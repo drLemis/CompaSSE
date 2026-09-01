@@ -1,7 +1,7 @@
 # CompaSSE
 **Reanimate old SKSE plugins for current Skyrim Special Edition. Or at least try to.**
 
-This is a simple tool that occassionaly fixes outdated Skyrim Script Extender (SKSE) plugins, allowing them to run on modern game runtimes without waiting for mod authors to recompile them.
+This is a simple tool that occasionally fixes outdated Skyrim Script Extender (SKSE) plugins, allowing them to run on modern game runtimes without waiting for mod authors to recompile them.
 
 ## The Problem
 Skyrim updates break plugins. When a new game version releases, plugins built for the old runtime are automatically rejected by SKSE and fail to load. This happens for three main reasons:
