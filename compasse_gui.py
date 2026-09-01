@@ -517,11 +517,23 @@ class PluginCard(tk.Frame):
 # Main GUI
 # ===================================================================
 
+def _window_icon():
+    base = getattr(sys, "_MEIPASS", None) or str(Path(__file__).parent)
+    ico = Path(base) / "compasse.ico"
+    return str(ico) if ico.exists() else ""
+
+
 class AutoPorterGUI:
     def __init__(self, root):
         self.root = root
         root.title(f"CompaSSE v{core.VERSION}")
         root.geometry("920x720")
+        icon = _window_icon()
+        if icon:
+            try:
+                root.iconbitmap(icon)
+            except tk.TclError:
+                pass
         root.minsize(700, 520)
         root.configure(bg=BG)
 
