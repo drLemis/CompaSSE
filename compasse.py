@@ -184,10 +184,29 @@ def check_flag(dll_path):
         "needs_patch": flag_val == 0,
     }
 
+def _backup(src_path):
+    """Copy a file to <src_dir>/CompaSSE/backups/ before modification.
+
+    Idempotent: skips if a backup already exists. Returns the backup path.
+    Backups live in one subfolder instead of being laying around.
+    """
+    parent = src_path.parent
+    out_dir = parent / "CompaSSE" / "backups"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bak = out_dir / (src_path.name + ".bak")
+    if not bak.exists():
+        shutil.copy2(src_path, bak)
+    return bak
+
+def backup_bytes(path, data):
+    """Backup a file then atomically overwrite it with the given bytes."""
+    _backup(path)
+    with open(path, "wb") as f:
+        f.write(data)
+
 def patch_flag(dll_path):
     """Patch versionIndependenceEx 0->2 with backup. Returns True if patched."""
-    with open(dll_path, "rb") as f:
-        data = bytearray(f.read())
+    data = bytearray(open(dll_path, "rb").read())
     sections = find_pe_sections(data)
     rva = find_export_rva(data, sections, b"SKSEPlugin_Version")
     struct_off = rva_to_offset(rva, sections)
@@ -195,11 +214,7 @@ def patch_flag(dll_path):
     if struct.unpack_from("<I", data, flag_off)[0] != 0:
         return False
     struct.pack_into("<I", data, flag_off, 2)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return True
 
 # ---------------------------------------------------------------------------
@@ -331,11 +346,7 @@ def patch_version_independence(dll_path):
     struct.pack_into("<I", data, indep_off, new_indep)
     struct.pack_into("<I", data, flag_off, new_flag)
 
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return True
 
 def patch_flag_force(dll_path):
@@ -358,11 +369,7 @@ def patch_flag_force(dll_path):
         return False
     old = struct.unpack_from("<I", data, flag_off)[0]
     struct.pack_into("<I", data, flag_off, 2)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return old != 2
 
 def patch_version_independence_force(dll_path):
@@ -390,11 +397,7 @@ def patch_version_independence_force(dll_path):
     new_flag = old_flag | KVIEX_ADDR_LIB_V5  # |= 0x2
     struct.pack_into("<I", data, indep_off, new_indep)
     struct.pack_into("<I", data, flag_off, new_flag)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return (old_indep != new_indep) or (old_flag != new_flag)
 
 # ---------------------------------------------------------------------------
@@ -671,11 +674,7 @@ def patch_hook_offset(dll_path, hook, new_offset):
     if cur != hook["offset"]:
         return False
     struct.pack_into("<I", data, disp_off, new_offset)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return True
 
 # ---------------------------------------------------------------------------
@@ -868,9 +867,7 @@ def main():
             with open(bin_file, "rb") as f:
                 fmt = struct.unpack("<i", f.read(4))[0]
             if fmt == 5:
-                bak = bin_file.with_suffix(".bin.bak")
-                if not bak.exists():
-                    shutil.copy2(bin_file, bak)
+                _backup(bin_file)
                 n, sz = convert_format5_to_format2(bin_file, bin_file)
                 print(f"  {bin_file.name}: format 5 -> 2 ({n} entries, {sz} bytes)")
             else:
