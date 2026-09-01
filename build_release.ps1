@@ -5,14 +5,20 @@ Set-Location $Root
 
 $BundleDir = Join-Path $Root 'release'
 $Spec = Join-Path $Root 'CompaSSE.spec'
+$env:SOURCE_DATE_EPOCH = $(git log -1 --format='%ct' -- CompaSSE.spec build_release.ps1)
+if (-not $env:SOURCE_DATE_EPOCH) { $env:SOURCE_DATE_EPOCH = '0' }
+$env:PYTHONHASHSEED = '12345'
 
 foreach ($p in @('build', $BundleDir)) {
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
 }
 
 Write-Host '== PyInstaller build =='
+$ErrorActionPreference = 'Continue'
 python -m PyInstaller --noconfirm --clean --log-level WARN --distpath $BundleDir $Spec
-if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
+$rc = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($rc -ne 0) { throw 'PyInstaller failed' }
 
 $DataDir = Join-Path $BundleDir 'Data\SKSE\Plugins'
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null

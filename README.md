@@ -36,5 +36,49 @@ python compasse.py --dll <plugin.dll> --fix --game <exe> --addresslib <bin>
 ```
 Or just run the CompaSSE.exe like everyone does.
 
+## Building from source
+The release is a single self-contained EXE built with [PyInstaller](https://pyinstaller.org/) and the shim DLL.
+
+Prerequisites: Python 3.x, `pip install pyinstaller`.
+
+```powershell
+.\build_release.ps1
+```
+
+Output lands in `release\`:
+
+```
+release/
+├─ CompaSSE-<version>.zip          <- same content, distribution convenience
+├─ CompaSSE.exe                    <- user-usable main tool
+└─ Data/SKSE/Plugins/
+   └─ _AddressLibraryShim.dll      <- unmodified, shipped as-is
+```
+
+The shim DLL is intentionally **not** embedded - it ships unchanged beside the
+EXE and is consumed by SKSE at game runtime, never extracted or modified by
+the tool. Later its source code will be published, as I'll be satisfied by it.
+
+### Reproducible builds
+`build_release.ps1` pins the build timestamp (`SOURCE_DATE_EPOCH`) and Python
+hash seed (`PYTHONHASHSEED`), so two builds from the same source tree produce
+**byte-identical** EXEs. Verify with:
+
+```powershell
+(Get-FileHash release/CompaSSE.exe -Algorithm SHA256).Hash
+```
+
+This keeps AV engine reputation stable across builds: one clean scan of a
+released hash stays clean for that hash instead of resetting on every rebuild.
+
+### Why signed EXEs matter (AV / VirusTotal)
+The tool's job is patching game/DLL binaries, which reads as suspicious to AV
+heuristics by nature. The release deliberately avoids the classic malware
+signatures: no obfuscation, no UPX, no runtime modification of shipped files,
+and backups go to a dedicated subfolder rather than next to the originals.
+An unsigned EXE will still occasionally trip reputation-based engines
+if a release scans flagged, submit it as a false positive to the vendor
+(Microsoft, Bitdefender) with the source link.
+
 ## Secret sauce
 This is bundled with custom-made DLL for rerouting different versions of AddressLibrary calls from a pool of DLLs to proper instructions, so the outdated library presenting itself as modern can actually get proper addresses instead of the modern ones. Don't ask how it works. It is awful under the hood. I will throw it into garbage one day, but it is yet to come.
