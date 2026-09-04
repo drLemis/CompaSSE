@@ -22,7 +22,7 @@ if ($rc -ne 0) { throw 'PyInstaller failed' }
 
 $DataDir = Join-Path $BundleDir 'Data\SKSE\Plugins'
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $Root '_AddressLibraryShim.dll') -Destination $DataDir
+Copy-Item -LiteralPath (Join-Path $Root 'DLL\build\!CompaSSE.dll') -Destination $DataDir
 
 $Ver = & python -c "import compasse; print(compasse.VERSION)"
 $Zip = Join-Path $BundleDir "CompaSSE-$Ver.zip"

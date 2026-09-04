@@ -12,14 +12,11 @@ Three fix layers:
    then pattern-check. When the game updates the offset goes stale.
    Resolve via Address Library, scan exe, patch displacement.
 
-Also converts format-5 Address Library bins to format 2 so old plugins can
-parse them.
-
 Usage:
-  python compasse.py --scan <plugins_dir>
-  python compasse.py --fix <plugins_dir> --game <SkyrimSE.exe> --addresslib <bin>
-  python compasse.py --dll <file> --scan
-  python compasse.py --dll <file> --fix --game <exe> --addresslib <bin>
+  python compasse.py --audit --plugins-dir <dir>     # compatibility verdicts
+  python compasse.py --scan --plugins-dir <dir>      # scan and report
+  python compasse.py --fix --plugins-dir <dir> --game <exe> --addresslib <bin>
+  python compasse.py --audit --dll <file>            # audit single plugin
 """
 
 import argparse
@@ -39,6 +36,7 @@ except ImportError:
 FLAG_STRUCT_OFFSET = 0x304  # versionIndependenceEx offset within SKSEPlugin_Version
 VERSION_INDEP_OFFSET = 0x308  # versionIndependence offset within SKSEPlugin_Version
 PATTERN_SCAN_RANGE = 0x1000  # scan offsets 0..0x1000 for the pattern
+SHIM_NAME = "!CompaSSE.dll"
 
 # versionIndependence flags (from SKSE64 PluginManager.cpp)
 KVI_ADDR_LIB_POST_AE = 1 << 0
@@ -763,6 +761,125 @@ def analyze_plugin(dll_path, runtime_version=None):
     return info
 
 
+# ---------------------------------------------------------------------------
+# Audit: definitive compatibility verdict
+# ---------------------------------------------------------------------------
+def _audit_plugin(dll_path, runtime_version=None):
+    """Audit a single plugin against the definitive compatibility rules.
+
+    Returns dict with:
+        name:    plugin filename
+        verdict: SAFE / NEEDS_FIX / BROKEN / UNKNOWN
+        reason:  one-line human-readable explanation
+        details: dict of raw analysis data (flag, vi, hooks, build_year)
+    """
+    info = analyze_plugin(dll_path, runtime_version)
+    build_year = None
+    try:
+        with open(dll_path, "rb") as f:
+            hdr = f.read(0x400)
+        pe_off = struct.unpack_from("<I", hdr, 0x3C)[0]
+        if pe_off + 8 <= len(hdr) and hdr[pe_off:pe_off + 4] == b"PE\x00\x00":
+            ts = struct.unpack_from("<I", hdr, pe_off + 8)[0]
+            if ts != 0:
+                from datetime import datetime, timezone
+                build_year = datetime.fromtimestamp(ts, tz=timezone.utc).year
+    except Exception:
+        pass
+
+    flag = info["flag"]
+    vi = info["version_indep"]
+    hooks = info["hooks"]
+
+    # Not an SKSE plugin at all
+    if flag is None and vi is None:
+        return {
+            "name": dll_path.name,
+            "verdict": "UNKNOWN",
+            "reason": "Not an SKSE plugin (no SKSEPlugin_Version export).",
+            "details": {"build_year": build_year},
+        }
+
+    has_addr = vi.get("has_addr", False) if vi else False
+    flag_patch = flag is not None and flag.get("needs_patch", False)
+    indep_patch = vi is not None and vi.get("needs_indep", False)
+    has_unknown = vi is not None and vi.get("has_unknown", False)
+    needs_fix = flag_patch or indep_patch
+
+    # Rule 1: built with CommonLibSSE? (heuristic: build year + has SKSE export)
+    # Rule 2: uses Address Library? (versionIndependence flag bit)
+    # Rule 3: has hardcoded offsets? (capstone hook scan finds REL::ID + offset)
+
+    old_build = build_year is not None and build_year < 2025
+
+    # BROKEN: old build, no Address Library, likely hardcoded offsets
+    if old_build and not has_addr and not needs_fix:
+        return {
+            "name": dll_path.name,
+            "verdict": "BROKEN",
+            "reason": (f"Built {build_year}, no Address Library. "
+                       "Likely hardcoded offsets - will crash on current runtime."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # BROKEN: unknown flags, can't verify
+    if has_unknown:
+        return {
+            "name": dll_path.name,
+            "verdict": "BROKEN",
+            "reason": (f"Unknown versionIndependence flags (0x{vi['indep_val']:x}). "
+                       "Cannot verify compatibility."),
+            "details": {"build_year": build_year, "has_addr": has_addr},
+        }
+
+    # NEEDS_FIX: flag patches will make it work
+    if needs_fix and has_addr:
+        reasons = []
+        if flag_patch:
+            reasons.append("versionIndependenceEx flag is 0 (needs 2)")
+        if indep_patch:
+            reasons.append(f"versionIndependence is 0x{vi['indep_val']:x} (needs 0x{KVI_TARGET:x})")
+        extra = f", {len(hooks)} hook offsets stale" if hooks else ""
+        return {
+            "name": dll_path.name,
+            "verdict": "NEEDS_FIX",
+            "reason": "; ".join(reasons) + extra,
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # NEEDS_FIX: needs flags but no address library - risky
+    if needs_fix and not has_addr:
+        return {
+            "name": dll_path.name,
+            "verdict": "NEEDS_FIX",
+            "reason": (f"Built {build_year or '?'}, no Address Library. "
+                       "Flag patches applied but hardcoded offsets may still break it."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # SAFE: flags correct, uses Address Library
+    if has_addr and not needs_fix:
+        extra = f", {len(hooks)} hooks verified" if hooks else ""
+        return {
+            "name": dll_path.name,
+            "verdict": "SAFE",
+            "reason": f"Uses Address Library, flags correct{extra}.",
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # UNKNOWN: can't determine
+    return {
+        "name": dll_path.name,
+        "verdict": "UNKNOWN",
+        "reason": "Cannot determine compatibility. Review manually.",
+        "details": {"build_year": build_year, "has_addr": has_addr},
+    }
+
+
 def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dry_run=True):
     """Fix a single plugin. Returns list of action strings."""
     actions = []
@@ -843,35 +960,27 @@ def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dr
 def main():
     parser = argparse.ArgumentParser(
         description=f"CompaSSE {VERSION} for Skyrim SE 1.7.99+")
-    parser.add_argument("--scan", action="store_true", help="Scan and report (no changes)")
-    parser.add_argument("--fix", action="store_true", help="Apply fixes")
-    parser.add_argument("--plugins-dir", type=Path, default=None, help="Plugins dir to scan/fix")
-    parser.add_argument("--dll", type=Path, default=None, help="Single DLL to scan/fix")
-    parser.add_argument("--game", type=Path, default=None, help="SkyrimSE.exe path (for offset fix)")
-    parser.add_argument("--addresslib", type=Path, default=None, help="versionlib bin path (for offset fix)")
-    parser.add_argument("--convert-bin", action="store_true", help="Convert format-5 bins to format 2")
+    parser.add_argument("--scan", action="store_true",
+                        help="Scan plugins and show status (no changes)")
+    parser.add_argument("--audit", action="store_true",
+                        help="Audit plugins against compatibility rules")
+    parser.add_argument("--fix", action="store_true",
+                        help="Apply fixes to plugins")
+    parser.add_argument("--plugins-dir", type=Path, default=None,
+                        help="SKSE plugins directory")
+    parser.add_argument("--dll", type=Path, default=None,
+                        help="Single DLL to process")
+    parser.add_argument("--game", type=Path, default=None,
+                        help="SkyrimSE.exe path (required for hook offset fix)")
+    parser.add_argument("--addresslib", type=Path, default=None,
+                        help="versionlib bin path (required for hook offset fix)")
     args = parser.parse_args()
 
     if not HAS_CAPSTONE:
-        print("WARNING: capstone not installed - hook detection disabled (flag patch still works)")
+        print("WARNING: capstone not installed - hook detection disabled")
 
     if args.dll is None and args.plugins_dir is None:
-        args.plugins_dir = Path(
-            r"D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins"
-        )
-
-    # Convert bins
-    if args.convert_bin and args.plugins_dir:
-        print("=== Converting format-5 Address Library bins ===")
-        for bin_file in sorted(args.plugins_dir.glob("versionlib-*.bin")):
-            with open(bin_file, "rb") as f:
-                fmt = struct.unpack("<i", f.read(4))[0]
-            if fmt == 5:
-                _backup(bin_file)
-                n, sz = convert_format5_to_format2(bin_file, bin_file)
-                print(f"  {bin_file.name}: format 5 -> 2 ({n} entries, {sz} bytes)")
-            else:
-                print(f"  {bin_file.name}: format {fmt}, skip")
+        parser.error("specify --plugins-dir or --dll")
 
     # Load game + addresslib for offset fix
     exe = None
@@ -879,11 +988,13 @@ def main():
     addresslib = None
     runtime_version = None
     if args.fix and (args.game or args.dll):
-        game_path = args.game or Path(r"D:\SteamLibrary\steamapps\common\Skyrim Special Edition\SkyrimSE.exe")
+        game_path = args.game
+        if game_path is None:
+            parser.error("--game is required for --fix")
         runtime_version = runtime_version_from_exe(game_path) if game_path.exists() else None
-        al_path = args.addresslib or Path(
-            r"D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins\versionlib-1-7-104-0.bin"
-        )
+        al_path = args.addresslib
+        if al_path is None:
+            parser.error("--addresslib is required for --fix")
         if game_path.exists():
             exe, exe_sections = load_exe_sections(game_path)
         else:
@@ -905,45 +1016,48 @@ def main():
         print(f"ERROR: no plugins found at {args.plugins_dir}")
         sys.exit(1)
 
+    # -- Audit mode: definitive compatibility verdicts
+    if args.audit:
+        print(f"\n=== AUDIT {len(dlls)} plugin(s) ===\n")
+        counts = {"SAFE": 0, "NEEDS_FIX": 0, "BROKEN": 0, "UNKNOWN": 0}
+        for dll in dlls:
+            result = _audit_plugin(dll, runtime_version)
+            v = result["verdict"]
+            counts[v] = counts.get(v, 0) + 1
+            tag = {"SAFE": "[OK]", "NEEDS_FIX": "[FIX]", "BROKEN": "[!!]", "UNKNOWN": "[??]"}[v]
+            print(f"  {tag} {result['name']}: {result['reason']}")
+        print(f"\n  {counts['SAFE']} safe, {counts['NEEDS_FIX']} needs fix, "
+              f"{counts['BROKEN']} broken, {counts['UNKNOWN']} unknown")
+        return
+
+    # -- Scan / Fix mode
     mode = "SCAN" if dry_run else "FIX"
     print(f"\n=== {mode} {len(dlls)} plugin(s) ===")
 
     for dll in dlls:
         info = analyze_plugin(dll, runtime_version)
         print(f"\n{dll.name}:")
+
         if info["flag"] is None:
-            print("  not an SKSE plugin (no SKSEPlugin_Version export)")
+            print("  not an SKSE plugin")
         elif info["flag"]["needs_patch"]:
-            print(f"  flag: NEEDS PATCH (versionIndependenceEx=0 -> 2)")
+            print("  flag: NEEDS PATCH")
         else:
-            print(f"  flag: OK (versionIndependenceEx={info['flag']['flag_val']})")
+            print("  flag: OK")
 
         vi = info["version_indep"]
         if vi is not None:
             if vi["has_unknown"]:
-                print(
-                    f"  versionIndependence: UNKNOWN FLAGS 0x{vi['indep_val']:x} "
-                    f"(not patching)"
-                )
+                print(f"  versionIndependence: UNKNOWN (0x{vi['indep_val']:x})")
             elif vi["needs_indep"]:
-                print(
-                    f"  versionIndependence: NEEDS PATCH "
-                    f"(0x{vi['indep_val']:x} -> 0x{KVI_TARGET:x})"
-                )
+                print("  versionIndependence: NEEDS PATCH")
             else:
-                print(f"  versionIndependence: OK (0x{vi['indep_val']:x})")
-            if vi["runtime_ver"]:
-                print(
-                    f"  compatibleVersions[0]: {_packed_to_ver(vi['runtime_ver'])}"
-                )
+                print("  versionIndependence: OK")
 
         if info["hooks"]:
             print(f"  hooks: {len(info['hooks'])} auto-portable")
-            for h in info["hooks"]:
-                pat_str = " ".join(f"{h['pattern'].get(k, '??'):02x}" for k in sorted(h['pattern'].keys()))
-                print(f"    REL::ID={h['rel_id']} offset=0x{h['offset']:x} len={h['pattern_len']} [{pat_str}]")
         else:
-            print(f"  hooks: none auto-portable")
+            print("  hooks: none")
 
         if args.fix:
             for action in fix_plugin(dll, exe, exe_sections, addresslib,

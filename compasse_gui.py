@@ -373,12 +373,47 @@ class PluginCard(tk.Frame):
                      fg=TEXT_SECONDARY, bg=CARD_BG,
                      anchor="w").pack(fill="x", pady=(0, 2))
 
-        # ── Controls (only when the plugin needs fixing, or forced in unsafe mode) ──
+        # Risk factor explanation
+        why = verdict.get("why", "")
+        if why:
+            tk.Label(body, text=why,
+                     font=(FONT_FAMILY, 9),
+                     fg=TEXT_SECONDARY, bg=CARD_BG,
+                     anchor="w", wraplength=380).pack(fill="x", pady=(0, 2))
+
+        # PRO mode: expose all raw details
+        if force_fix:
+            details_lines = []
+            flag = info.get("flag")
+            vi = info.get("version_indep")
+            hooks = info.get("hooks", [])
+            if flag is not None:
+                details_lines.append(f"versionIndependenceEx: 0x{flag['flag_val']:x}")
+            if vi is not None:
+                details_lines.append(f"versionIndependence: 0x{vi['indep_val']:x}")
+                if vi.get("runtime_ver"):
+                    rv = vi["runtime_ver"]
+                    b = rv.to_bytes(4, "little")
+                    details_lines.append(f"compatibleVersions: {b[3]}.{b[2]}.{b[1]}.{b[0]}")
+            if hooks:
+                for h in hooks:
+                    pat = " ".join(f"{h['pattern'].get(k, '??'):02x}"
+                                   for k in sorted(h['pattern'].keys()))
+                    details_lines.append(
+                        f"hook REL::ID={h['rel_id']} off=0x{h['offset']:x} "
+                        f"len={h['pattern_len']} [{pat}]")
+            if details_lines:
+                tk.Label(body, text="\n".join(details_lines),
+                         font=(FONT_MONO, 8),
+                         fg=TEXT_SECONDARY, bg=CARD_BG,
+                         anchor="w", justify="left").pack(fill="x", pady=(0, 2))
+
+        # ── Controls (only when the plugin needs fixing, or forced in pro mode) ──
         if verdict["needs_fix"] or force_fix:
             fix_items = verdict.get("fix_items", [])
 
             if force_fix:
-                # Unsafe mode: offer BOTH address fixes to every mod,
+                # PRO mode: offer BOTH address fixes to every mod,
                 # regardless of whether they currently need them.
                 vi = info.get("version_indep") or {}
                 flag_cur = (info.get("flag") or {}).get("flag_val", 0)
@@ -581,15 +616,15 @@ class AutoPorterGUI:
         ttk.Button(bf, text="Clear",
                    command=self.clear).pack(side="left")
 
-        self.unsafe = tk.BooleanVar(value=False)
-        self.unsafe_btn = tk.Checkbutton(
-            bf, text="UNSAFE MODE",
-            variable=self.unsafe,
-            command=self._on_unsafe_toggle,
+        self.pro_mode = tk.BooleanVar(value=False)
+        self.pro_btn = tk.Checkbutton(
+            bf, text="PRO MODE",
+            variable=self.pro_mode,
+            command=self._on_pro_toggle,
             font=(FONT_FAMILY, 9, "bold"),
             fg="#b91c1c", bg=BG, activebackground=BG,
             selectcolor=BG, cursor="hand2")
-        self.unsafe_btn.pack(side="left", padx=(12, 0))
+        self.pro_btn.pack(side="left", padx=(12, 0))
 
         # ── Summary bar ──
         sf = tk.Frame(self.root, bg=BG)
@@ -694,7 +729,6 @@ class AutoPorterGUI:
             build_date = _get_build_date_str(dll)
             v = classify(info, build_year)
             v["build_date"] = build_date
-            v["hook_count"] = len(info.get("hooks", []))
             self._scan_data.append((dll, info, v))
             counts[v["cat"]] = counts.get(v["cat"], 0) + 1
             self.root.after(
@@ -725,7 +759,7 @@ class AutoPorterGUI:
     def _add_card(self, dll, info, v):
         card = PluginCard(self.sf.inner, dll, info, v,
                           on_fix_one=self._fix_single,
-                          force_fix=self.unsafe.get())
+                          force_fix=self.pro_mode.get())
         ncol = 2
         row = len(self.cards) // ncol
         col = len(self.cards) % ncol
@@ -735,9 +769,9 @@ class AutoPorterGUI:
         self.sf.inner.grid_columnconfigure(1, weight=1, uniform="card")
         self.cards.append(card)
 
-    def _on_unsafe_toggle(self):
+    def _on_pro_toggle(self):
         # Rebuild cards from the last scan so every one shows fix buttons
-        # when unsafe mode is on.
+        # when pro mode is on.
         for c in self.cards:
             c.destroy()
         self.cards.clear()

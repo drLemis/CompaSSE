@@ -1,3 +1,18 @@
+# Build output
 /build/
+/dist/
+/DLL/build/
 /release/
+
+# Python
 __pycache__/
+*.pyc
+
+# MSVC build artifacts
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
