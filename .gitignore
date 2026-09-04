@@ -16,3 +16,6 @@ __pycache__/
 *.ilk
 *.iobj
 *.ipdb
+
+# Hidden configs
+.*/
