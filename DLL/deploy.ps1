@@ -3,8 +3,9 @@
     Build, deploy, and optionally launch Skyrim with the CompaSSE shim.
 
 .DESCRIPTION
-    Compiles the shim DLL from source, copies it to the Skyrim SE Plugins
-    folder, and optionally launches the game via skse64_loader.
+    Compiles the shim DLL from source, builds CompaSSE.exe via PyInstaller,
+    generates the translation table, and deploys everything to the Skyrim SE
+    Plugins folder.
 
     ASCII sort order matters: "!" (0x21) sorts before "A" (0x41), so
     !CompaSSE.dll loads FIRST and installs hooks before any other plugin
@@ -12,6 +13,9 @@
 
 .PARAMETER NoBuild
     Skip compilation. Deploy the last build output.
+
+.PARAMETER NoTranslations
+    Skip translation table generation.
 
 .PARAMETER Launch
     After deployment, launch Skyrim SE via skse64_loader.exe.
@@ -47,6 +51,7 @@
 [CmdletBinding()]
 param(
     [switch]$NoBuild,
+    [switch]$NoTranslations,
     [switch]$Launch,
     [switch]$Kill,
     [int]$Wait = 5,
@@ -65,9 +70,11 @@ $BuildOutput = Join-Path $ScriptDir 'build\!CompaSSE.dll'
 if (-not $PluginsDir) {
     $PluginsDir = 'D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins'
 }
-$SkyrimDir = Split-Path -Parent (Split-Path -Parent $PluginsDir)
+$SkyrimDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PluginsDir))
+$GameExe = Join-Path $SkyrimDir 'SkyrimSE.exe'
 
 $Target = Join-Path $PluginsDir '!CompaSSE.dll'
+$CompaSSEDir = Join-Path $PluginsDir 'CompaSSE'
 
 # ---- Helpers ----
 function Write-Step($msg) { Write-Host "`n>> $msg" -ForegroundColor Cyan }
@@ -97,9 +104,9 @@ if ($Kill) {
     }
 }
 
-# ---- Build ----
+# ---- Build DLL ----
 if ($NoBuild) {
-    Write-Step 'Build'
+    Write-Step 'Build DLL'
     Write-Skip 'Skipped (-NoBuild)'
     if (-not (Test-Path -LiteralPath $BuildOutput)) {
         Write-Fail "Build output not found: $BuildOutput"
@@ -119,8 +126,10 @@ if ($NoBuild) {
         Write-Host "   Running: cmd /c `"$BuildBat`"" -ForegroundColor Gray
         $prev = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
+        Push-Location $ScriptDir
         cmd /c "`"$BuildBat`"" 2>&1 | ForEach-Object { Write-Host "   $_" }
         $rc = $LASTEXITCODE
+        Pop-Location
         $ErrorActionPreference = $prev
         if ($rc -ne 0) {
             Write-Fail "Build failed (exit code $rc)"
@@ -135,6 +144,41 @@ if ($NoBuild) {
     Write-Ok "Built: $BuildOutput ($sz bytes)"
 }
 
+# ---- Build CompaSSE.exe (PyInstaller) ----
+$ExeOutput = Join-Path $ProjectRoot 'dist\CompaSSE.exe'
+if ($NoBuild) {
+    Write-Step 'Build CompaSSE.exe'
+    Write-Skip 'Skipped (-NoBuild)'
+    if (-not (Test-Path -LiteralPath $ExeOutput)) {
+        Write-Skip "CompaSSE.exe not found: $ExeOutput"
+    }
+} else {
+    Write-Step 'Building CompaSSE.exe'
+    $Spec = Join-Path $ProjectRoot 'CompaSSE.spec'
+    if ($DryRun) {
+        Write-Host "   [DRY RUN] python -m PyInstaller --noconfirm --clean --distpath dist $Spec" -ForegroundColor DarkGray
+    } else {
+        Write-Host "   Running: python -m PyInstaller" -ForegroundColor Gray
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        Push-Location $ProjectRoot
+        python -m PyInstaller --noconfirm --clean --log-level WARN --distpath dist $Spec 2>&1 | ForEach-Object { Write-Host "   $_" }
+        $rc = $LASTEXITCODE
+        Pop-Location
+        $ErrorActionPreference = $prev
+        if ($rc -ne 0) {
+            Write-Fail "PyInstaller failed (exit code $rc)"
+            exit 1
+        }
+    }
+    if (Test-Path -LiteralPath $ExeOutput) {
+        $sz = (Get-Item -LiteralPath $ExeOutput).Length
+        Write-Ok "Built: $ExeOutput ($sz bytes)"
+    } else {
+        Write-Fail "CompaSSE.exe not found after build"
+    }
+}
+
 # ---- Verify target folder exists ----
 if (-not (Test-Path -LiteralPath $PluginsDir)) {
     Write-Fail "Plugins folder not found: $PluginsDir"
@@ -142,7 +186,7 @@ if (-not (Test-Path -LiteralPath $PluginsDir)) {
     exit 1
 }
 
-# ---- Deploy ----
+# ---- Deploy DLL ----
 Write-Step 'Deploying DLL to plugins folder'
 
 $name = Split-Path -Leaf $Target
@@ -161,8 +205,70 @@ if (-not $DryRun) {
     Write-Ok "$name (dry run)"
 }
 
+# ---- Deploy CompaSSE.exe ----
+if (Test-Path -LiteralPath $ExeOutput) {
+    Write-Step 'Deploying CompaSSE.exe'
+    $ExeTarget = Join-Path $PluginsDir '..\..\..\..\..\..'
+    $ExeTarget = Join-Path $SkyrimDir 'CompaSSE.exe'
+    Invoke-Dry "Copy -> CompaSSE.exe" {
+        Copy-Item -LiteralPath $ExeOutput -Destination $ExeTarget -Force
+    }
+    if (-not $DryRun) {
+        $exSz = (Get-Item -LiteralPath $ExeTarget).Length
+        Write-Ok "CompaSSE.exe ($exSz bytes)"
+    } else {
+        Write-Ok "CompaSSE.exe (dry run)"
+    }
+}
+
+# ---- Ensure CompaSSE subfolder exists ----
+if (-not (Test-Path -LiteralPath $CompaSSEDir)) {
+    Invoke-Dry "Create CompaSSE subfolder" { New-Item -ItemType Directory -Path $CompaSSEDir -Force | Out-Null }
+    Write-Ok "Created CompaSSE subfolder"
+}
+
+# ---- Build translation table ----
+if (-not $NoTranslations) {
+    Write-Step 'Building translation table'
+    if (-not (Test-Path -LiteralPath $GameExe)) {
+        Write-Skip "Game exe not found: $GameExe - skipping translation build"
+    } else {
+        if ($DryRun) {
+            Write-Host "   [DRY RUN] compasse.exe --build-translations" -ForegroundColor DarkGray
+        } else {
+            $pyArgs = @(
+                'compasse.py', '--build-translations',
+                '--game', $GameExe,
+                '--plugins-dir', $PluginsDir
+            )
+            Write-Host "   Running: python $($pyArgs -join ' ')" -ForegroundColor Gray
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            Push-Location $ProjectRoot
+            python @pyArgs 2>&1 | ForEach-Object { Write-Host "   $_" }
+            $rc = $LASTEXITCODE
+            Pop-Location
+            $ErrorActionPreference = $prev
+            if ($rc -ne 0) {
+                Write-Fail "Translation build failed (exit code $rc)"
+                exit 1
+            }
+        }
+        $transBin = Join-Path $CompaSSEDir 'translation_table.bin'
+        if (Test-Path -LiteralPath $transBin) {
+            $sz = (Get-Item -LiteralPath $transBin).Length
+            Write-Ok "translation_table.bin ($sz bytes)"
+        } else {
+            Write-Skip "translation_table.bin not found after build"
+        }
+    }
+} else {
+    Write-Step 'Build translation table'
+    Write-Skip 'Skipped (-NoTranslations)'
+}
+
 # ---- Clear old log ----
-$logPath = Join-Path $PluginsDir '!CompaSSE.log'
+$logPath = Join-Path $CompaSSEDir '!CompaSSE.log'
 if (Test-Path -LiteralPath $logPath) {
     Invoke-Dry "Remove old log" { Remove-Item -LiteralPath $logPath -Force }
     Write-Ok 'Cleared old log'
@@ -205,8 +311,15 @@ Write-Step 'Done'
 if ($DryRun) {
     Write-Host "   Dry run complete. No changes were made." -ForegroundColor Yellow
 } else {
-    Write-Host "   DLL deployed to:" -ForegroundColor Green
+    Write-Host "   Deployed:" -ForegroundColor Green
     Write-Host "     $Target"
+    if (Test-Path -LiteralPath $ExeTarget) {
+        Write-Host "     $ExeTarget"
+    }
+    $transBin = Join-Path $CompaSSEDir 'translation_table.bin'
+    if (Test-Path -LiteralPath $transBin) {
+        Write-Host "     $transBin"
+    }
     if ($Launch) {
         Write-Host "   Game launched. Check log at:" -ForegroundColor Green
         Write-Host "     $logPath"

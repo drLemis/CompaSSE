@@ -21,8 +21,27 @@ $ErrorActionPreference = 'Stop'
 if ($rc -ne 0) { throw 'PyInstaller failed' }
 
 $DataDir = Join-Path $BundleDir 'Data\SKSE\Plugins'
-New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+$CompaSSEDir = Join-Path $DataDir 'CompaSSE'
+New-Item -ItemType Directory -Path $CompaSSEDir -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root 'DLL\build\!CompaSSE.dll') -Destination $DataDir
+
+# Build translation table against installed game's old bins
+$DefaultPluginsDir = 'D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins'
+$GameExe = Join-Path (Split-Path -Parent $DefaultPluginsDir) 'SkyrimSE.exe'
+if (Test-Path -LiteralPath $GameExe) {
+    Write-Host '== Building translation table =='
+    python compasse.py --build-translations --game $GameExe --plugins-dir $DefaultPluginsDir
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Translation build failed (exit code $LASTEXITCODE)" }
+    # Copy result to bundle
+    $srcBin = Join-Path $DefaultPluginsDir 'CompaSSE\translation_table.bin'
+    if (Test-Path -LiteralPath $srcBin) {
+        Copy-Item -LiteralPath $srcBin -Destination $CompaSSEDir
+        Write-Host "   Copied translation_table.bin to bundle"
+    }
+} else {
+    Write-Warning "Game exe not found - skipping translation table build"
+    Write-Warning "Users must run: compasse.exe --build-translations"
+}
 
 $Ver = & python -c "import compasse; print(compasse.VERSION)"
 $Zip = Join-Path $BundleDir "CompaSSE-$Ver.zip"

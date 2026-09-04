@@ -46,6 +46,9 @@ python compasse.py --scan --plugins-dir <dir>
 
 # Apply fixes (requires game exe + address library)
 python compasse.py --fix --plugins-dir <dir> --game SkyrimSE.exe --addresslib versionlib.bin
+
+# Build translation table (auto-detects paths from game exe location)
+python compasse.py --build-translations --game SkyrimSE.exe --plugins-dir <dir>
 ```
 
 ### 2. !CompaSSE.dll - serves correct offsets at runtime

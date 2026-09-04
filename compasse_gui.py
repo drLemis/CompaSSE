@@ -616,6 +616,10 @@ class AutoPorterGUI:
         ttk.Button(bf, text="Clear",
                    command=self.clear).pack(side="left")
 
+        self.trans_btn = ttk.Button(bf, text="Build Translations",
+                                    command=self.build_translations)
+        self.trans_btn.pack(side="left", padx=(12, 0))
+
         self.pro_mode = tk.BooleanVar(value=False)
         self.pro_btn = tk.Checkbutton(
             bf, text="PRO MODE",
@@ -676,6 +680,7 @@ class AutoPorterGUI:
             return
         self.busy = True
         self.scan_btn.config(state="disabled")
+        self.trans_btn.config(state="disabled")
         self.status.config(text="Working\u2026")
         threading.Thread(target=self._worker, args=(fn,), daemon=True).start()
 
@@ -691,6 +696,7 @@ class AutoPorterGUI:
     def _done(self):
         self.busy = False
         self.scan_btn.config(state="normal")
+        self.trans_btn.config(state="normal")
         self.status.config(text="Done")
 
     # ──────────────────────────────────────────────────────────────
@@ -885,6 +891,34 @@ class AutoPorterGUI:
     # ─────────────────────────────────────────────────────────────
     # Clear
     # ─────────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────
+    # Build Translations
+    # ──────────────────────────────────────────────────────────────
+
+    def build_translations(self):
+        if self.game_exe is None:
+            messagebox.showerror(
+                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
+            return
+        plugins = self._plugins()
+        if plugins is None or not plugins.exists():
+            messagebox.showerror(
+                "Error", f"Plugins folder not found:\n{plugins}")
+            return
+        self._run(lambda: self._do_build_translations(plugins))
+
+    def _do_build_translations(self, plugins):
+        try:
+            ver_count, total = core.build_translations(
+                str(self.game_exe), plugins)
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Build Translations",
+                f"Done.\n{ver_count} version(s), {total} entries.\n\n"
+                f"Written to:\n{plugins / 'CompaSSE' / 'translation_table.bin'}"))
+        except Exception as exc:
+            self.root.after(
+                0, lambda: messagebox.showerror("Error", str(exc)))
 
     def clear(self):
         self._clear_cards()

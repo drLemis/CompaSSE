@@ -230,7 +230,6 @@ static bool g_loading = false; // reentrancy guard for ensure_buffers
 static bool g_serving_alt = false; // reentrancy guard for alt-path file open
 static thread_local bool g_ntRedirecting = false; // reentrancy guard for NtCreateFile->CreateFileW redirect
 static uint32_t g_srcFmt = 0;  // source bin format (1/2/5) once loaded
-static const bool merge_old_bins = true; // merge legacy IDs from old format-1/2 bins
 static wchar_t g_tempPath2[MAX_PATH];
 static wchar_t g_tempPath5[MAX_PATH];
 static wchar_t g_tempPath1[MAX_PATH];
@@ -246,24 +245,24 @@ static void load_translations() {
     if (g_translations_loaded) return;
     g_translations_loaded = true;
 
-    // Find translation_table.bin next to this DLL
+    // Find CompaSSE\translation_table.bin next to this DLL
     wchar_t dllPath[MAX_PATH];
     if (!GetModuleFileNameW(g_self, dllPath, MAX_PATH)) return;
     wchar_t* bs = wcsrchr(dllPath, L'\\');
     if (bs) bs[1] = 0; else return;
     wchar_t fullPath[MAX_PATH];
     wcscpy_s(fullPath, dllPath);
-    wcscat_s(fullPath, L"translation_table.bin");
+    wcscat_s(fullPath, L"CompaSSE\\translation_table.bin");
 
     HANDLE h = fpCreateFileW(fullPath, GENERIC_READ,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        shim_log("load_translations: no translation_table.bin found");
+        shim_log("load_translations: no CompaSSE\\translation_table.bin found");
         return;
     }
     LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart > (1 << 25)) { CloseHandle(h); return; }
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart > (1 << 28)) { CloseHandle(h); return; } // 256MB max
     std::vector<uint8_t> buf((size_t)sz.QuadPart);
     DWORD total = 0;
     while (total < buf.size()) {
@@ -277,6 +276,11 @@ static void load_translations() {
     size_t o = 0;
     if (total < 8 || memcmp(buf.data(), "TRTL", 4) != 0) return;
     o = 4;
+    uint32_t fmtVersion = *(uint32_t*)(buf.data() + o); o += 4;
+    if (fmtVersion != 1) {
+        shim_log("load_translations: unsupported format version %u", fmtVersion);
+        return;
+    }
     uint32_t verCount = *(uint32_t*)(buf.data() + o); o += 4;
 
     for (uint32_t v = 0; v < verCount && o < total; ++v) {
@@ -351,98 +355,6 @@ static bool is_versionlib_handle(HANDLE h) {
     DWORD n = GetFinalPathNameByHandleW(h, buf, MAX_PATH, 0);
     if (n == 0 || n >= MAX_PATH) return false;
     return is_versionlib_path(buf);
-}
-
-// Merge every old format-1/2 Address Library bin found in the plugins folder
-// into `entries`, adding any {id, offset} pair whose id is absent (or whose
-// offset is 0 in the current runtime's library). Format-5 dense arrays store
-// 0 for ids the current runtime doesn't map; legacy plugins still need those
-// ids, so fill them from the newest old bin that knows them. Returns the
-// merged mapping.
-static void merge_old_entries(const wchar_t* binPath,
-                              std::map<uint64_t, uint64_t>& have,
-                              uint32_t& srcPtrSize) {
-    (void)srcPtrSize;
-    wchar_t dir[MAX_PATH];
-    wcscpy_s(dir, binPath);
-    wchar_t* fslash = wcsrchr(dir, L'\\');
-    wchar_t* bslash = wcsrchr(dir, L'/');
-    wchar_t* last = (fslash && bslash) ? (fslash > bslash ? fslash : bslash)
-                    : fslash ? fslash : bslash;
-    if (last) last[1] = 0;
-    else dir[0] = 0;
-
-    // Scan version-*.bin ONLY (legacy SE, fmt1). The user's working artifact
-    // (versionlib-1-7-104-0-patched.bin, 824108 entries) = fmt5 nonzero-only
-    // base + these bins, newest first. versionlib-1-6-* bins add 0 IDs and
-    // their offsets for fmt5-zero IDs point at different code in 1.7.104, so
-    // they must NOT fill gaps.
-    const wchar_t* patterns[] = { L"version-*.bin" };
-    struct OldBin { wchar_t name[MAX_PATH]; uint64_t minor; };
-    std::vector<OldBin> bins;
-    for (int p = 0; p < 1; ++p) {
-        wchar_t pat[MAX_PATH];
-        swprintf_s(pat, L"%ls%ls", dir, patterns[p]);
-        WIN32_FIND_DATAW fd;
-        HANDLE find = FindFirstFileW(pat, &fd);
-        if (find == INVALID_HANDLE_VALUE) continue;
-        do {
-            wchar_t full[MAX_PATH];
-            swprintf_s(full, L"%ls%ls", dir, fd.cFileName);
-            if (!is_versionlib_path(full)) continue;
-            // version-1-5-97-0.bin -> parse minor
-            uint64_t minor = 0;
-            wchar_t* p = wcsstr(full, L"-1-");
-            if (p) { const wchar_t* p2 = wcschr(p + 3, L'-'); if (p2) minor = wcstoull(p2 + 1, nullptr, 10); }
-            // version-1-7-*.bin (format 1) uses a different ID scheme than
-            // versionlib-1-7-*.bin (format 5). Merging it corrupts the map
-            // with wrong offsets for fmt5 callers. Only merge 1.5.x legacy bins.
-            if (minor >= 7) continue;
-            if (minor > 0 && wcscmp(full, binPath) != 0) {
-                OldBin ob; wcscpy_s(ob.name, full); ob.minor = minor;
-                bins.push_back(ob);
-            }
-        } while (FindNextFileW(find, &fd));
-        FindClose(find);
-    }
-
-    // Newest first: prefer fills from bins closest to the current runtime.
-    std::sort(bins.begin(), bins.end(), [](const OldBin& a, const OldBin& b) {
-        return a.minor > b.minor;
-    });
-
-    for (auto& ob : bins) {
-        HANDLE h = fpCreateFileW(ob.name, GENERIC_READ,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        LARGE_INTEGER sz;
-        if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart < (LONGLONG)(1 << 26)) {
-            std::vector<uint8_t> d((size_t)sz.QuadPart);
-            DWORD total = 0;
-            while (total < d.size()) {
-                DWORD rd = 0;
-                if (!ReadFile(h, d.data() + total, (DWORD)(d.size() - total), &rd, nullptr) || rd == 0)
-                    break;
-                total += rd;
-            }
-            if (total == d.size()) {
-                uint32_t v[4]; std::string nm; uint32_t ptr = 0;
-                std::vector<std::pair<uint64_t, uint64_t>> old;
-                if (parse_format2(d.data(), d.size(), old, v, nm, ptr)) {
-                    int added = 0, filled = 0;
-                    for (auto& e : old) {
-                        auto it = have.find(e.first);
-                        if (it == have.end()) { have[e.first] = e.second; added++; }
-                        else if (it->second == 0 && e.second != 0) { it->second = e.second; filled++; }
-                    }
-                    if (added > 0 || filled > 0)
-                        shim_log("merge: +%d IDs, filled %d zeros from %ls", added, filled, ob.name);
-                }
-            }
-        }
-        CloseHandle(h);
-    }
 }
 
 // Read the real bin and build all three in-memory buffers (fmt1/fmt2/fmt5),
@@ -544,71 +456,45 @@ static void ensure_buffers(const wchar_t* binPath) {
         g_fmt5 = src;
         std::map<uint64_t, uint64_t> have;
         uint32_t mergedPtr = ptr_size;
-        for (auto& e : entries) if (e.second != 0) have[e.first] = e.second; // drop fmt5 zeros
-        if (merge_old_bins) {
-            merge_old_entries(binPath, have, mergedPtr);
-            load_translations();
-            int remapped = apply_translations(have);
-            std::vector<std::pair<uint64_t, uint64_t>> merged(have.begin(), have.end());
-            std::sort(merged.begin(), merged.end());
-            if (!encode_format2(g_fmt2, version, name, mergedPtr, merged)) {
-                g_loadFailed = true;
-                g_loading = false;
-                shim_log("ensure_buffers: encode merged fmt2 failed");
-                return;
-            }
-            if (!encode_format0(g_fmt0, version, name, mergedPtr, merged)) {
-                g_loadFailed = true;
-                g_loading = false;
-                shim_log("ensure_buffers: encode merged fmt0 failed");
-                return;
-            }
-            // fmt1 = fmt2 with format byte 1
-            if (!format2_to_format1(g_fmt2.data(), g_fmt2.size(), g_fmt1)) {
-                g_loadFailed = true;
-                g_loading = false;
-                shim_log("ensure_buffers: transcode merged fmt2 -> fmt1 failed");
-                return;
-            }
-            // g_fmt5_patched: copy of raw fmt5 with translated offsets patched in.
-            // Same size and count as original - just offset values changed at translated ID positions.
-            // This lets format-5 callers (IAL) parse it without noticing any difference.
-            g_fmt5_patched = src;  // copy raw fmt5
-            {
-                int patched = 0;
-                for (const auto& te : g_flatTranslations) {
-                    // Format 5 header = 96 bytes, each entry is a u32 offset at position 96 + id*4
-                    if (te.old_id * 4 + 96 + 4 <= g_fmt5_patched.size()) {
-                        size_t pos = 96 + (size_t)te.old_id * 4;
-                        uint32_t v = (uint32_t)te.offset;
-                        g_fmt5_patched[pos]     = (uint8_t)(v & 0xFF);
-                        g_fmt5_patched[pos + 1] = (uint8_t)((v >> 8) & 0xFF);
-                        g_fmt5_patched[pos + 2] = (uint8_t)((v >> 16) & 0xFF);
-                        g_fmt5_patched[pos + 3] = (uint8_t)((v >> 24) & 0xFF);
-                        patched++;
-                    }
+        for (auto& e : entries) if (e.second != 0) have[e.first] = e.second;
+        load_translations();
+        int remapped = apply_translations(have);
+        std::vector<std::pair<uint64_t, uint64_t>> merged(have.begin(), have.end());
+        std::sort(merged.begin(), merged.end());
+        if (!encode_format2(g_fmt2, version, name, mergedPtr, merged)) {
+            g_loadFailed = true;
+            g_loading = false;
+            shim_log("ensure_buffers: encode merged fmt2 failed");
+            return;
+        }
+        if (!encode_format0(g_fmt0, version, name, mergedPtr, merged)) {
+            g_loadFailed = true;
+            g_loading = false;
+            shim_log("ensure_buffers: encode merged fmt0 failed");
+            return;
+        }
+        // fmt1 = fmt2 with format byte 1
+        if (!format2_to_format1(g_fmt2.data(), g_fmt2.size(), g_fmt1)) {
+            g_loadFailed = true;
+            g_loading = false;
+            shim_log("ensure_buffers: transcode merged fmt2 -> fmt1 failed");
+            return;
+        }
+        // g_fmt5_patched: copy of raw fmt5 with translated offsets patched in.
+        g_fmt5_patched = src;
+        {
+            int patched = 0;
+            for (const auto& te : g_flatTranslations) {
+                if (te.old_id * 4 + 96 + 4 <= g_fmt5_patched.size()) {
+                    size_t pos = 96 + (size_t)te.old_id * 4;
+                    uint32_t v = (uint32_t)te.offset;
+                    g_fmt5_patched[pos]     = (uint8_t)(v & 0xFF);
+                    g_fmt5_patched[pos + 1] = (uint8_t)((v >> 8) & 0xFF);
+                    g_fmt5_patched[pos + 2] = (uint8_t)((v >> 16) & 0xFF);
+                    g_fmt5_patched[pos + 3] = (uint8_t)((v >> 24) & 0xFF);
+                    patched++;
                 }
             }
-        } else {
-            if (!format5_to_format2(src.data(), src.size(), g_fmt2)) {
-                g_loadFailed = true;
-                g_loading = false;
-                shim_log("ensure_buffers: transcode fmt5 -> fmt2 failed");
-                return;
-            }
-            if (!format5_to_format1(src.data(), src.size(), g_fmt1)) {
-                g_loadFailed = true;
-                g_loading = false;
-                shim_log("ensure_buffers: transcode fmt5 -> fmt1 failed");
-                return;
-            }
-            if (!format5_to_format0(src.data(), src.size(), g_fmt0)) {
-                g_loadFailed = true;
-                g_loading = false;
-                shim_log("ensure_buffers: transcode fmt5 -> fmt0 failed");
-                return;
-            }
-            g_fmt5_patched = src; // no merge: patched fmt5 = raw fmt5
         }
     } else if (srcFmt == 1 || srcFmt == 2) {
         // Source is format 1/2: keep as fmt2, transcode up to fmt5 and down to fmt1.
@@ -1188,12 +1074,21 @@ void shim_log(const char* fmt, ...) {
         char path[MAX_PATH] = {};
         DWORD len = g_self ? GetModuleFileNameA(g_self, path, MAX_PATH) : 0;
         if (len > 0 && len < MAX_PATH && path[0]) {
-            // Replace the DLL basename's extension with .log.
+            // Replace the DLL basename's extension with .log, in CompaSSE subfolder.
             char* slash = strrchr(path, '\\');
-            char* base = slash ? slash + 1 : path;
-            char* dot = strrchr(base, '.');
-            if (dot) *dot = 0;
-            strcat_s(path, ".log");
+            if (slash) {
+                // Insert "CompaSSE\" before the filename
+                char filename[MAX_PATH];
+                strcpy_s(filename, slash + 1);
+                char* dot = strrchr(filename, '.');
+                if (dot) *dot = 0;
+                strcat_s(filename, ".log");
+                *(slash + 1) = 0;
+                strcat_s(path, "CompaSSE\\");
+                strcat_s(path, filename);
+            } else {
+                path[0] = 0;
+            }
         } else {
             len = GetTempPathA(MAX_PATH, path);
             if (len > 0 && len < MAX_PATH)

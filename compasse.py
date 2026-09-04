@@ -17,6 +17,7 @@ Usage:
   python compasse.py --scan --plugins-dir <dir>      # scan and report
   python compasse.py --fix --plugins-dir <dir> --game <exe> --addresslib <bin>
   python compasse.py --audit --dll <file>            # audit single plugin
+  python compasse.py --build-translations            # build translation table
 """
 
 import argparse
@@ -85,6 +86,11 @@ def runtime_version_from_exe(exe_path):
     except Exception:
         return None
 
+def unpack_version(packed):
+    """Unpack version integer to (major, minor, patch) tuple."""
+    if packed is None: return None
+    return (packed >> 24, (packed >> 16) & 0xFF, (packed >> 8) & 0xFF)
+
 # ---------------------------------------------------------------------------
 # PE helpers
 # ---------------------------------------------------------------------------
@@ -118,6 +124,211 @@ def rva_to_offset(rva, sections):
         if vaddr <= rva < vaddr + vsize:
             return rawoff + (rva - vaddr)
     return None
+
+# ---------------------------------------------------------------------------
+# Address library parsers (for --build-translations)
+# ---------------------------------------------------------------------------
+def parse_format5(bin_data):
+    """Parse fmt5: dense u32 array. Returns dict {id: offset} or None."""
+    if len(bin_data) < 96: return None
+    if struct.unpack_from("<I", bin_data, 0)[0] != 5: return None
+    count = struct.unpack_from("<I", bin_data, 92)[0]
+    entries = {}
+    for i in range(count):
+        off = struct.unpack_from("<I", bin_data, 96 + i * 4)[0]
+        if off != 0:
+            entries[i] = off
+    return entries
+
+def parse_library_any(bin_path):
+    """Parse any versionlib/version-*.bin file. Returns dict {id: offset}."""
+    with open(bin_path, "rb") as f:
+        data = f.read()
+    fmt = struct.unpack_from("<I", data, 0)[0] if len(data) >= 4 else 0
+    if fmt == 5: return parse_format5(data)
+    elif fmt in (1, 2): return parse_addresslib(bin_path)
+    return None
+
+def read_code_sig(exe_data, sections, rva, length=64):
+    """Read code signature (bytes) at RVA from PE data."""
+    off = rva_to_offset(rva, sections)
+    if off is None or off + length > len(exe_data): return None
+    return bytes(exe_data[off:off+length])
+
+def collect_signatures(exe_data, sections, id_offsets):
+    """Extract code signatures for each ID. Returns dict {id: sig_bytes}."""
+    sigs = {}
+    for id_val, offset in id_offsets.items():
+        sig = read_code_sig(exe_data, sections, offset)
+        if sig:
+            sigs[id_val] = sig
+    return sigs
+
+def extract_version_from_filename(fn):
+    """Extract (major, minor, patch) from filename like 'version-1-6-640-0'."""
+    import re
+    m = re.search(r'(\d+)-(\d+)-(\d+)', fn)
+    if m: return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', fn)
+    if m: return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+def build_translations(game_exe, plugins_dir, game_version=None):
+    """Build translation_table.bin from old bins + current binary.
+
+    Returns (version_count, total_entries) on success, raises on error.
+    """
+    exe_data, sections = load_exe_sections(game_exe)
+    if not exe_data:
+        raise RuntimeError(f"Cannot read PE: {game_exe}")
+
+    # Find versionlib matching the game exe version
+    game_ver_tuple = unpack_version(game_version)
+    current_lib = None
+    current_ver = None
+    for p in plugins_dir.glob("versionlib-*.bin"):
+        ver = extract_version_from_filename(p.name)
+        if ver and ver == game_ver_tuple:
+            lib = parse_library_any(str(p))
+            if lib:
+                current_lib = lib
+                current_ver = ver
+                break
+    if current_lib is None:
+        # Fallback: use the first versionlib found
+        for p in plugins_dir.glob("versionlib-*.bin"):
+            ver = extract_version_from_filename(p.name)
+            if ver:
+                lib = parse_library_any(str(p))
+                if lib:
+                    current_lib = lib
+                    current_ver = ver
+                    break
+    if current_lib is None:
+        raise RuntimeError("No versionlib-*.bin found in plugins folder")
+
+    # Use the actual game exe version to exclude current version bins
+    exclude_ver = unpack_version(game_version) if game_version else current_ver
+
+    # Read existing translation table for old signatures
+    old_sigs = {}  # {version_tuple: {id: sig_bytes}}
+    trans_bin = plugins_dir / "CompaSSE" / "translation_table.bin"
+    if trans_bin.exists():
+        with open(trans_bin, "rb") as f:
+            data = f.read()
+        if len(data) >= 8 and data[:4] == b"TRTL":
+            fmt_ver = struct.unpack_from("<I", data, 4)[0]
+            o = 8
+            ver_count = struct.unpack_from("<I", data, o)[0]; o += 4
+            for _ in range(ver_count):
+                if o + 4 > len(data): break
+                ver_len = struct.unpack_from("<I", data, o)[0]; o += 4
+                if ver_len > 32 or o + ver_len > len(data): break
+                ver_str = data[o:o+ver_len].decode("ascii", errors="replace")
+                o += (ver_len + 3) & ~3
+                ver = extract_version_from_filename(ver_str.replace(".", "-"))
+                if o + 4 > len(data): break
+                entry_count = struct.unpack_from("<I", data, o)[0]; o += 4
+                sigs = {}
+                for _ in range(entry_count):
+                    if fmt_ver == 2:
+                        if o + 16 > len(data): break
+                        old_id = struct.unpack_from("<Q", data, o)[0]; o += 8
+                        o += 4  # skip offset
+                        sig_size = struct.unpack_from("<I", data, o)[0]; o += 4
+                        sig = data[o:o+sig_size]; o += sig_size
+                        sigs[old_id] = sig
+                    else:
+                        if o + 12 > len(data): break
+                        o += 12  # skip old_id + offset (v1 has no signatures)
+                if ver and sigs:
+                    old_sigs[ver] = sigs  # only v2 provides cached signatures
+
+    # Collect current signatures from the binary
+    current_sigs = collect_signatures(exe_data, sections, current_lib)
+    print(f"Current binary: {len(current_sigs)} signatures extracted")
+    print(f"Current version: {current_ver[0]}.{current_ver[1]}.{current_ver[2]}")
+
+    # Build reverse lookup: signature -> current_id (for O(1) matching)
+    sig_to_id = {}
+    for cur_id, cur_sig in current_sigs.items():
+        if cur_sig not in sig_to_id:
+            sig_to_id[cur_sig] = cur_id
+
+    # Find old version bins in plugins dir
+    old_bins = {}
+    for p in plugins_dir.glob("version-*.bin"):
+        ver = extract_version_from_filename(p.name)
+        if ver and ver != exclude_ver:
+            lib = parse_library_any(str(p))
+            if lib:
+                old_bins[ver] = lib
+
+    if not old_bins and not old_sigs:
+        raise RuntimeError("No old version bins or existing translations found")
+
+    # Build translation entries: match old IDs to current offsets
+    out = bytearray()
+    out += b"TRTL"
+    out += struct.pack("<I", 1)  # format version 1 (no signatures - DLL doesn't need them)
+    ver_count_pos = len(out)
+    out += struct.pack("<I", 0)  # placeholder
+    ver_count = 0
+    total_entries = 0
+
+    for old_ver in sorted(old_bins.keys()):
+        old_lib = old_bins[old_ver]
+        entries = []
+        for old_id, old_offset in old_lib.items():
+            # Same ID exists in current library - only translate if offset changed
+            if old_id in current_lib:
+                cur_offset = current_lib[old_id]
+                if cur_offset != old_offset:
+                    entries.append((old_id, cur_offset, b""))
+                continue
+            # ID missing from current library - try to match by signature
+            matched_sig = b""
+            if old_ver in old_sigs and old_id in old_sigs[old_ver]:
+                old_sig = old_sigs[old_ver][old_id]
+                cur_id = sig_to_id.get(old_sig)
+                if cur_id is not None:
+                    matched_sig = old_sig
+                    entries.append((old_id, current_lib.get(cur_id, 0), matched_sig))
+            else:
+                # No old signature - extract at old offset and match
+                sig = read_code_sig(exe_data, sections, old_offset)
+                if sig:
+                    cur_id = sig_to_id.get(sig)
+                    if cur_id is not None:
+                        matched_sig = sig
+                        entries.append((old_id, current_lib.get(cur_id, 0), matched_sig))
+
+        if not entries:
+            continue
+
+        entries.sort(key=lambda x: x[0])
+        ver_str = f"{old_ver[0]}.{old_ver[1]}.{old_ver[2]}"
+        ver_bytes = ver_str.encode("ascii")
+        padded_len = (len(ver_bytes) + 3) & ~3
+        out += struct.pack("<I", len(ver_bytes))
+        out += ver_bytes
+        out += b"\x00" * (padded_len - len(ver_bytes))
+        out += struct.pack("<I", len(entries))
+        for old_id, offset, sig in entries:
+            out += struct.pack("<QI", old_id, offset)
+        ver_count += 1
+        total_entries += len(entries)
+        print(f"  {ver_str}: {len(entries)} entries")
+
+    struct.pack_into("<I", out, ver_count_pos, ver_count)
+
+    # Write to CompaSSE subfolder
+    out_dir = plugins_dir / "CompaSSE"
+    out_dir.mkdir(exist_ok=True)
+    with open(out_dir / "translation_table.bin", "wb") as f:
+        f.write(out)
+    print(f"\nWrote {len(out)} bytes to {out_dir / 'translation_table.bin'} ({ver_count} versions, {total_entries} entries)")
+    return ver_count, total_entries
 
 def find_export_rva(data, sections, export_name_bytes):
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
@@ -974,7 +1185,30 @@ def main():
                         help="SkyrimSE.exe path (required for hook offset fix)")
     parser.add_argument("--addresslib", type=Path, default=None,
                         help="versionlib bin path (required for hook offset fix)")
+    parser.add_argument("--build-translations", action="store_true",
+                        help="Build translation table from old bins + current binary")
     args = parser.parse_args()
+
+    # -- Build translations mode
+    if args.build_translations:
+        # Auto-detect paths: game exe is next to this script
+        game_path = args.game
+        if game_path is None:
+            game_path = Path(__file__).resolve().parent / "SkyrimSE.exe"
+        if not game_path.exists():
+            parser.error(f"game exe not found: {game_path}")
+        plugins_dir = args.plugins_dir
+        if plugins_dir is None:
+            plugins_dir = game_path.parent / "Data" / "SKSE" / "Plugins"
+        if not plugins_dir.exists():
+            parser.error(f"plugins folder not found: {plugins_dir}")
+        game_ver = runtime_version_from_exe(game_path)
+        print(f"Game: {game_path}")
+        print(f"Plugins: {plugins_dir}")
+        ver_count, total = build_translations(str(game_path), plugins_dir,
+                                              game_version=game_ver)
+        print(f"\nDone. {ver_count} version(s), {total} total entries.")
+        return
 
     if not HAS_CAPSTONE:
         print("WARNING: capstone not installed - hook detection disabled")
