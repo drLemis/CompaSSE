@@ -33,6 +33,7 @@ def _app_dir():
 HERE = _app_dir()
 sys.path.insert(0, str(HERE))
 import compasse as core
+import skse_healer as healer
 
 
 def find_game_exe():
@@ -549,6 +550,434 @@ class PluginCard(tk.Frame):
 
 
 # ===================================================================
+# Healer card (for stale pattern scan offsets)
+# ===================================================================
+
+HEALER_BADGE_COLORS = {
+    "AUTO_FIXABLE": {"bar": "#22c55e"},
+    "MANUAL_NEEDED": {"bar": "#f97316"},
+    "FUNCTION_REWRITTEN": {"bar": "#ef4444"},
+}
+
+
+class HealerCard(tk.Frame):
+    """A card representing one stale offset finding."""
+
+    def __init__(self, parent, finding, exe_data, exe_sections, on_heal,
+                 old_exe_data=None, old_exe_sections=None, **kw):
+        super().__init__(parent, bg=CARD_BG, relief="solid", bd=1, **kw)
+        self.finding = finding
+        self.exe_data = exe_data
+        self.exe_sections = exe_sections
+        self.old_exe_data = old_exe_data
+        self.old_exe_sections = old_exe_sections
+        self.on_heal = on_heal
+        self.fixed = False
+        self.selected_offset = finding.get("new_offset")
+
+        auto_fix = finding.get("auto_fixable", False)
+        has_reason = "reason" in finding
+        has_candidates = "candidates" in finding
+        if auto_fix:
+            badge_key = "AUTO_FIXABLE"
+        elif has_reason:
+            badge_key = "FUNCTION_REWRITTEN"
+        else:
+            badge_key = "MANUAL_NEEDED"
+        colors = HEALER_BADGE_COLORS[badge_key]
+
+        # Left accent bar
+        self.bar = tk.Frame(self, bg=colors["bar"], width=4)
+        self.bar.pack(side="left", fill="y")
+
+        # Content area
+        body = tk.Frame(self, bg=CARD_BG)
+        body.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=10)
+
+        # Header: plugin name
+        dll_path = finding["dll_path"]
+        tk.Label(body, text=dll_path.name,
+                 font=(FONT_FAMILY, 11, "bold"),
+                 fg=TEXT_PRIMARY, bg=CARD_BG).pack(anchor="w")
+
+        # ID + offset info
+        id_val = finding["id_val"]
+        func_rva = finding["func_rva"]
+        old_off = finding["old_offset"]
+        new_off = finding.get("new_offset")
+        info_line = f"REL::ID {id_val}  (func RVA 0x{func_rva:X})"
+        tk.Label(body, text=info_line,
+                 font=(FONT_FAMILY, 9),
+                 fg=TEXT_SECONDARY, bg=CARD_BG,
+                 anchor="w").pack(fill="x")
+
+        # Bytes at stale offset
+        func_off = healer.rva_to_offset(func_rva, exe_sections)
+        if func_off is not None:
+            stale_bytes = healer.extract_bytes_at(exe_data, func_off + old_off, 16)
+            if stale_bytes:
+                stale_hex = stale_bytes.hex(" ")
+                tk.Label(body, text=f"New binary at 0x{old_off:X}: {stale_hex}",
+                         font=(FONT_MONO, 8),
+                         fg=TEXT_SECONDARY, bg=CARD_BG,
+                         anchor="w").pack(fill="x")
+
+        # Old binary bytes (if available)
+        if old_exe_data and old_exe_sections:
+            old_func_off = healer.rva_to_offset(func_rva, old_exe_sections)
+            if old_func_off is not None:
+                old_bytes = healer.extract_bytes_at(old_exe_data, old_func_off + old_off, 16)
+                if old_bytes:
+                    old_hex = old_bytes.hex(" ")
+                    tk.Label(body, text=f"Old binary at 0x{old_off:X}: {old_hex}",
+                             font=(FONT_MONO, 8),
+                             fg="#6366f1", bg=CARD_BG,
+                             anchor="w").pack(fill="x")
+
+        # Offset details
+        if new_off is not None:
+            detail = f"Offset: 0x{old_off:X} -> 0x{new_off:X}"
+        else:
+            detail = f"Offset: 0x{old_off:X} -> ?"
+        tk.Label(body, text=detail,
+                 font=(FONT_MONO, 9),
+                 fg=TEXT_PRIMARY, bg=CARD_BG,
+                 anchor="w").pack(fill="x")
+
+        # Status / reason
+        if "reason" in finding:
+            status_text = finding["reason"]
+        elif auto_fix and new_off is not None:
+            status_text = "Auto-fixable"
+        elif has_candidates:
+            n = len(finding["candidates"])
+            status_text = f"{n} candidates - select one below"
+        else:
+            status_text = "Needs manual investigation"
+        tk.Label(body, text=status_text,
+                 font=(FONT_FAMILY, 9),
+                 fg=TEXT_SECONDARY, bg=CARD_BG,
+                 anchor="w", wraplength=380).pack(fill="x", pady=(2, 4))
+
+        # Candidate selection (when multiple CALL+MOV patterns found)
+        self.candidate_var = tk.IntVar(value=-1)
+        self.candidate_buttons = []
+        if has_candidates and not auto_fix:
+            candidates = finding["candidates"]
+            closest = finding.get("closest_candidate")
+            tk.Label(body, text="Candidate offsets:",
+                     font=(FONT_FAMILY, 9, "bold"),
+                     fg=TEXT_PRIMARY, bg=CARD_BG,
+                     anchor="w").pack(fill="x", pady=(4, 2))
+
+            cand_frame = tk.Frame(body, bg=CARD_BG)
+            cand_frame.pack(fill="x")
+
+            for idx, (coff, call_tgt) in enumerate(candidates):
+                # Show offset and bytes at that offset
+                if func_off is not None:
+                    cand_bytes = healer.extract_bytes_at(exe_data, func_off + coff, 8)
+                    cand_hex = cand_bytes.hex(" ") if cand_bytes else "??"
+                else:
+                    cand_hex = "??"
+                dist = coff - old_off
+                label = f"0x{coff:X} ({dist:+d})  [{cand_hex}]"
+                is_closest = (closest == coff)
+                if is_closest:
+                    label += "  <-- closest"
+
+                rb = tk.Radiobutton(
+                    cand_frame, text=label,
+                    variable=self.candidate_var, value=coff,
+                    font=(FONT_MONO, 8),
+                    fg=TEXT_PRIMARY, bg=CARD_BG,
+                    selectcolor=CARD_BG,
+                    activebackground=CARD_BG,
+                    anchor="w",
+                    command=self._on_candidate_select,
+                )
+                rb.pack(fill="x", anchor="w")
+                self.candidate_buttons.append(rb)
+
+        # Action row
+        btn_frame = tk.Frame(body, bg=CARD_BG)
+        btn_frame.pack(fill="x", pady=(4, 0))
+
+        if auto_fix and new_off is not None:
+            # Direct heal button
+            self.heal_btn = tk.Button(
+                btn_frame,
+                text="Heal",
+                font=(FONT_FAMILY, 9, "bold"),
+                relief="raised", bd=1,
+                padx=12, pady=4,
+                bg="#fef08a", fg="#713f12",
+                activebackground="#fde047", activeforeground="#422006",
+                cursor="hand2",
+                command=self._on_heal_click,
+            )
+            self.heal_btn.pack(side="left")
+        elif has_candidates:
+            # Heal with selected candidate
+            self.heal_btn = tk.Button(
+                btn_frame,
+                text="Heal with selected",
+                font=(FONT_FAMILY, 9, "bold"),
+                relief="raised", bd=1,
+                padx=12, pady=4,
+                bg="#e0e0e0", fg="#404040",
+                activebackground="#d0d0d0", activeforeground="#202020",
+                cursor="hand2",
+                state="disabled",
+                command=self._on_heal_click,
+            )
+            self.heal_btn.pack(side="left")
+        else:
+            self.heal_btn = None
+
+        # Status label
+        self.status_lbl = tk.Label(body, text="",
+                                   font=(FONT_FAMILY, 9),
+                                   fg=TEXT_SECONDARY, bg=CARD_BG)
+        self.status_lbl.pack(anchor="w")
+
+    def _on_candidate_select(self):
+        sel = self.candidate_var.get()
+        if sel >= 0 and self.heal_btn:
+            self.heal_btn.config(state="normal", bg="#fef08a", fg="#713f12")
+
+    def _on_heal_click(self):
+        # Determine offset to use
+        sel = self.candidate_var.get()
+        if sel >= 0:
+            self.selected_offset = sel
+        if self.selected_offset is None:
+            return
+        if self.heal_btn:
+            self.heal_btn.config(state="disabled")
+        self.status_lbl.config(text="Patching...")
+        # Create a copy of finding with the selected offset
+        patched = dict(self.finding)
+        patched["new_offset"] = self.selected_offset
+        self.on_heal(self, patched)
+
+    def mark_fixed(self, success, message):
+        self.fixed = True
+        if self.heal_btn:
+            self.heal_btn.config(state="disabled")
+        self.status_lbl.config(
+            text="Fixed \u2713" if success else ("Failed: " + message),
+            fg="#16a34a" if success else "#dc2626",
+        )
+
+
+# ===================================================================
+# Healer Tab
+# ===================================================================
+
+class HealerTab:
+    """Tab for detecting and fixing stale pattern scan offsets in SKSE plugins."""
+
+    def __init__(self, parent, game_exe, plugins_dir_fn):
+        self.parent = parent
+        self.game_exe = game_exe
+        self._plugins_dir_fn = plugins_dir_fn
+        self.cards = []
+        self.busy = False
+        self._exe_data = None
+        self._exe_sections = None
+
+        self._build()
+
+    def _build(self):
+        # Top controls
+        ctrl = tk.Frame(self.parent, bg=BG)
+        ctrl.pack(fill="x", padx=10, pady=(10, 4))
+
+        # Plugin selector
+        tk.Label(ctrl, text="Plugin:",
+                 font=(FONT_FAMILY, 10), fg=TEXT_PRIMARY, bg=BG
+                 ).pack(side="left")
+        self.plugin_var = tk.StringVar()
+        self.plugin_entry = ttk.Entry(ctrl, textvariable=self.plugin_var, width=40)
+        self.plugin_entry.pack(side="left", padx=(6, 4))
+        ttk.Button(ctrl, text="Browse...", command=self._browse_plugin
+                   ).pack(side="left", padx=(0, 12))
+
+        # Old game exe selector (optional)
+        tk.Label(ctrl, text="Old game (optional):",
+                 font=(FONT_FAMILY, 10), fg=TEXT_PRIMARY, bg=BG
+                 ).pack(side="left")
+        self.old_game_var = tk.StringVar()
+        self.old_game_entry = ttk.Entry(ctrl, textvariable=self.old_game_var, width=40)
+        self.old_game_entry.pack(side="left", padx=(6, 4))
+        ttk.Button(ctrl, text="Browse...", command=self._browse_old_game
+                   ).pack(side="left")
+
+        # Buttons row
+        btn_frame = tk.Frame(self.parent, bg=BG)
+        btn_frame.pack(fill="x", padx=10, pady=(4, 4))
+
+        self.scan_btn = ttk.Button(btn_frame, text="Scan", command=self.scan)
+        self.scan_btn.pack(side="left", padx=(0, 6))
+
+        ttk.Button(btn_frame, text="Clear", command=self._clear_cards).pack(side="left")
+
+        # Summary
+        self.summary_lbl = tk.Label(btn_frame, text="",
+                                    font=(FONT_FAMILY, 10, "bold"),
+                                    fg=TEXT_PRIMARY, bg=BG)
+        self.summary_lbl.pack(side="left", padx=(16, 0))
+
+        # Scrollable card area
+        self.sf = ScrollFrame(self.parent)
+        self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
+
+        # Status bar
+        self.status = ttk.Label(self.parent, text="Ready", anchor="w")
+        self.status.pack(fill="x", padx=10, pady=(0, 8))
+
+    # -- Browse --
+
+    def _browse_plugin(self):
+        path = filedialog.askopenfilename(
+            title="Select Plugin DLL",
+            filetypes=[("DLL files", "*.dll"), ("All files", "*.*")],
+            initialdir=str(self._plugins_dir_fn() or ""),
+        )
+        if path:
+            self.plugin_var.set(path)
+
+    def _browse_old_game(self):
+        path = filedialog.askopenfilename(
+            title="Select Old SkyrimSE.exe (optional)",
+            filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
+        )
+        if path:
+            self.old_game_var.set(path)
+
+    # -- Scan --
+
+    def scan(self):
+        plugin_path = self.plugin_var.get().strip()
+        if not plugin_path:
+            messagebox.showerror("Error", "Select a plugin DLL first.")
+            return
+        plugin_path = Path(plugin_path)
+        if not plugin_path.exists():
+            messagebox.showerror("Error", f"Plugin not found:\n{plugin_path}")
+            return
+        if self.game_exe is None:
+            messagebox.showerror("Error", "Place this tool in the same folder as SkyrimSE.exe.")
+            return
+        plugins_dir = self._plugins_dir_fn()
+        if plugins_dir is None or not plugins_dir.exists():
+            messagebox.showerror("Error", "Plugins folder not found.")
+            return
+
+        old_game = self.old_game_var.get().strip()
+        old_game_path = Path(old_game) if old_game else None
+        if old_game_path and not old_game_path.exists():
+            messagebox.showerror("Error", f"Old game exe not found:\n{old_game_path}")
+            return
+
+        self._run(lambda: self._do_scan(plugin_path, plugins_dir, old_game_path))
+
+    def _do_scan(self, plugin_path, plugins_dir, old_game_path):
+        self.root.after(0, self._clear_cards)
+        try:
+            # Load game data for byte display in cards
+            self._exe_data, self._exe_sections = healer.load_game_sections(self.game_exe)
+            self._old_exe_data = None
+            self._old_exe_sections = None
+            if old_game_path:
+                self._old_exe_data, self._old_exe_sections = healer.load_game_sections(old_game_path)
+            findings, _, _, _ = healer.analyze_plugin(
+                plugin_path, self.game_exe, plugins_dir, old_game_path)
+        except Exception as exc:
+            self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+            return
+
+        for f in findings:
+            self.root.after(
+                0,
+                lambda finding=f: self._add_card(finding),
+            )
+
+        n = len(findings)
+        auto = sum(1 for f in findings if f.get("auto_fixable"))
+        manual = n - auto
+        if n == 0:
+            self.root.after(0, lambda: self.summary_lbl.config(
+                text="No stale offsets found"))
+        else:
+            parts = []
+            if auto:
+                parts.append(f"{auto} auto-fixable")
+            if manual:
+                parts.append(f"{manual} manual")
+            self.root.after(0, lambda t=", ".join(parts): self.summary_lbl.config(
+                text=f"{n} stale offset(s): {t}"))
+
+    def _add_card(self, finding):
+        card = HealerCard(self.sf.inner, finding,
+                          self._exe_data, self._exe_sections,
+                          on_heal=self._heal_one,
+                          old_exe_data=self._old_exe_data,
+                          old_exe_sections=self._old_exe_sections)
+        card.pack(fill="x", padx=4, pady=4)
+        self.cards.append(card)
+
+    # -- Heal --
+
+    def _heal_one(self, card, patched_finding=None):
+        self._run(lambda: self._heal_worker(card, patched_finding))
+
+    def _heal_worker(self, card, patched_finding=None):
+        finding = patched_finding or card.finding
+        dll_path = finding["dll_path"]
+        try:
+            ok = healer.heal_plugin(dll_path, finding, backup=True)
+            msg = f"0x{finding['old_offset']:X} -> 0x{finding['new_offset']:X}" if ok else "patch failed"
+            self.root.after(0, lambda: card.mark_fixed(ok, msg))
+        except Exception as exc:
+            self.root.after(0, lambda: card.mark_fixed(False, str(exc)))
+
+    # -- Helpers --
+
+    def _run(self, fn):
+        if self.busy:
+            return
+        self.busy = True
+        self.scan_btn.config(state="disabled")
+        self.status.config(text="Working\u2026")
+        threading.Thread(target=self._worker, args=(fn,), daemon=True).start()
+
+    def _worker(self, fn):
+        try:
+            fn()
+        except Exception as exc:
+            self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+        finally:
+            self.root.after(0, self._done)
+
+    def _done(self):
+        self.busy = False
+        self.scan_btn.config(state="normal")
+        self.status.config(text="Done")
+
+    def _clear_cards(self):
+        for c in self.cards:
+            c.destroy()
+        self.cards.clear()
+        self.summary_lbl.config(text="")
+
+    @property
+    def root(self):
+        return self.parent.winfo_toplevel()
+
+
+# ===================================================================
 # Main GUI
 # ===================================================================
 
@@ -589,8 +1018,33 @@ class AutoPorterGUI:
     # ──────────────────────────────────────────────────────────────
 
     def _build(self):
+        # ── Notebook (tabs) ──
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=6, pady=(6, 0))
+
+        # Tab 1: Address Library (existing functionality)
+        self.tab_main = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.tab_main, text="  Address Library  ")
+
+        # Tab 2: Healer
+        self.tab_healer = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.tab_healer, text="  Healer  ")
+
+        # ── Build main tab (existing UI, reparented to tab_main) ──
+        self._build_main_tab()
+
+        # ── Build healer tab ──
+        self.healer_tab = HealerTab(
+            self.tab_healer,
+            game_exe=self.game_exe,
+            plugins_dir_fn=self._plugins,
+        )
+
+    def _build_main_tab(self):
+        parent = self.tab_main
+
         # ── Auto-detected location hint ──
-        pf = tk.Frame(self.root, bg=BG)
+        pf = tk.Frame(parent, bg=BG)
         pf.pack(fill="x", padx=10, pady=(10, 4))
         if self.game_exe:
             tk.Label(pf, text=f"Game: {self.game_exe.name}",
@@ -607,7 +1061,7 @@ class AutoPorterGUI:
                      fg="#dc2626", bg=BG, anchor="w").pack(fill="x")
 
         # ── Buttons ──
-        bf = tk.Frame(self.root, bg=BG)
+        bf = tk.Frame(parent, bg=BG)
         bf.pack(fill="x", padx=10, pady=(4, 4))
 
         self.scan_btn = ttk.Button(bf, text="Scan", command=self.scan)
@@ -631,7 +1085,7 @@ class AutoPorterGUI:
         self.pro_btn.pack(side="left", padx=(12, 0))
 
         # ── Summary bar ──
-        sf = tk.Frame(self.root, bg=BG)
+        sf = tk.Frame(parent, bg=BG)
         sf.pack(fill="x", padx=10, pady=(4, 2))
 
         counts_row = tk.Frame(sf, bg=BG)
@@ -653,11 +1107,11 @@ class AutoPorterGUI:
         self.c_other.pack(side="left")
 
         # ── Scrollable card area ──
-        self.sf = ScrollFrame(self.root)
+        self.sf = ScrollFrame(parent)
         self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
 
         # ── Status bar ──
-        self.status = ttk.Label(self.root, text="Ready", anchor="w")
+        self.status = ttk.Label(parent, text="Ready", anchor="w")
         self.status.pack(fill="x", padx=10, pady=(0, 8))
 
     # ──────────────────────────────────────────────────────────────
@@ -910,8 +1364,9 @@ class AutoPorterGUI:
 
     def _do_build_translations(self, plugins):
         try:
+            game_ver = core.runtime_version_from_exe(self.game_exe)
             ver_count, total = core.build_translations(
-                str(self.game_exe), plugins)
+                str(self.game_exe), plugins, game_version=game_ver)
             self.root.after(0, lambda: messagebox.showinfo(
                 "Build Translations",
                 f"Done.\n{ver_count} version(s), {total} entries.\n\n"

@@ -489,7 +489,7 @@ def check_version_independence(dll_path, runtime_version=None):
     #    compatibleVersions list non-empty and runtime not in it.
     if has_addr:
         pre_cutoff = _BUILD_TIME_SENTINEL <= build_time < _BUILD_TIME_CUTOFF
-        needs_indep = (not has_structs) or (pre_cutoff and not has_ex_v5)
+        needs_indep = pre_cutoff and not has_ex_v5
     else:
         compat_list = []
         for ci in range(16):
