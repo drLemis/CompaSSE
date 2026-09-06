@@ -12,14 +12,12 @@ Three fix layers:
    then pattern-check. When the game updates the offset goes stale.
    Resolve via Address Library, scan exe, patch displacement.
 
-Also converts format-5 Address Library bins to format 2 so old plugins can
-parse them.
-
 Usage:
-  python compasse.py --scan <plugins_dir>
-  python compasse.py --fix <plugins_dir> --game <SkyrimSE.exe> --addresslib <bin>
-  python compasse.py --dll <file> --scan
-  python compasse.py --dll <file> --fix --game <exe> --addresslib <bin>
+  python compasse.py --audit --plugins-dir <dir>     # compatibility verdicts
+  python compasse.py --scan --plugins-dir <dir>      # scan and report
+  python compasse.py --fix --plugins-dir <dir> --game <exe> --addresslib <bin>
+  python compasse.py --audit --dll <file>            # audit single plugin
+  python compasse.py --build-translations            # build translation table
 """
 
 import argparse
@@ -28,7 +26,7 @@ import struct
 import sys
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 try:
     from capstone import Cs, CS_ARCH_X86, CS_MODE_64, x86
@@ -39,6 +37,7 @@ except ImportError:
 FLAG_STRUCT_OFFSET = 0x304  # versionIndependenceEx offset within SKSEPlugin_Version
 VERSION_INDEP_OFFSET = 0x308  # versionIndependence offset within SKSEPlugin_Version
 PATTERN_SCAN_RANGE = 0x1000  # scan offsets 0..0x1000 for the pattern
+SHIM_NAME = "!CompaSSE.dll"
 
 # versionIndependence flags (from SKSE64 PluginManager.cpp)
 KVI_ADDR_LIB_POST_AE = 1 << 0
@@ -87,6 +86,11 @@ def runtime_version_from_exe(exe_path):
     except Exception:
         return None
 
+def unpack_version(packed):
+    """Unpack version integer to (major, minor, patch) tuple."""
+    if packed is None: return None
+    return (packed >> 24, (packed >> 16) & 0xFF, (packed >> 8) & 0xFF)
+
 # ---------------------------------------------------------------------------
 # PE helpers
 # ---------------------------------------------------------------------------
@@ -120,6 +124,211 @@ def rva_to_offset(rva, sections):
         if vaddr <= rva < vaddr + vsize:
             return rawoff + (rva - vaddr)
     return None
+
+# ---------------------------------------------------------------------------
+# Address library parsers (for --build-translations)
+# ---------------------------------------------------------------------------
+def parse_format5(bin_data):
+    """Parse fmt5: dense u32 array. Returns dict {id: offset} or None."""
+    if len(bin_data) < 96: return None
+    if struct.unpack_from("<I", bin_data, 0)[0] != 5: return None
+    count = struct.unpack_from("<I", bin_data, 92)[0]
+    entries = {}
+    for i in range(count):
+        off = struct.unpack_from("<I", bin_data, 96 + i * 4)[0]
+        if off != 0:
+            entries[i] = off
+    return entries
+
+def parse_library_any(bin_path):
+    """Parse any versionlib/version-*.bin file. Returns dict {id: offset}."""
+    with open(bin_path, "rb") as f:
+        data = f.read()
+    fmt = struct.unpack_from("<I", data, 0)[0] if len(data) >= 4 else 0
+    if fmt == 5: return parse_format5(data)
+    elif fmt in (1, 2): return parse_addresslib(bin_path)
+    return None
+
+def read_code_sig(exe_data, sections, rva, length=64):
+    """Read code signature (bytes) at RVA from PE data."""
+    off = rva_to_offset(rva, sections)
+    if off is None or off + length > len(exe_data): return None
+    return bytes(exe_data[off:off+length])
+
+def collect_signatures(exe_data, sections, id_offsets):
+    """Extract code signatures for each ID. Returns dict {id: sig_bytes}."""
+    sigs = {}
+    for id_val, offset in id_offsets.items():
+        sig = read_code_sig(exe_data, sections, offset)
+        if sig:
+            sigs[id_val] = sig
+    return sigs
+
+def extract_version_from_filename(fn):
+    """Extract (major, minor, patch) from filename like 'version-1-6-640-0'."""
+    import re
+    m = re.search(r'(\d+)-(\d+)-(\d+)', fn)
+    if m: return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', fn)
+    if m: return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+def build_translations(game_exe, plugins_dir, game_version=None):
+    """Build translation_table.bin from old bins + current binary.
+
+    Returns (version_count, total_entries) on success, raises on error.
+    """
+    exe_data, sections = load_exe_sections(game_exe)
+    if not exe_data:
+        raise RuntimeError(f"Cannot read PE: {game_exe}")
+
+    # Find versionlib matching the game exe version
+    game_ver_tuple = unpack_version(game_version)
+    current_lib = None
+    current_ver = None
+    for p in plugins_dir.glob("versionlib-*.bin"):
+        ver = extract_version_from_filename(p.name)
+        if ver and ver == game_ver_tuple:
+            lib = parse_library_any(str(p))
+            if lib:
+                current_lib = lib
+                current_ver = ver
+                break
+    if current_lib is None:
+        # Fallback: use the first versionlib found
+        for p in plugins_dir.glob("versionlib-*.bin"):
+            ver = extract_version_from_filename(p.name)
+            if ver:
+                lib = parse_library_any(str(p))
+                if lib:
+                    current_lib = lib
+                    current_ver = ver
+                    break
+    if current_lib is None:
+        raise RuntimeError("No versionlib-*.bin found in plugins folder")
+
+    # Use the actual game exe version to exclude current version bins
+    exclude_ver = unpack_version(game_version) if game_version else current_ver
+
+    # Read existing translation table for old signatures
+    old_sigs = {}  # {version_tuple: {id: sig_bytes}}
+    trans_bin = plugins_dir / "CompaSSE" / "translation_table.bin"
+    if trans_bin.exists():
+        with open(trans_bin, "rb") as f:
+            data = f.read()
+        if len(data) >= 8 and data[:4] == b"TRTL":
+            fmt_ver = struct.unpack_from("<I", data, 4)[0]
+            o = 8
+            ver_count = struct.unpack_from("<I", data, o)[0]; o += 4
+            for _ in range(ver_count):
+                if o + 4 > len(data): break
+                ver_len = struct.unpack_from("<I", data, o)[0]; o += 4
+                if ver_len > 32 or o + ver_len > len(data): break
+                ver_str = data[o:o+ver_len].decode("ascii", errors="replace")
+                o += (ver_len + 3) & ~3
+                ver = extract_version_from_filename(ver_str.replace(".", "-"))
+                if o + 4 > len(data): break
+                entry_count = struct.unpack_from("<I", data, o)[0]; o += 4
+                sigs = {}
+                for _ in range(entry_count):
+                    if fmt_ver == 2:
+                        if o + 16 > len(data): break
+                        old_id = struct.unpack_from("<Q", data, o)[0]; o += 8
+                        o += 4  # skip offset
+                        sig_size = struct.unpack_from("<I", data, o)[0]; o += 4
+                        sig = data[o:o+sig_size]; o += sig_size
+                        sigs[old_id] = sig
+                    else:
+                        if o + 12 > len(data): break
+                        o += 12  # skip old_id + offset (v1 has no signatures)
+                if ver and sigs:
+                    old_sigs[ver] = sigs  # only v2 provides cached signatures
+
+    # Collect current signatures from the binary
+    current_sigs = collect_signatures(exe_data, sections, current_lib)
+    print(f"Current binary: {len(current_sigs)} signatures extracted")
+    print(f"Current version: {current_ver[0]}.{current_ver[1]}.{current_ver[2]}")
+
+    # Build reverse lookup: signature -> current_id (for O(1) matching)
+    sig_to_id = {}
+    for cur_id, cur_sig in current_sigs.items():
+        if cur_sig not in sig_to_id:
+            sig_to_id[cur_sig] = cur_id
+
+    # Find old version bins in plugins dir
+    old_bins = {}
+    for p in plugins_dir.glob("version-*.bin"):
+        ver = extract_version_from_filename(p.name)
+        if ver and ver != exclude_ver:
+            lib = parse_library_any(str(p))
+            if lib:
+                old_bins[ver] = lib
+
+    if not old_bins and not old_sigs:
+        raise RuntimeError("No old version bins or existing translations found")
+
+    # Build translation entries: match old IDs to current offsets
+    out = bytearray()
+    out += b"TRTL"
+    out += struct.pack("<I", 1)  # format version 1 (no signatures - DLL doesn't need them)
+    ver_count_pos = len(out)
+    out += struct.pack("<I", 0)  # placeholder
+    ver_count = 0
+    total_entries = 0
+
+    for old_ver in sorted(old_bins.keys()):
+        old_lib = old_bins[old_ver]
+        entries = []
+        for old_id, old_offset in old_lib.items():
+            # Same ID exists in current library - only translate if offset changed
+            if old_id in current_lib:
+                cur_offset = current_lib[old_id]
+                if cur_offset != old_offset:
+                    entries.append((old_id, cur_offset, b""))
+                continue
+            # ID missing from current library - try to match by signature
+            matched_sig = b""
+            if old_ver in old_sigs and old_id in old_sigs[old_ver]:
+                old_sig = old_sigs[old_ver][old_id]
+                cur_id = sig_to_id.get(old_sig)
+                if cur_id is not None:
+                    matched_sig = old_sig
+                    entries.append((old_id, current_lib.get(cur_id, 0), matched_sig))
+            else:
+                # No old signature - extract at old offset and match
+                sig = read_code_sig(exe_data, sections, old_offset)
+                if sig:
+                    cur_id = sig_to_id.get(sig)
+                    if cur_id is not None:
+                        matched_sig = sig
+                        entries.append((old_id, current_lib.get(cur_id, 0), matched_sig))
+
+        if not entries:
+            continue
+
+        entries.sort(key=lambda x: x[0])
+        ver_str = f"{old_ver[0]}.{old_ver[1]}.{old_ver[2]}"
+        ver_bytes = ver_str.encode("ascii")
+        padded_len = (len(ver_bytes) + 3) & ~3
+        out += struct.pack("<I", len(ver_bytes))
+        out += ver_bytes
+        out += b"\x00" * (padded_len - len(ver_bytes))
+        out += struct.pack("<I", len(entries))
+        for old_id, offset, sig in entries:
+            out += struct.pack("<QI", old_id, offset)
+        ver_count += 1
+        total_entries += len(entries)
+        print(f"  {ver_str}: {len(entries)} entries")
+
+    struct.pack_into("<I", out, ver_count_pos, ver_count)
+
+    # Write to CompaSSE subfolder
+    out_dir = plugins_dir / "CompaSSE"
+    out_dir.mkdir(exist_ok=True)
+    with open(out_dir / "translation_table.bin", "wb") as f:
+        f.write(out)
+    print(f"\nWrote {len(out)} bytes to {out_dir / 'translation_table.bin'} ({ver_count} versions, {total_entries} entries)")
+    return ver_count, total_entries
 
 def find_export_rva(data, sections, export_name_bytes):
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
@@ -184,10 +393,29 @@ def check_flag(dll_path):
         "needs_patch": flag_val == 0,
     }
 
+def _backup(src_path):
+    """Copy a file to <src_dir>/CompaSSE/backups/ before modification.
+
+    Idempotent: skips if a backup already exists. Returns the backup path.
+    Backups live in one subfolder instead of being laying around.
+    """
+    parent = src_path.parent
+    out_dir = parent / "CompaSSE" / "backups"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bak = out_dir / (src_path.name + ".bak")
+    if not bak.exists():
+        shutil.copy2(src_path, bak)
+    return bak
+
+def backup_bytes(path, data):
+    """Backup a file then atomically overwrite it with the given bytes."""
+    _backup(path)
+    with open(path, "wb") as f:
+        f.write(data)
+
 def patch_flag(dll_path):
     """Patch versionIndependenceEx 0->2 with backup. Returns True if patched."""
-    with open(dll_path, "rb") as f:
-        data = bytearray(f.read())
+    data = bytearray(open(dll_path, "rb").read())
     sections = find_pe_sections(data)
     rva = find_export_rva(data, sections, b"SKSEPlugin_Version")
     struct_off = rva_to_offset(rva, sections)
@@ -195,11 +423,7 @@ def patch_flag(dll_path):
     if struct.unpack_from("<I", data, flag_off)[0] != 0:
         return False
     struct.pack_into("<I", data, flag_off, 2)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return True
 
 # ---------------------------------------------------------------------------
@@ -265,7 +489,7 @@ def check_version_independence(dll_path, runtime_version=None):
     #    compatibleVersions list non-empty and runtime not in it.
     if has_addr:
         pre_cutoff = _BUILD_TIME_SENTINEL <= build_time < _BUILD_TIME_CUTOFF
-        needs_indep = (not has_structs) or (pre_cutoff and not has_ex_v5)
+        needs_indep = pre_cutoff and not has_ex_v5
     else:
         compat_list = []
         for ci in range(16):
@@ -331,11 +555,7 @@ def patch_version_independence(dll_path):
     struct.pack_into("<I", data, indep_off, new_indep)
     struct.pack_into("<I", data, flag_off, new_flag)
 
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return True
 
 def patch_flag_force(dll_path):
@@ -358,11 +578,7 @@ def patch_flag_force(dll_path):
         return False
     old = struct.unpack_from("<I", data, flag_off)[0]
     struct.pack_into("<I", data, flag_off, 2)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return old != 2
 
 def patch_version_independence_force(dll_path):
@@ -390,11 +606,7 @@ def patch_version_independence_force(dll_path):
     new_flag = old_flag | KVIEX_ADDR_LIB_V5  # |= 0x2
     struct.pack_into("<I", data, indep_off, new_indep)
     struct.pack_into("<I", data, flag_off, new_flag)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return (old_indep != new_indep) or (old_flag != new_flag)
 
 # ---------------------------------------------------------------------------
@@ -671,11 +883,7 @@ def patch_hook_offset(dll_path, hook, new_offset):
     if cur != hook["offset"]:
         return False
     struct.pack_into("<I", data, disp_off, new_offset)
-    bak = dll_path.with_suffix(".dll.bak")
-    if not bak.exists():
-        shutil.copy2(dll_path, bak)
-    with open(dll_path, "wb") as f:
-        f.write(data)
+    backup_bytes(dll_path, bytes(data))
     return True
 
 # ---------------------------------------------------------------------------
@@ -764,6 +972,125 @@ def analyze_plugin(dll_path, runtime_version=None):
     return info
 
 
+# ---------------------------------------------------------------------------
+# Audit: definitive compatibility verdict
+# ---------------------------------------------------------------------------
+def _audit_plugin(dll_path, runtime_version=None):
+    """Audit a single plugin against the definitive compatibility rules.
+
+    Returns dict with:
+        name:    plugin filename
+        verdict: SAFE / NEEDS_FIX / BROKEN / UNKNOWN
+        reason:  one-line human-readable explanation
+        details: dict of raw analysis data (flag, vi, hooks, build_year)
+    """
+    info = analyze_plugin(dll_path, runtime_version)
+    build_year = None
+    try:
+        with open(dll_path, "rb") as f:
+            hdr = f.read(0x400)
+        pe_off = struct.unpack_from("<I", hdr, 0x3C)[0]
+        if pe_off + 8 <= len(hdr) and hdr[pe_off:pe_off + 4] == b"PE\x00\x00":
+            ts = struct.unpack_from("<I", hdr, pe_off + 8)[0]
+            if ts != 0:
+                from datetime import datetime, timezone
+                build_year = datetime.fromtimestamp(ts, tz=timezone.utc).year
+    except Exception:
+        pass
+
+    flag = info["flag"]
+    vi = info["version_indep"]
+    hooks = info["hooks"]
+
+    # Not an SKSE plugin at all
+    if flag is None and vi is None:
+        return {
+            "name": dll_path.name,
+            "verdict": "UNKNOWN",
+            "reason": "Not an SKSE plugin (no SKSEPlugin_Version export).",
+            "details": {"build_year": build_year},
+        }
+
+    has_addr = vi.get("has_addr", False) if vi else False
+    flag_patch = flag is not None and flag.get("needs_patch", False)
+    indep_patch = vi is not None and vi.get("needs_indep", False)
+    has_unknown = vi is not None and vi.get("has_unknown", False)
+    needs_fix = flag_patch or indep_patch
+
+    # Rule 1: built with CommonLibSSE? (heuristic: build year + has SKSE export)
+    # Rule 2: uses Address Library? (versionIndependence flag bit)
+    # Rule 3: has hardcoded offsets? (capstone hook scan finds REL::ID + offset)
+
+    old_build = build_year is not None and build_year < 2025
+
+    # BROKEN: old build, no Address Library, likely hardcoded offsets
+    if old_build and not has_addr and not needs_fix:
+        return {
+            "name": dll_path.name,
+            "verdict": "BROKEN",
+            "reason": (f"Built {build_year}, no Address Library. "
+                       "Likely hardcoded offsets - will crash on current runtime."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # BROKEN: unknown flags, can't verify
+    if has_unknown:
+        return {
+            "name": dll_path.name,
+            "verdict": "BROKEN",
+            "reason": (f"Unknown versionIndependence flags (0x{vi['indep_val']:x}). "
+                       "Cannot verify compatibility."),
+            "details": {"build_year": build_year, "has_addr": has_addr},
+        }
+
+    # NEEDS_FIX: flag patches will make it work
+    if needs_fix and has_addr:
+        reasons = []
+        if flag_patch:
+            reasons.append("versionIndependenceEx flag is 0 (needs 2)")
+        if indep_patch:
+            reasons.append(f"versionIndependence is 0x{vi['indep_val']:x} (needs 0x{KVI_TARGET:x})")
+        extra = f", {len(hooks)} hook offsets stale" if hooks else ""
+        return {
+            "name": dll_path.name,
+            "verdict": "NEEDS_FIX",
+            "reason": "; ".join(reasons) + extra,
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # NEEDS_FIX: needs flags but no address library - risky
+    if needs_fix and not has_addr:
+        return {
+            "name": dll_path.name,
+            "verdict": "NEEDS_FIX",
+            "reason": (f"Built {build_year or '?'}, no Address Library. "
+                       "Flag patches applied but hardcoded offsets may still break it."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # SAFE: flags correct, uses Address Library
+    if has_addr and not needs_fix:
+        extra = f", {len(hooks)} hooks verified" if hooks else ""
+        return {
+            "name": dll_path.name,
+            "verdict": "SAFE",
+            "reason": f"Uses Address Library, flags correct{extra}.",
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # UNKNOWN: can't determine
+    return {
+        "name": dll_path.name,
+        "verdict": "UNKNOWN",
+        "reason": "Cannot determine compatibility. Review manually.",
+        "details": {"build_year": build_year, "has_addr": has_addr},
+    }
+
+
 def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dry_run=True):
     """Fix a single plugin. Returns list of action strings."""
     actions = []
@@ -844,37 +1171,50 @@ def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dr
 def main():
     parser = argparse.ArgumentParser(
         description=f"CompaSSE {VERSION} for Skyrim SE 1.7.99+")
-    parser.add_argument("--scan", action="store_true", help="Scan and report (no changes)")
-    parser.add_argument("--fix", action="store_true", help="Apply fixes")
-    parser.add_argument("--plugins-dir", type=Path, default=None, help="Plugins dir to scan/fix")
-    parser.add_argument("--dll", type=Path, default=None, help="Single DLL to scan/fix")
-    parser.add_argument("--game", type=Path, default=None, help="SkyrimSE.exe path (for offset fix)")
-    parser.add_argument("--addresslib", type=Path, default=None, help="versionlib bin path (for offset fix)")
-    parser.add_argument("--convert-bin", action="store_true", help="Convert format-5 bins to format 2")
+    parser.add_argument("--scan", action="store_true",
+                        help="Scan plugins and show status (no changes)")
+    parser.add_argument("--audit", action="store_true",
+                        help="Audit plugins against compatibility rules")
+    parser.add_argument("--fix", action="store_true",
+                        help="Apply fixes to plugins")
+    parser.add_argument("--plugins-dir", type=Path, default=None,
+                        help="SKSE plugins directory")
+    parser.add_argument("--dll", type=Path, default=None,
+                        help="Single DLL to process")
+    parser.add_argument("--game", type=Path, default=None,
+                        help="SkyrimSE.exe path (required for hook offset fix)")
+    parser.add_argument("--addresslib", type=Path, default=None,
+                        help="versionlib bin path (required for hook offset fix)")
+    parser.add_argument("--build-translations", action="store_true",
+                        help="Build translation table from old bins + current binary")
     args = parser.parse_args()
 
+    # -- Build translations mode
+    if args.build_translations:
+        # Auto-detect paths: game exe is next to this script
+        game_path = args.game
+        if game_path is None:
+            game_path = Path(__file__).resolve().parent / "SkyrimSE.exe"
+        if not game_path.exists():
+            parser.error(f"game exe not found: {game_path}")
+        plugins_dir = args.plugins_dir
+        if plugins_dir is None:
+            plugins_dir = game_path.parent / "Data" / "SKSE" / "Plugins"
+        if not plugins_dir.exists():
+            parser.error(f"plugins folder not found: {plugins_dir}")
+        game_ver = runtime_version_from_exe(game_path)
+        print(f"Game: {game_path}")
+        print(f"Plugins: {plugins_dir}")
+        ver_count, total = build_translations(str(game_path), plugins_dir,
+                                              game_version=game_ver)
+        print(f"\nDone. {ver_count} version(s), {total} total entries.")
+        return
+
     if not HAS_CAPSTONE:
-        print("WARNING: capstone not installed - hook detection disabled (flag patch still works)")
+        print("WARNING: capstone not installed - hook detection disabled")
 
     if args.dll is None and args.plugins_dir is None:
-        args.plugins_dir = Path(
-            r"D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins"
-        )
-
-    # Convert bins
-    if args.convert_bin and args.plugins_dir:
-        print("=== Converting format-5 Address Library bins ===")
-        for bin_file in sorted(args.plugins_dir.glob("versionlib-*.bin")):
-            with open(bin_file, "rb") as f:
-                fmt = struct.unpack("<i", f.read(4))[0]
-            if fmt == 5:
-                bak = bin_file.with_suffix(".bin.bak")
-                if not bak.exists():
-                    shutil.copy2(bin_file, bak)
-                n, sz = convert_format5_to_format2(bin_file, bin_file)
-                print(f"  {bin_file.name}: format 5 -> 2 ({n} entries, {sz} bytes)")
-            else:
-                print(f"  {bin_file.name}: format {fmt}, skip")
+        parser.error("specify --plugins-dir or --dll")
 
     # Load game + addresslib for offset fix
     exe = None
@@ -882,11 +1222,13 @@ def main():
     addresslib = None
     runtime_version = None
     if args.fix and (args.game or args.dll):
-        game_path = args.game or Path(r"D:\SteamLibrary\steamapps\common\Skyrim Special Edition\SkyrimSE.exe")
+        game_path = args.game
+        if game_path is None:
+            parser.error("--game is required for --fix")
         runtime_version = runtime_version_from_exe(game_path) if game_path.exists() else None
-        al_path = args.addresslib or Path(
-            r"D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins\versionlib-1-7-104-0.bin"
-        )
+        al_path = args.addresslib
+        if al_path is None:
+            parser.error("--addresslib is required for --fix")
         if game_path.exists():
             exe, exe_sections = load_exe_sections(game_path)
         else:
@@ -908,45 +1250,48 @@ def main():
         print(f"ERROR: no plugins found at {args.plugins_dir}")
         sys.exit(1)
 
+    # -- Audit mode: definitive compatibility verdicts
+    if args.audit:
+        print(f"\n=== AUDIT {len(dlls)} plugin(s) ===\n")
+        counts = {"SAFE": 0, "NEEDS_FIX": 0, "BROKEN": 0, "UNKNOWN": 0}
+        for dll in dlls:
+            result = _audit_plugin(dll, runtime_version)
+            v = result["verdict"]
+            counts[v] = counts.get(v, 0) + 1
+            tag = {"SAFE": "[OK]", "NEEDS_FIX": "[FIX]", "BROKEN": "[!!]", "UNKNOWN": "[??]"}[v]
+            print(f"  {tag} {result['name']}: {result['reason']}")
+        print(f"\n  {counts['SAFE']} safe, {counts['NEEDS_FIX']} needs fix, "
+              f"{counts['BROKEN']} broken, {counts['UNKNOWN']} unknown")
+        return
+
+    # -- Scan / Fix mode
     mode = "SCAN" if dry_run else "FIX"
     print(f"\n=== {mode} {len(dlls)} plugin(s) ===")
 
     for dll in dlls:
         info = analyze_plugin(dll, runtime_version)
         print(f"\n{dll.name}:")
+
         if info["flag"] is None:
-            print("  not an SKSE plugin (no SKSEPlugin_Version export)")
+            print("  not an SKSE plugin")
         elif info["flag"]["needs_patch"]:
-            print(f"  flag: NEEDS PATCH (versionIndependenceEx=0 -> 2)")
+            print("  flag: NEEDS PATCH")
         else:
-            print(f"  flag: OK (versionIndependenceEx={info['flag']['flag_val']})")
+            print("  flag: OK")
 
         vi = info["version_indep"]
         if vi is not None:
             if vi["has_unknown"]:
-                print(
-                    f"  versionIndependence: UNKNOWN FLAGS 0x{vi['indep_val']:x} "
-                    f"(not patching)"
-                )
+                print(f"  versionIndependence: UNKNOWN (0x{vi['indep_val']:x})")
             elif vi["needs_indep"]:
-                print(
-                    f"  versionIndependence: NEEDS PATCH "
-                    f"(0x{vi['indep_val']:x} -> 0x{KVI_TARGET:x})"
-                )
+                print("  versionIndependence: NEEDS PATCH")
             else:
-                print(f"  versionIndependence: OK (0x{vi['indep_val']:x})")
-            if vi["runtime_ver"]:
-                print(
-                    f"  compatibleVersions[0]: {_packed_to_ver(vi['runtime_ver'])}"
-                )
+                print("  versionIndependence: OK")
 
         if info["hooks"]:
             print(f"  hooks: {len(info['hooks'])} auto-portable")
-            for h in info["hooks"]:
-                pat_str = " ".join(f"{h['pattern'].get(k, '??'):02x}" for k in sorted(h['pattern'].keys()))
-                print(f"    REL::ID={h['rel_id']} offset=0x{h['offset']:x} len={h['pattern_len']} [{pat_str}]")
         else:
-            print(f"  hooks: none auto-portable")
+            print("  hooks: none")
 
         if args.fix:
             for action in fix_plugin(dll, exe, exe_sections, addresslib,

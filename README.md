@@ -1,40 +1,146 @@
 # CompaSSE
-**Reanimate old SKSE plugins for current Skyrim Special Edition. Or at least try to.**
 
-This is a simple tool that occasionally fixes outdated Skyrim Script Extender (SKSE) plugins, allowing them to run on modern game runtimes without waiting for mod authors to recompile them.
+## TL;DR
 
-## The Problem
-Skyrim updates break plugins. When a new game version releases, plugins built for the old runtime are automatically rejected by SKSE and fail to load. This happens for three main reasons:
-1.  **Missing version independence flag**: CommonLibNG plugins often lack the `versionIndependenceEx` flag, causing SKSE to reject them, because there is no way to tell if they will even work on the new version.
-2.  **Incompatible version declaration**: Plugins declare a specific game version they support. When the game updates, this declaration no longer matches, and SKSE refuses to load them.
-3.  **Stale offsets**: Some plugins use `REL::ID(n) + hardcoded offset` for pattern checks. After a game update, these offsets become stale, breaking the plugin's internal logic. The AddressLibrary.dll been out for years, but before that - it was wild out there. And here we are now.
+Skyrim SE keeps getting updates. Every update breaks old SKSE mods because
+the addresses where game functions live change. Mod authors have to recompile
+their mods for each update, and most don't.
 
-## The Solution
-CompaSSE applies three fix layers to "broken" SKSE plugins:
-1.  **Flag Patch**: Corrects the `versionIndependenceEx` flag to `AddressLibraryV5` (0x2), which is required for modern SKSE. This will allow SKSE to at least load it properly.
-2.  **Version Independence Patch**: Overrides the plugin's version declaration, marking it as compatible with all post-AE (1.6.629+) runtimes and skipping build-time compatibility checks.
-3.  **Offset/Pattern Fix**: Automatically resolves stale offsets via Address Library, scans the game executable for the correct pattern, and patches the plugin to use the updated displacement.
-Additionally, it can convert format 5 Address Library bins to format 2, allowing older plugins to parse them, but if you're that deep - there is something so wrong at this point that you should never trust some random too from The Internetz to do that.
+CompaSSE fixes this. It has two parts that work together:
 
-## Prerequisites
-*   Python 3.6+
-*   A lotta free time and an itch for old mods on your modern Skyrim release.
-### Optional prerequisites
-*   `capstone` library for hook detection (install via `pip install capstone`). The flag and version independence patches work without it.
+1. **CompaSSE.exe** patches mods on disk so SKSE accepts them (fixes the
+   "must be recompiled" error)
+2. **!CompaSSE.dll** intercepts address library reads at runtime
+   so mods get the right function offsets for the current game version
 
-## Commands
+Run the patcher once, drop the shim in, and old mods work again.
+
+**If a mod was built with CommonLibSSE and uses Address Library (most modern
+mods), CompaSSE makes it work. If a mod has hardcoded offsets or uses the
+old SKSE library, nothing can help - it needs a rewrite by the author.**
+
+---
+
+## What it does
+
+CompaSSE fixes outdated Skyrim Script Extender (SKSE) plugins so they load
+on modern game runtimes without waiting for mod author recompiles. It has
+two components that solve different parts of the problem:
+
+### 1. CompaSSE.exe - patches mods on disk
+
+A Python CLI/GUI that fixes the version flags SKSE checks during load:
+
+- **Audit** - checks each plugin against compatibility rules and gives a
+  verdict: SAFE / NEEDS FIX / BROKEN / UNKNOWN
+- **Fix** - patches `versionIndependenceEx` and `versionIndependence` flags
+  so SKSE accepts the plugin (fixes "must be recompiled" errors)
+- **Scan** - shows current flag status without changes
+
 ```bash
-# Scan plugins to see what needs fixing (dry run)
-python compasse.py --scan <plugins_dir>
+# Audit all plugins - shows which are safe, which need fixes, which are dead
+python compasse.py --audit --plugins-dir <dir>
 
-# Fix all plugins in a directory (requires game exe and Address Library)
-python compasse.py --fix <plugins_dir> --game <SkyrimSE.exe> --addresslib <versionlib.bin>
+# Scan and show flag status
+python compasse.py --scan --plugins-dir <dir>
 
-# Analyze a single DLL
-python compasse.py --dll <plugin.dll> --scan
-python compasse.py --dll <plugin.dll> --fix --game <exe> --addresslib <bin>
+# Apply fixes (requires game exe + address library)
+python compasse.py --fix --plugins-dir <dir> --game SkyrimSE.exe --addresslib versionlib.bin
+
+# Build translation table (auto-detects paths from game exe location)
+python compasse.py --build-translations --game SkyrimSE.exe --plugins-dir <dir>
 ```
-Or just run the CompaSSE.exe like everyone does.
 
-## Secret sauce
-This is bundled with custom-made DLL for rerouting different versions of AddressLibrary calls from a pool of DLLs to proper instructions, so the outdated library presenting itself as modern can actually get proper addresses instead of the modern ones. Don't ask how it works. It is awful under the hood. I will throw it into garbage one day, but it is yet to come.
+### 2. !CompaSSE.dll - serves correct offsets at runtime
+
+A C++ DLL placed in `Data/SKSE/Plugins/` that hooks Windows APIs. Even
+after flag patching, old mods still read the wrong offsets from the address
+library because the format or version changed. The shim intercepts these
+reads and serves compatible data.
+
+Both components are needed: the patcher fixes what SKSE checks, the shim
+fixes what the mods read.
+
+See [DLL/README.md](DLL/README.md) for the full technical breakdown.
+
+## Compatibility rules
+
+A mod is safe if and only if:
+1. It was built with **CommonLibSSE** (not the old `skse_github/common` lib)
+2. It uses **Address Library** for function lookups (`REL::ID`)
+3. The game functions it calls **still exist** in the current version
+
+**Red flags**: hardcoded offsets, old `skse_github/common` library, no
+`SKSEPlugin_Version` export. These mods are usually dead without a rewrite.
+
+## Quick deploy
+
+```powershell
+# 1. Patch mods on disk (fixes "must be recompiled" errors)
+python compasse.py --fix --plugins-dir "D:\...\Data\SKSE\Plugins" `
+    --game "D:\...\SkyrimSE.exe" `
+    --addresslib "D:\...\Data\SKSE\Plugins\versionlib-1-7-104-0.bin"
+
+# 2. Deploy the shim DLL (serves correct offsets at runtime)
+.\DLL\deploy.ps1
+
+# Or do both at once:
+.\DLL\deploy.ps1 -Kill -Launch
+```
+
+## How it works (TL;DR)
+
+### Step 1: Flag patching (CompaSSE.exe)
+
+SKSE checks each plugin's `SKSEPlugin_Version` export for two flags:
+- `versionIndependenceEx` at offset +0x304 must have bit 0x2
+- `versionIndependence` at offset +0x308 must have bits 0x1 | 0x4
+
+Old mods don't have these flags set. CompaSSE.exe patches them on disk so
+SKSE accepts the plugin during its two-pass load.
+
+### Step 2: Address library serving (shim DLL)
+
+After SKSE loads a patched mod, the mod opens the address library bin to
+look up function offsets. The shim intercepts this read and serves a
+compatible version based on what the mod can parse:
+- Format 5 callers (commonlibsse-ng) get the real file
+- Format 2 callers (most mods) get a transcoded temp file
+- Format 1 callers (old CommonLibSSE) get a transcoded temp file
+
+The shim also merges legacy IDs from old address library versions and
+applies cross-version translation tables so mods get the offsets they
+expect for the current game version.
+
+## Building from source
+
+Prerequisites: Visual Studio Build Tools (MSVC), Python 3.x
+
+```powershell
+# Build the shim DLL
+cmd /c DLL\build_shim.bat
+
+# Build the release bundle (PyInstaller + shim DLL)
+.\build_release.ps1
+```
+
+## Project structure
+```
+CompaSSE/
++- compasse.py              # CLI tool (audit/scan/fix)
++- compasse_gui.py          # GUI tool (per-mod cards)
++- CompaSSE.spec            # PyInstaller spec for GUI exe
++- build_release.ps1        # Release bundle builder
++- DLL/
+|  +- deploy.ps1            # Build + deploy automation
+|  +- build_shim.bat        # MSVC build script
+|  +- main.cpp              # DLL entry, SKSE exports, crash VEH
+|  +- hooks.cpp             # All 13 API hooks, serve logic, translation
+|  +- hooks.h               # Hook interface
+|  +- decoder_detect.cpp    # Import-based format detection
+|  +- transcode.cpp         # Format transcoding (0/1/2/5)
+|  +- postload_scan.cpp     # Post-load plugin analysis
+|  +- minhook/              # MinHook library (hooking framework)
+|  +- README.md             # Full technical documentation
++- README.md                # This file
+```
