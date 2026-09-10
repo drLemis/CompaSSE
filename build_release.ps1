@@ -25,10 +25,20 @@ $CompaSSEDir = Join-Path $DataDir 'CompaSSE'
 New-Item -ItemType Directory -Path $CompaSSEDir -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root 'DLL\build\!CompaSSE.dll') -Destination $DataDir
 
-# Build translation table against installed game's old bins
-$DefaultPluginsDir = 'D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins'
-$GameExe = Join-Path (Split-Path -Parent $DefaultPluginsDir) 'SkyrimSE.exe'
-if (Test-Path -LiteralPath $GameExe) {
+# Build translation table against installed game's old bins (best effort, skipped without a game)
+$DefaultPluginsDir = $env:COMPASSE_PLUGINS_DIR
+if (-not $DefaultPluginsDir) {
+    $sp = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -Name SteamPath -ErrorAction SilentlyContinue).SteamPath
+    if ($sp) {
+        $cand = Join-Path $sp 'steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins'
+        if (Test-Path -LiteralPath $cand) { $DefaultPluginsDir = $cand }
+    }
+}
+$GameExe = $null
+if ($DefaultPluginsDir) {
+    $GameExe = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $DefaultPluginsDir))) 'SkyrimSE.exe'
+}
+if ($GameExe -and (Test-Path -LiteralPath $GameExe)) {
     Write-Host '== Building translation table =='
     python compasse.py --build-translations --game $GameExe --plugins-dir $DefaultPluginsDir
     if ($LASTEXITCODE -ne 0) { Write-Warning "Translation build failed (exit code $LASTEXITCODE)" }

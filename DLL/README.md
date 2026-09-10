@@ -160,7 +160,7 @@ parse, but older plugins only understand format 1 or 2.
 
 ## Hook Chain (13 hooks)
 
-The shim installs 13 hooks via [MinHook](https://github.com/TsudaKageworst/minhook):
+The shim installs 13 hooks via [MinHook](https://github.com/TsudaKageyu/minhook):
 
 ### File API hooks (6)
 

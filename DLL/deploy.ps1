@@ -67,8 +67,47 @@ $ProjectRoot = Split-Path -Parent $ScriptDir
 $BuildBat = Join-Path $ScriptDir 'build_shim.bat'
 $BuildOutput = Join-Path $ScriptDir 'build\!CompaSSE.dll'
 
+# Locate the SKSE plugins folder: explicit arg, env var, then Steam
+# libraries from the registry + libraryfolders.vdf. No hardcoded paths.
+function Find-SkyrimPluginsDir {
+    if ($env:COMPASSE_PLUGINS_DIR -and (Test-Path -LiteralPath $env:COMPASSE_PLUGINS_DIR)) {
+        return $env:COMPASSE_PLUGINS_DIR
+    }
+    $roots = @()
+    foreach ($hive in @('HKCU:\Software\Valve\Steam', 'HKLM:\SOFTWARE\Wow6432Node\Valve\Steam', 'HKLM:\SOFTWARE\Valve\Steam')) {
+        try {
+            $sp = (Get-ItemProperty -LiteralPath $hive -Name SteamPath -ErrorAction Stop).SteamPath
+            if ($sp) { $roots += $sp }
+        } catch { }
+    }
+    $libs = @()
+    foreach ($root in ($roots | Select-Object -Unique)) {
+        $libs += (Join-Path $root 'steamapps')
+        $vdf = Join-Path $root 'steamapps\libraryfolders.vdf'
+        if (Test-Path -LiteralPath $vdf) {
+            $raw = Get-Content -LiteralPath $vdf -Raw -ErrorAction SilentlyContinue
+            if ($raw) {
+                foreach ($m in [regex]::Matches($raw, '"path"\s+"([^"]+)"')) {
+                    $libs += (Join-Path ($m.Groups[1].Value -replace '\\\\', '\') 'steamapps')
+                }
+            }
+        }
+    }
+    foreach ($lib in ($libs | Select-Object -Unique)) {
+        $cand = Join-Path $lib 'common\Skyrim Special Edition\Data\SKSE\Plugins'
+        if (Test-Path -LiteralPath $cand) {
+            return $cand
+        }
+    }
+    return $null
+}
+
 if (-not $PluginsDir) {
-    $PluginsDir = 'D:\SteamLibrary\steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins'
+    $PluginsDir = Find-SkyrimPluginsDir
+}
+if (-not $PluginsDir -or -not (Test-Path -LiteralPath $PluginsDir)) {
+    Write-Host "   FAIL: Plugins folder not found: ${PluginsDir}. Pass -PluginsDir <path> or set COMPASSE_PLUGINS_DIR." -ForegroundColor Red
+    exit 1
 }
 $SkyrimDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PluginsDir))
 $GameExe = Join-Path $SkyrimDir 'SkyrimSE.exe'
@@ -177,13 +216,6 @@ if ($NoBuild) {
     } else {
         Write-Fail "CompaSSE.exe not found after build"
     }
-}
-
-# ---- Verify target folder exists ----
-if (-not (Test-Path -LiteralPath $PluginsDir)) {
-    Write-Fail "Plugins folder not found: $PluginsDir"
-    Write-Host "   Check your Skyrim SE install path." -ForegroundColor Yellow
-    exit 1
 }
 
 # ---- Deploy DLL ----
