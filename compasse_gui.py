@@ -1312,13 +1312,24 @@ class AutoPorterGUI:
     # ──────────────────────────────────────────────────────────────
 
     def _resolve_al(self):
-        """Return the first versionlib bin in the plugins folder."""
+        """Return the versionlib matching the game exe, else first found.
+
+        A stale-version lib maps IDs to wrong RVAs, poisoning every hook
+        fix - same rule as the healer's loader.
+        """
         plugins = self._plugins()
-        if plugins and plugins.exists():
-            bins = sorted(plugins.glob("versionlib-*.bin"))
-            if bins:
-                return bins[0]
-        return None
+        if not plugins or not plugins.exists():
+            return None
+        bins = sorted(plugins.glob("versionlib-*.bin"))
+        if not bins:
+            return None
+        if self.game_exe:
+            game_ver = core.unpack_version(core.runtime_version_from_exe(self.game_exe))
+            if game_ver:
+                for b in bins:
+                    if core.extract_version_from_filename(b.name) == game_ver:
+                        return b
+        return bins[0]
 
 
 # ===================================================================
