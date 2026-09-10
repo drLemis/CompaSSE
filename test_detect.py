@@ -304,6 +304,28 @@ def main():
     t14b.write_bytes(make_pe64([(".text", 0x1000, 0x100, 0x400, 0x100)]))
     check("T14.zero", C.pe_build_dt(t14b) is None, "zero ts")
 
+    # ---------------------------------------------------------------- T16: mod names
+    import json
+    data16 = tmp / "Data"
+    plug16 = data16 / "SKSE" / "Plugins"
+    plug16.mkdir(parents=True)
+    (data16 / "vortex.deployment.json").write_text(json.dumps({"files": [
+        {"relPath": "SKSE\\Plugins\\CoolMod.dll", "source": "Cool Mod v1"},
+        {"relPath": "SKSE/Plugins/Other.dll", "source": ""},
+        {"relPath": "SKSE\\Plugins\\Dup.dll", "source": "First"},
+        {"relPath": "SKSE\\Plugins\\Dup.dll", "source": "Second"},
+    ]}), encoding="utf-8")
+    C.find_mod_names.cache_clear()
+    m16 = C.find_mod_names(str(plug16))
+    check("T16.map", m16.get("coolmod.dll") == "Cool Mod v1", repr(m16))
+    check("T16.empty-src", "other.dll" not in m16, repr(m16))
+    check("T16.first-wins", m16.get("dup.dll") == "First", repr(m16))
+    check("T16.missing",
+          C.find_mod_names(str(tmp / "nomanifest" / "Plugins")) == {}, "no manifest")
+    (data16 / "vortex.deployment.json").write_text("{corrupt", encoding="utf-8")
+    C.find_mod_names.cache_clear()
+    check("T16.corrupt", C.find_mod_names(str(plug16)) == {}, "bad json")
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

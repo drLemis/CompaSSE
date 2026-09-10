@@ -309,7 +309,7 @@ if (Test-Path -LiteralPath $logPath) {
 # ---- Launch ----
 if ($Launch) {
     Write-Step 'Launching Skyrim SE'
-    $exe = Join-Path $SkyrimDir '../skse64_loader.exe'
+    $exe = Join-Path $SkyrimDir 'skse64_loader.exe'
     if (-not (Test-Path -LiteralPath $exe)) {
         Write-Fail "skse64_loader.exe not found: $exe"
         exit 1
