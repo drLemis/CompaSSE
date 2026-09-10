@@ -139,7 +139,6 @@ CompaSSE/
 |  +- hooks.h               # Hook interface
 |  +- decoder_detect.cpp    # Import-based format detection
 |  +- transcode.cpp         # Format transcoding (0/1/2/5)
-|  +- postload_scan.cpp     # Post-load plugin analysis
 |  +- minhook/              # MinHook library (hooking framework)
 |  +- README.md             # Full technical documentation
 +- README.md                # This file

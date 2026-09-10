@@ -155,8 +155,6 @@ parse, but older plugins only understand format 1 or 2.
 | `decoder_detect.h`   | `DecoderType` enum, `detect_decoder`, `resolve_caller_module`, `decoder_for_module` |
 | `transcode.cpp`      | Format transcoding: parse/encode format 0, 1, 2, 5                                  |
 | `transcode.h`        | Transcoder API                                                                      |
-| `postload_scan.cpp`  | Post-load analysis of all loaded modules (diagnostic)                               |
-| `postload_scan.h`    | `postload_scan_all`                                                                 |
 | `build_shim.bat`     | MSVC build script                                                                   |
 | `deploy.ps1`         | Build + deploy automation                                                           |
 

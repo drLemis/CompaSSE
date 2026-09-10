@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """CompaSSE UI: per-mod cards for scan/fix."""
-import os
-import struct
 import sys
 import threading
 import tkinter as tk
-from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -64,85 +61,28 @@ BADGE_COLORS = {
     "NOT_SKSE":  {"bar": "#9ca3af"},
 }
 
-# Address Library detection imports (Windows API / STL symbols)
-_ADDR_LIB_IMPORTS = {
-    "CreateFileMappingW", "MapViewOfFile",
-    "istream", "_Fiopen",
-}
-
-
-
 
 # ===================================================================
 # Classification helper
 # ===================================================================
 
 def _get_build_dt(dll_path):
-    """Return the PE build timestamp as a datetime (UTC), or None."""
-    try:
-        with open(dll_path, "rb") as f:
-            hdr = f.read(0x400)
-        e_lfanew = struct.unpack_from("<I", hdr, 0x3C)[0]
-        if e_lfanew + 24 > len(hdr):
-            return None
-        if hdr[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
-            return None
-        timestamp = struct.unpack_from("<I", hdr, e_lfanew + 8)[0]
-        if timestamp == 0:
-            return None
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-    except Exception:
-        return None
+    """PE build timestamp as datetime (UTC), or None. Single impl in core."""
+    return core.pe_build_dt(dll_path)
 
 
 def _get_build_year(dll_path):
-    """Read PE header timestamp to determine the compiler build year."""
-    try:
-        dt = _get_build_dt(dll_path)
-        return dt.year if dt else None
-    except Exception:
-        return None
+    """Build year, or None."""
+    dt = _get_build_dt(dll_path)
+    return dt.year if dt else None
 
 
 def _get_build_date_str(dll_path):
     """Full build date string like '2022 July 04'."""
-    try:
-        dt = _get_build_dt(dll_path)
-        if dt is None:
-            return None
-        return dt.strftime("%Y %B %d").replace(" 0", " ")
-    except Exception:
+    dt = _get_build_dt(dll_path)
+    if dt is None:
         return None
-
-
-def _uses_address_library(info):
-    """This plugin uses the Address Library?
-
-    Checks the versionIndependence flag bit (authoritative, no third-party
-    deps). This matches what SKSE itself checks at load.
-    """
-    vi = info.get("version_indep")
-    return bool(vi and vi.get("has_addr", False))
-
-
-def _rva_to_file_off(data, sections, rva):
-    """Convert an RVA to a file offset using PE section table."""
-    for _name, vaddr, vsize, rawoff, _rawsize in sections:
-        if vaddr <= rva < vaddr + vsize:
-            return rawoff + (rva - vaddr)
-    return None
-
-
-def _ver_str(vi):
-    """Turn compatibleVersions[0] into '1.6.x' style string, or None."""
-    try:
-        rv = (vi or {}).get("runtime_ver")
-        if not rv:
-            return None
-        b = rv.to_bytes(4, "little")
-        return f"{b[3]}.{b[2]}.{b[1]}.{b[0]}"
-    except Exception:
-        return None
+    return dt.strftime("%Y %B %d").replace(" 0", " ")
 
 
 def classify(info, build_year):
@@ -150,7 +90,8 @@ def classify(info, build_year):
     flag = info.get("flag")
     vi = info.get("version_indep")
     hooks = info.get("hooks", [])
-    version = _ver_str(vi)
+    rv = (vi or {}).get("runtime_ver")
+    version = core._packed_to_ver(rv) if rv else None
 
     def _base(cat, badge, key, why, fix_desc="", safe=False, needs_fix=False, items=None):
         return dict(cat=cat, badge=badge, key=key, why=why, fix_desc=fix_desc,
@@ -164,12 +105,12 @@ def classify(info, build_year):
 
     old = build_year is not None and build_year < 2025
     recent = build_year is not None and build_year >= 2025
-    addrlib = _uses_address_library(info)
+    # versionIndependence flag bit: authoritative, matches SKSE's own check.
+    addrlib = bool(vi and vi.get("has_addr", False))
     flag_patch = flag is not None and flag.get("needs_patch", False)
     indep_patch = vi is not None and vi.get("needs_indep", False)
     has_unknown = vi is not None and vi.get("has_unknown", False)
 
-    # Build the ordered list of individual fixes.
     items = []
     if flag_patch:
         items.append({
@@ -459,7 +400,6 @@ class PluginCard(tk.Frame):
                     b.pack(fill="x", pady=2)
                     self.fix_buttons.append(b)
 
-                # "Fix all" only when there are multiple distinct fixes
                 if len(fix_items) > 1:
                     fab = tk.Button(
                         fw,
@@ -674,7 +614,6 @@ class HealerCard(tk.Frame):
             cand_frame.pack(fill="x")
 
             for idx, (coff, call_tgt) in enumerate(candidates):
-                # Show offset and bytes at that offset
                 if func_off is not None:
                     cand_bytes = healer.extract_bytes_at(exe_data, func_off + coff, 8)
                     cand_hex = cand_bytes.hex(" ") if cand_bytes else "??"
@@ -747,7 +686,6 @@ class HealerCard(tk.Frame):
             self.heal_btn.config(state="normal", bg="#fef08a", fg="#713f12")
 
     def _on_heal_click(self):
-        # Determine offset to use
         sel = self.candidate_var.get()
         if sel >= 0:
             self.selected_offset = sel
@@ -756,7 +694,6 @@ class HealerCard(tk.Frame):
         if self.heal_btn:
             self.heal_btn.config(state="disabled")
         self.status_lbl.config(text="Patching...")
-        # Create a copy of finding with the selected offset
         patched = dict(self.finding)
         patched["new_offset"] = self.selected_offset
         self.on_heal(self, patched)
@@ -886,7 +823,6 @@ class HealerTab:
     def _do_scan(self, plugin_path, plugins_dir, old_game_path):
         self.root.after(0, self._clear_cards)
         try:
-            # Load game data for byte display in cards
             self._exe_data, self._exe_sections = healer.load_game_sections(self.game_exe)
             self._old_exe_data = None
             self._old_exe_sections = None
@@ -1170,7 +1106,6 @@ class AutoPorterGUI:
         self._run(lambda: self._do_scan(plugins))
 
     def _do_scan(self, plugins):
-        # Clear previous results
         self.root.after(0, self._clear_cards)
         self._exe = None
         self._exe_sections = None
@@ -1178,13 +1113,11 @@ class AutoPorterGUI:
         runtime_version = (core.runtime_version_from_exe(self.game_exe)
                            if self.game_exe else None)
 
-        # Scan every DLL
         dlls = sorted(plugins.glob("*.dll"))
         counts = {}
         self._scan_data = []
         for dll in dlls:
             info = core.analyze_plugin(dll, runtime_version)
-            info["_path"] = str(dll)          # stash for import detection
             build_year = _get_build_year(dll)
             build_date = _get_build_date_str(dll)
             v = classify(info, build_year)
@@ -1196,7 +1129,6 @@ class AutoPorterGUI:
                 lambda d=dll, i=info, v=v: self._add_card(d, i, v),
             )
 
-        # Update summary counts
         total = len(dlls)
         need = (counts.get("NEEDS_FIX", 0)
                 + counts.get("DANGEROUS", 0)
@@ -1284,7 +1216,6 @@ class AutoPorterGUI:
     def _apply_fix(self, card, kind="all"):
         """Run the requested fix kind for one card; post result to UI thread."""
         try:
-            # Unsafe mode forces the flags; safe mode only patches when needed.
             force = getattr(card, "force_fix", False)
             changed = []
             if kind in ("all", "flag"):
@@ -1302,7 +1233,6 @@ class AutoPorterGUI:
                 if ok:
                     changed.append("address lib flags")
             if kind in ("all", "hooks"):
-                # Resolve hook offsets against the installed address library.
                 self._load_game_data()
                 if self._exe is not None and self._addresslib is not None:
                     rv = (core.runtime_version_from_exe(self.game_exe)
@@ -1315,11 +1245,9 @@ class AutoPorterGUI:
                             continue
                         base = self._addresslib[rel_id]
                         old_off = hook.get("offset")
-                        # Already correct?
                         if core.pattern_matches_at(
                                 self._exe, self._exe_sections, base, old_off, hook.get("pattern")):
                             continue
-                        # Find unique new offset near the old one.
                         matches = core.find_pattern_offsets(
                             self._exe, self._exe_sections, base,
                             hook.get("pattern"), old_off)

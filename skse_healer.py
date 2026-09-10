@@ -19,44 +19,17 @@ import argparse
 import shutil
 from pathlib import Path
 
+import compasse as _core
+
 
 # ---------------------------------------------------------------------------
-# PE helpers
+# PE helpers: single implementation lives in compasse.py. Aliases below keep
+# older call sites (GUI, tests) working without a second copy to rot.
 # ---------------------------------------------------------------------------
-def find_pe_sections(data):
-    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
-    if data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
-        return []
-    coff = e_lfanew + 4
-    num_sections = struct.unpack_from("<H", data, coff + 2)[0]
-    opt = coff + 20
-    magic = struct.unpack_from("<H", data, opt)[0]
-    if magic == 0x20B:
-        num_dd = struct.unpack_from("<I", data, opt + 108)[0]
-        dd_start = opt + 112
-    elif magic == 0x10B:
-        num_dd = struct.unpack_from("<I", data, opt + 92)[0]
-        dd_start = opt + 96
-    else:
-        return []
-    sec = dd_start + num_dd * 8
-    sections = []
-    for _ in range(num_sections):
-        vsize = struct.unpack_from("<I", data, sec + 8)[0]
-        va = struct.unpack_from("<I", data, sec + 12)[0]
-        rawsize = struct.unpack_from("<I", data, sec + 16)[0]
-        raw = struct.unpack_from("<I", data, sec + 20)[0]
-        name = data[sec:sec + 8].rstrip(b"\x00").decode("ascii", errors="replace")
-        sections.append((name, va, vsize, raw, rawsize))
-        sec += 40
-    return sections
-
-
-def rva_to_offset(rva, sections):
-    for _name, va, vsize, raw, rawsize in sections:
-        if va <= rva < va + max(vsize, rawsize):
-            return rva - va + raw
-    return None
+find_pe_sections = _core.find_pe_sections
+rva_to_offset = _core.rva_to_offset
+parse_format5 = _core.parse_format5
+load_game_sections = _core.load_exe_sections
 
 
 def load_code(dll_path):
@@ -93,11 +66,12 @@ def find_id_refs_nearby(code, center, radius=128):
     end = min(len(code), center + radius)
     for i in range(start, end - 6):
         if code[i:i + 3] == b"\x48\xC7\x45":
-            stack_off = code[i + 3]
-            if stack_off < 0x80:
-                id_val = struct.unpack_from("<I", code, i + 4)[0]
-                if 1000 < id_val < 100000:
-                    results.append((i, id_val))
+            # mov [rbp+disp8], imm32. Any disp8 is sane (|off| <= 128);
+            # locals typically live at NEGATIVE disp (e.g. [rbp-8] = 0xF8),
+            # so the displacement value must not be range-filtered.
+            id_val = struct.unpack_from("<I", code, i + 4)[0]
+            if 1000 < id_val < 100000:
+                results.append((i, id_val))
         elif code[i:i + 3] == b"\x48\xC7\x85":
             id_val = struct.unpack_from("<I", code, i + 7)[0]
             if 1000 < id_val < 100000:
@@ -130,41 +104,31 @@ def find_call_mov_rip_rax(exe_data, func_off, func_size=0x20000):
 # ---------------------------------------------------------------------------
 # Address library resolution
 # ---------------------------------------------------------------------------
-def parse_format5(data):
-    """Parse format 5 versionlib (dense u32 array). Returns {id: offset}."""
-    if len(data) < 96:
-        return None
-    if struct.unpack_from("<I", data, 0)[0] != 5:
-        return None
-    count = struct.unpack_from("<I", data, 92)[0]
-    entries = {}
-    for i in range(count):
-        off = struct.unpack_from("<I", data, 96 + i * 4)[0]
-        if off != 0:
-            entries[i] = off
-    return entries
-
-
 def load_current_lib(plugins_dir, game_version=None):
-    """Load the versionlib matching the current game version."""
-    for p in plugins_dir.glob("versionlib-*.bin"):
+    """Load the versionlib matching the current game version.
+
+    game_version: (major, minor, build) tuple from the game exe, or None.
+    A wrong-version lib maps IDs to wrong func RVAs, poisoning every finding,
+    so prefer the filename-version match and only fall back to first found.
+    """
+    found = []
+    for p in sorted(plugins_dir.glob("versionlib-*.bin")):
         with open(p, "rb") as f:
             data = f.read()
         if len(data) >= 4 and struct.unpack_from("<I", data, 0)[0] == 5:
             lib = parse_format5(data)
             if lib:
-                return lib
-    return None
+                ver = _core.extract_version_from_filename(p.name)
+                if game_version and ver == tuple(game_version[:3]):
+                    return lib
+                found.append(lib)
+    return found[0] if found else None
 
 
-# ---------------------------------------------------------------------------
-# Game binary analysis
-# ---------------------------------------------------------------------------
-def load_game_sections(exe_path):
-    with open(exe_path, "rb") as f:
-        exe = f.read()
-    sections = find_pe_sections(exe)
-    return exe, sections
+def _exe_version_tuple(exe_path):
+    """(major, minor, build) from the exe's VS_FIXEDFILEINFO, or None."""
+    packed = _core.runtime_version_from_exe(exe_path)
+    return _core.unpack_version(packed) if packed is not None else None
 
 
 def extract_bytes_at(exe_data, addr, size=16):
@@ -196,7 +160,7 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
     If old_exe_path is provided, uses it to extract patterns from the old binary."""
     dll_data, dll_sections, code = load_code(dll_path)
     exe_data, exe_sections = load_game_sections(exe_path)
-    current_lib = load_current_lib(plugins_dir)
+    current_lib = load_current_lib(plugins_dir, _exe_version_tuple(exe_path))
 
     old_exe_data = None
     old_exe_sections = None
@@ -220,10 +184,12 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                 if pattern is None:
                     continue
 
-                # Deduplicate: same offset value already handled
-                if scan_offset in seen_offsets:
+                # Deduplicate per code site: the same numeric offset at two
+                # different sites (or IDs) are two independent hooks.
+                key = (code_off, id_val, scan_offset)
+                if key in seen_offsets:
                     continue
-                seen_offsets.add(scan_offset)
+                seen_offsets.add(key)
 
                 if pattern[0] == 0xE8:
                     matches = find_byte_sequence(exe_data, pattern)
@@ -232,8 +198,8 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                     actual_addrs = [m for m in matches if abs(m - test_addr) > 16]
                     if not actual_addrs:
                         continue
-                    for actual_addr in actual_addrs:
-                        new_offset = actual_addr - func_off
+                    if len(actual_addrs) == 1:
+                        new_offset = actual_addrs[0] - func_off
                         if 0 < new_offset < 0x20000:
                             findings.append({
                                 "dll_path": dll_path,
@@ -244,8 +210,30 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                                 "new_offset": new_offset,
                                 "pattern": pattern,
                                 "expected_addr": test_addr,
-                                "actual_addr": actual_addr,
+                                "actual_addr": actual_addrs[0],
                                 "auto_fixable": True,
+                            })
+                    else:
+                        # Ambiguous: N sites share the pattern. One manual
+                        # finding with candidates - never N auto-fixable ones
+                        # (healing would apply them in turn, last wins blind).
+                        cands = sorted({m - func_off for m in actual_addrs
+                                        if 0 < m - func_off < 0x20000})
+                        if cands:
+                            closest = min(cands, key=lambda c: abs(c - scan_offset))
+                            findings.append({
+                                "dll_path": dll_path,
+                                "code_offset": code_off,
+                                "id_val": id_val,
+                                "func_rva": func_rva,
+                                "old_offset": scan_offset,
+                                "new_offset": None,
+                                "pattern": pattern,
+                                "expected_addr": test_addr,
+                                "actual_addr": None,
+                                "candidates": [(c, None) for c in cands],
+                                "closest_candidate": closest,
+                                "auto_fixable": False,
                             })
                 else:
                     if old_exe_data and old_exe_sections:
@@ -256,24 +244,39 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                                 matches = find_byte_sequence(exe_data, old_pattern)
                                 if matches:
                                     actual_addrs = [m for m in matches if abs(m - test_addr) > 16]
-                                    for actual_addr in actual_addrs:
-                                        new_offset = actual_addr - func_off
-                                        if 0 < new_offset < 0x20000:
-                                            findings.append({
-                                                "dll_path": dll_path,
-                                                "code_offset": code_off,
-                                                "id_val": id_val,
-                                                "func_rva": func_rva,
-                                                "old_offset": scan_offset,
-                                                "new_offset": new_offset,
-                                                "pattern": old_pattern,
-                                                "expected_addr": test_addr,
-                                                "actual_addr": actual_addr,
-                                                "auto_fixable": True,
-                                            })
+                                    uniq = [(m - func_off) for m in actual_addrs
+                                            if 0 < m - func_off < 0x20000]
+                                    if len(uniq) == 1:
+                                        findings.append({
+                                            "dll_path": dll_path,
+                                            "code_offset": code_off,
+                                            "id_val": id_val,
+                                            "func_rva": func_rva,
+                                            "old_offset": scan_offset,
+                                            "new_offset": uniq[0],
+                                            "pattern": old_pattern,
+                                            "expected_addr": test_addr,
+                                            "actual_addr": actual_addrs[0],
+                                            "auto_fixable": True,
+                                        })
+                                    elif uniq:
+                                        cands = sorted(set(uniq))
+                                        closest = min(cands, key=lambda c: abs(c - scan_offset))
+                                        findings.append({
+                                            "dll_path": dll_path,
+                                            "code_offset": code_off,
+                                            "id_val": id_val,
+                                            "func_rva": func_rva,
+                                            "old_offset": scan_offset,
+                                            "new_offset": None,
+                                            "pattern": old_pattern,
+                                            "expected_addr": test_addr,
+                                            "actual_addr": None,
+                                            "candidates": [(c, None) for c in cands],
+                                            "closest_candidate": closest,
+                                            "auto_fixable": False,
+                                        })
                                 else:
-                                    # Old pattern doesn't exist in new binary
-                                    # Function was rewritten, plugin needs recompilation
                                     findings.append({
                                         "dll_path": dll_path,
                                         "code_offset": code_off,
@@ -288,7 +291,6 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                                         "reason": "Scan pattern gone from new binary - function rewritten, plugin needs recompilation by author",
                                     })
                     else:
-                        # No old binary provided - use heuristic fallback
                         call_movs = find_call_mov_rip_rax(exe_data, func_off)
                         if len(call_movs) == 1:
                             pattern_off, call_target = call_movs[0]
@@ -333,8 +335,6 @@ def heal_plugin(dll_path, finding, backup=True):
     """Patch the plugin DLL with the corrected offset."""
     new_offset = finding["new_offset"]
     code_off = finding["code_offset"]
-    # The MOV EBX, imm32 is at code_off in .text section
-    # We need to convert code offset to file offset
     dll_data, dll_sections, _ = load_code(dll_path)
     text_section = None
     for name, va, vsize, raw, rawsize in dll_sections:
@@ -345,12 +345,10 @@ def heal_plugin(dll_path, finding, backup=True):
         return False
     text_va, text_raw = text_section
     file_off = text_raw + code_off
-    # Backup
     if backup:
         bak_path = dll_path.parent / (dll_path.name + ".bak")
         if not bak_path.exists():
             shutil.copy2(dll_path, bak_path)
-    # Patch
     data = bytearray(dll_path.read_bytes())
     struct.pack_into("<I", data, file_off + 1, new_offset)  # +1 to skip 0xBB opcode
     dll_path.write_bytes(data)

@@ -91,6 +91,22 @@ def unpack_version(packed):
     if packed is None: return None
     return (packed >> 24, (packed >> 16) & 0xFF, (packed >> 8) & 0xFF)
 
+def pe_build_dt(dll_path):
+    """PE TimeDateStamp as datetime (UTC), or None if missing/unreadable."""
+    try:
+        from datetime import datetime, timezone
+        with open(dll_path, "rb") as f:
+            hdr = f.read(0x400)
+        pe_off = struct.unpack_from("<I", hdr, 0x3C)[0]
+        if pe_off + 8 > len(hdr) or hdr[pe_off:pe_off + 4] != b"PE\x00\x00":
+            return None
+        ts = struct.unpack_from("<I", hdr, pe_off + 8)[0]
+        if not ts:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------------------
 # PE helpers
 # ---------------------------------------------------------------------------
@@ -103,11 +119,18 @@ def find_pe_sections(data):
     opt = coff + 20
     magic = struct.unpack_from("<H", data, opt)[0]
     if magic == 0x20B:
-        sec_start = opt + 112 + 16 * 8
+        num_dd = struct.unpack_from("<I", data, opt + 108)[0]
+        dd_start = opt + 112
     elif magic == 0x10B:
-        sec_start = opt + 96 + 16 * 8
+        num_dd = struct.unpack_from("<I", data, opt + 92)[0]
+        dd_start = opt + 96
     else:
         return []
+    # Real PEs declare 16 dirs; clamp garbage so one corrupt header
+    # can't send the section table into the weeds.
+    if not 0 < num_dd <= 32:
+        num_dd = 16
+    sec_start = dd_start + num_dd * 8
     sections = []
     for i in range(num_sections):
         s = sec_start + i * 40
@@ -121,7 +144,9 @@ def find_pe_sections(data):
 
 def rva_to_offset(rva, sections):
     for name, vaddr, vsize, rawoff, rawsize in sections:
-        if vaddr <= rva < vaddr + vsize:
+        # max(vsize, rawsize): .text is often padded on disk (rawsize > vsize);
+        # RVAs in the padding still map to file bytes. vsize-only misses them.
+        if vaddr <= rva < vaddr + max(vsize, rawsize):
             return rawoff + (rva - vaddr)
     return None
 
@@ -182,7 +207,6 @@ def build_translations(game_exe, plugins_dir, game_version=None):
     if not exe_data:
         raise RuntimeError(f"Cannot read PE: {game_exe}")
 
-    # Find versionlib matching the game exe version
     game_ver_tuple = unpack_version(game_version)
     current_lib = None
     current_ver = None
@@ -195,7 +219,6 @@ def build_translations(game_exe, plugins_dir, game_version=None):
                 current_ver = ver
                 break
     if current_lib is None:
-        # Fallback: use the first versionlib found
         for p in plugins_dir.glob("versionlib-*.bin"):
             ver = extract_version_from_filename(p.name)
             if ver:
@@ -207,10 +230,8 @@ def build_translations(game_exe, plugins_dir, game_version=None):
     if current_lib is None:
         raise RuntimeError("No versionlib-*.bin found in plugins folder")
 
-    # Use the actual game exe version to exclude current version bins
     exclude_ver = unpack_version(game_version) if game_version else current_ver
 
-    # Read existing translation table for old signatures
     old_sigs = {}  # {version_tuple: {id: sig_bytes}}
     trans_bin = plugins_dir / "CompaSSE" / "translation_table.bin"
     if trans_bin.exists():
@@ -244,7 +265,6 @@ def build_translations(game_exe, plugins_dir, game_version=None):
                 if ver and sigs:
                     old_sigs[ver] = sigs  # only v2 provides cached signatures
 
-    # Collect current signatures from the binary
     current_sigs = collect_signatures(exe_data, sections, current_lib)
     print(f"Current binary: {len(current_sigs)} signatures extracted")
     print(f"Current version: {current_ver[0]}.{current_ver[1]}.{current_ver[2]}")
@@ -255,7 +275,6 @@ def build_translations(game_exe, plugins_dir, game_version=None):
         if cur_sig not in sig_to_id:
             sig_to_id[cur_sig] = cur_id
 
-    # Find old version bins in plugins dir
     old_bins = {}
     for p in plugins_dir.glob("version-*.bin"):
         ver = extract_version_from_filename(p.name)
@@ -267,7 +286,6 @@ def build_translations(game_exe, plugins_dir, game_version=None):
     if not old_bins and not old_sigs:
         raise RuntimeError("No old version bins or existing translations found")
 
-    # Build translation entries: match old IDs to current offsets
     out = bytearray()
     out += b"TRTL"
     out += struct.pack("<I", 1)  # format version 1 (no signatures - DLL doesn't need them)
@@ -322,7 +340,6 @@ def build_translations(game_exe, plugins_dir, game_version=None):
 
     struct.pack_into("<I", out, ver_count_pos, ver_count)
 
-    # Write to CompaSSE subfolder
     out_dir = plugins_dir / "CompaSSE"
     out_dir.mkdir(exist_ok=True)
     with open(out_dir / "translation_table.bin", "wb") as f:
@@ -463,7 +480,7 @@ def check_version_independence(dll_path, runtime_version=None):
     indep_val = struct.unpack_from("<I", data, indep_off)[0]
     indep_ex_val = struct.unpack_from("<I", data, flag_off)[0]
 
-    # Read first compatibleVersions entry
+
     runtime_ver = None
     if compat_off + 4 <= len(data):
         first_compat = struct.unpack_from("<I", data, compat_off)[0]
@@ -476,7 +493,7 @@ def check_version_independence(dll_path, runtime_version=None):
     has_ex_v5 = bool(indep_ex_val & KVIEX_ADDR_LIB_V5)
     has_unknown = bool(indep_val & ~KVI_KNOWN)
 
-    # Read build time from PE header (already in memory)
+
     build_time = 0
     pe_off = struct.unpack_from("<I", data, 0x3C)[0]
     if pe_off + 8 < len(data):
@@ -975,7 +992,7 @@ def analyze_plugin(dll_path, runtime_version=None):
 # ---------------------------------------------------------------------------
 # Audit: definitive compatibility verdict
 # ---------------------------------------------------------------------------
-def _audit_plugin(dll_path, runtime_version=None):
+def _audit_plugin(dll_path, runtime_version=None, id_set=None):
     """Audit a single plugin against the definitive compatibility rules.
 
     Returns dict with:
@@ -985,18 +1002,8 @@ def _audit_plugin(dll_path, runtime_version=None):
         details: dict of raw analysis data (flag, vi, hooks, build_year)
     """
     info = analyze_plugin(dll_path, runtime_version)
-    build_year = None
-    try:
-        with open(dll_path, "rb") as f:
-            hdr = f.read(0x400)
-        pe_off = struct.unpack_from("<I", hdr, 0x3C)[0]
-        if pe_off + 8 <= len(hdr) and hdr[pe_off:pe_off + 4] == b"PE\x00\x00":
-            ts = struct.unpack_from("<I", hdr, pe_off + 8)[0]
-            if ts != 0:
-                from datetime import datetime, timezone
-                build_year = datetime.fromtimestamp(ts, tz=timezone.utc).year
-    except Exception:
-        pass
+    dt = pe_build_dt(dll_path)
+    build_year = dt.year if dt else None
 
     flag = info["flag"]
     vi = info["version_indep"]
@@ -1135,7 +1142,7 @@ def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dr
         base = addresslib[rel_id]
         old_off = hook["offset"]
 
-        # If the old offset still matches, the plugin works as-is.
+
         if pattern_matches_at(exe, exe_sections, base, old_off, hook["pattern"]):
             actions.append(f"  hook REL::ID {rel_id}: offset 0x{old_off:x} already correct")
             continue
@@ -1191,7 +1198,7 @@ def main():
 
     # -- Build translations mode
     if args.build_translations:
-        # Auto-detect paths: game exe is next to this script
+
         game_path = args.game
         if game_path is None:
             game_path = Path(__file__).resolve().parent / "SkyrimSE.exe"
@@ -1216,7 +1223,7 @@ def main():
     if args.dll is None and args.plugins_dir is None:
         parser.error("specify --plugins-dir or --dll")
 
-    # Load game + addresslib for offset fix
+
     exe = None
     exe_sections = None
     addresslib = None
@@ -1240,7 +1247,7 @@ def main():
 
     dry_run = not args.fix
 
-    # Collect DLLs to process
+
     dlls = []
     if args.dll:
         dlls = [args.dll]
