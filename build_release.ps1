@@ -28,10 +28,29 @@ Copy-Item -LiteralPath (Join-Path $Root 'DLL\build\!CompaSSE.dll') -Destination 
 # Build translation table against installed game's old bins (best effort, skipped without a game)
 $DefaultPluginsDir = $env:COMPASSE_PLUGINS_DIR
 if (-not $DefaultPluginsDir) {
-    $sp = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -Name SteamPath -ErrorAction SilentlyContinue).SteamPath
-    if ($sp) {
-        $cand = Join-Path $sp 'steamapps\common\Skyrim Special Edition\Data\SKSE\Plugins'
-        if (Test-Path -LiteralPath $cand) { $DefaultPluginsDir = $cand }
+    $roots = @()
+    foreach ($hive in @('HKCU:\Software\Valve\Steam', 'HKLM:\SOFTWARE\Wow6432Node\Valve\Steam', 'HKLM:\SOFTWARE\Valve\Steam')) {
+        try {
+            $sp = (Get-ItemProperty -LiteralPath $hive -Name SteamPath -ErrorAction Stop).SteamPath
+            if ($sp) { $roots += $sp }
+        } catch { }
+    }
+    $libs = @()
+    foreach ($root in ($roots | Select-Object -Unique)) {
+        $libs += (Join-Path $root 'steamapps')
+        $vdf = Join-Path $root 'steamapps\libraryfolders.vdf'
+        if (Test-Path -LiteralPath $vdf) {
+            $raw = Get-Content -LiteralPath $vdf -Raw -ErrorAction SilentlyContinue
+            if ($raw) {
+                foreach ($m in [regex]::Matches($raw, '"path"\s+"([^"]+)"')) {
+                    $libs += (Join-Path ($m.Groups[1].Value -replace '\\\\', '\') 'steamapps')
+                }
+            }
+        }
+    }
+    foreach ($lib in ($libs | Select-Object -Unique)) {
+        $cand = Join-Path $lib 'common\Skyrim Special Edition\Data\SKSE\Plugins'
+        if (Test-Path -LiteralPath $cand) { $DefaultPluginsDir = $cand; break }
     }
 }
 $GameExe = $null
