@@ -1097,10 +1097,13 @@ void shim_log(const char* fmt, ...) {
                 path[0] = 0;
         }
         if (path[0]) {
+            static bool fresh = true;
             HANDLE h = CreateFileA(path, FILE_APPEND_DATA,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                   nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                   nullptr, fresh ? CREATE_ALWAYS : OPEN_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
             if (h != INVALID_HANDLE_VALUE) {
+                fresh = false;
                 DWORD written = 0;
                 WriteFile(h, line, (DWORD)n, &written, nullptr);
                 CloseHandle(h);
