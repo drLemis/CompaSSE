@@ -1278,16 +1278,22 @@ def find_version_gates(dll_path):
     return uniq
 
 
-def analyze_plugin(dll_path, runtime_version=None):
-    """Analyze a single plugin. Returns dict with flag + versionIndependence + hooks info."""
-    info = {"name": dll_path.name, "flag": None, "version_indep": None, "hooks": []}
+def analyze_plugin(dll_path, runtime_version=None, include_hooks=True):
+    """Analyze a single plugin. Returns dict with flag + versionIndependence + hooks info.
+
+    include_hooks=False skips the capstone disassembly pass (seconds per
+    DLL) for fast scans; callers run find_hooks on demand at fix time.
+    """
+    info = {"name": dll_path.name, "flag": None, "version_indep": None, "hooks": [],
+            "hooks_scanned": include_hooks}
     flag = check_flag(dll_path)
     if flag is not None:
         info["flag"] = flag
     vi = check_version_independence(dll_path, runtime_version)
     if vi is not None:
         info["version_indep"] = vi
-    info["hooks"] = find_hooks(dll_path)
+    if include_hooks:
+        info["hooks"] = find_hooks(dll_path)
     return info
 
 

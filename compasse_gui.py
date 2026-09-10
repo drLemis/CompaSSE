@@ -281,6 +281,7 @@ class PluginCard(tk.Frame):
         self.on_fix_one = on_fix_one
         self.force_fix = force_fix
         self.fixed = False
+        self.hooks_scanned = bool(info.get("hooks_scanned", False))
         self.fix_buttons = []
 
         colors = BADGE_COLORS[verdict["key"]]
@@ -1117,7 +1118,10 @@ class AutoPorterGUI:
         counts = {}
         self._scan_data = []
         for dll in dlls:
-            info = core.analyze_plugin(dll, runtime_version)
+            try:
+                info = core.analyze_plugin(dll, runtime_version, include_hooks=False)
+            except OSError:
+                continue
             build_year = _get_build_year(dll)
             build_date = _get_build_date_str(dll)
             v = classify(info, build_year)
@@ -1232,7 +1236,7 @@ class AutoPorterGUI:
                     ok = core.patch_version_independence(card.dll_path)
                 if ok:
                     changed.append("address lib flags")
-            if kind in ("all", "hooks"):
+            if kind in ("all", "hooks") or not getattr(card, "hooks_scanned", True):
                 self._load_game_data()
                 if self._exe is not None and self._addresslib is not None:
                     rv = (core.runtime_version_from_exe(self.game_exe)
@@ -1258,6 +1262,7 @@ class AutoPorterGUI:
                         changed.append(f"hooks patched ({n})")
                 else:
                     changed.append("hooks skipped (no address library)")
+                card.hooks_scanned = True
             if changed:
                 msg = "; ".join(changed)
                 self.root.after(0, lambda: card.mark_fixed(True, msg))
@@ -1269,10 +1274,6 @@ class AutoPorterGUI:
                 self.root.after(0, lambda: card.mark_noop(already))
         except Exception as exc:
             self.root.after(0, lambda: card.mark_fixed(False, str(exc)))
-
-    # ─────────────────────────────────────────────────────────────
-    # Clear
-    # ─────────────────────────────────────────────────────────────
 
     # ──────────────────────────────────────────────────────────────
     # Build Translations
