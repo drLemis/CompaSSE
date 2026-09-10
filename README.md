@@ -129,6 +129,7 @@ cmd /c DLL\build_shim.bat
 CompaSSE/
 +- compasse.py              # CLI tool (audit/scan/fix)
 +- compasse_gui.py          # GUI tool (per-mod cards)
++- skse_healer.py           # Stale-offset detector/healer (also a GUI tab)
 +- CompaSSE.spec            # PyInstaller spec for GUI exe
 +- build_release.ps1        # Release bundle builder
 +- DLL/

@@ -347,6 +347,113 @@ def build_translations(game_exe, plugins_dir, game_version=None):
     print(f"\nWrote {len(out)} bytes to {out_dir / 'translation_table.bin'} ({ver_count} versions, {total_entries} entries)")
     return ver_count, total_entries
 
+
+def mint_missing_translations(old_exe_data, old_secs, old_lib,
+                              new_exe_data, new_secs, new_lib, sig_len=64):
+    """Mint entries for old IDs missing from the new library.
+
+    Ground truth comes from the OLD exe bytes: the signature at the old
+    offset is searched in the NEW exe .text. Unique hit -> (old_id,
+    new_offset). Zero hits -> function removed (unfixable). Several hits
+    -> ambiguous (reported, not minted: a wrong entry is worse than none).
+
+    IDs present in both libs need no entry: fresh lookup resolves them.
+
+    Returns (entries, removed_count, ambiguous_ids).
+    """
+    new_text_va = new_text = None
+    for name, vaddr, vsize, rawoff, rawsize in new_secs:
+        if name == ".text":
+            new_text_va = vaddr
+            new_text = bytes(new_exe_data[rawoff:rawoff + rawsize])
+            break
+    if new_text is None:
+        raise RuntimeError("new exe has no .text section")
+
+    def sig_at(exe_data, secs, rva):
+        off = rva_to_offset(rva, secs)
+        if off is None or off + sig_len > len(exe_data):
+            return None
+        return bytes(exe_data[off:off + sig_len])
+
+    entries, removed, ambiguous = [], 0, []
+    for old_id, old_offset in old_lib.items():
+        if old_id in new_lib:
+            continue
+        sig = sig_at(old_exe_data, old_secs, old_offset)
+        if sig is None or len(set(sig)) < 8:
+            continue  # unmappable or padding-weak: never mint on weak sigs
+        hits = []
+        pos = new_text.find(sig)
+        while pos != -1 and len(hits) <= 2:
+            hits.append(pos)
+            pos = new_text.find(sig, pos + 1)
+        if len(hits) == 1:
+            entries.append((old_id, new_text_va + hits[0]))
+        elif len(hits) == 0:
+            removed += 1
+        else:
+            ambiguous.append(old_id)
+    entries.sort()
+    return entries, removed, ambiguous
+
+
+def merge_translation_block(plugins_dir, version_str, entries):
+    """Append a version block, dropping stale rows verified-wrong.
+
+    Rows for the same old_id from older blocks lose: a byte-verified
+    ground-truth entry beats a weak-signature guess. Backs up first.
+    Returns (dropped, total_entries).
+    """
+    trans_bin = plugins_dir / "CompaSSE" / "translation_table.bin"
+    if not trans_bin.exists():
+        raise RuntimeError(f"no translation table at {trans_bin}")
+    bak = trans_bin.parent / (trans_bin.name + ".bak")
+    if not bak.exists():
+        shutil.copy2(trans_bin, bak)
+
+    raw = bytearray(open(trans_bin, "rb").read())
+    if bytes(raw[:4]) != b"TRTL" or struct.unpack_from("<I", raw, 4)[0] != 1:
+        raise RuntimeError("unsupported translation table format")
+    o = 8
+    ver_count = struct.unpack_from("<I", raw, o)[0]; o += 4
+    versions = []
+    for _ in range(ver_count):
+        ver_len = struct.unpack_from("<I", raw, o)[0]; o += 4
+        vs = raw[o:o + ver_len].decode("ascii", errors="replace")
+        o += (ver_len + 3) & ~3
+        ec = struct.unpack_from("<I", raw, o)[0]; o += 4
+        ent = []
+        for _ in range(ec):
+            oid = struct.unpack_from("<Q", raw, o)[0]; o += 8
+            off = struct.unpack_from("<I", raw, o)[0]; o += 4
+            ent.append((oid, off))
+        versions.append((vs, ent))
+
+    new_ids = {i for i, _ in entries}
+    dropped = 0
+    fixed = []
+    for vs, ent in versions:
+        if vs == version_str:
+            continue
+        kept = [(i, x) for i, x in ent if i not in new_ids]
+        dropped += len(ent) - len(kept)
+        fixed.append((vs, kept))
+    fixed.append((version_str, sorted(entries)))
+
+    out = bytearray(b"TRTL" + struct.pack("<I", 1) + struct.pack("<I", len(fixed)))
+    for vs, ent in fixed:
+        vb = vs.encode("ascii")
+        out += struct.pack("<I", len(vb)) + vb + b"\x00" * (((len(vb) + 3) & ~3) - len(vb))
+        out += struct.pack("<I", len(ent))
+        for i, off in ent:
+            out += struct.pack("<QI", i, off)
+    with open(trans_bin, "wb") as f:
+        f.write(out)
+    total = sum(len(e) for _, e in fixed)
+    return dropped, total
+
+
 def find_export_rva(data, sections, export_name_bytes):
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
     coff = e_lfanew + 4
@@ -696,10 +803,12 @@ def find_hooks(dll_path):
                 continue
             dest_reg, disp = lea_info
 
-            # Backward: mov [mem], imm (REL::ID) + call, within 25 insns
+            # Backward: mov [mem], imm (REL::ID) + call, within 25 insns.
+            # Stop is max(-1, ...) so index 0 is still visited (range stop
+            # is exclusive; max(0, ...) silently skipped function starts).
             rel_id = None
             has_call = False
-            for k in range(i - 1, max(0, i - 25), -1):
+            for k in range(i - 1, max(-1, i - 25), -1):
                 prev = insns[k]
                 if prev.mnemonic == "call":
                     has_call = True
@@ -892,10 +1001,13 @@ def patch_hook_offset(dll_path, hook, new_offset):
     if not text:
         return False
     tvaddr, trawoff, trawsize = text
-    # lea instruction at hook['va']; displacement is at va+3 (48 8d 98 <disp32>)
-    disp_off = trawoff + (hook["va"] - tvaddr) + 3
-    if disp_off + 4 > len(data):
+    # Only the disp32 form (48 8D 98 <disp32>) carries its displacement at
+    # va+3 with 4-byte width. Anything else (disp8, other regs) and a blind
+    # 4-byte write corrupts the following instruction - refuse instead.
+    insn_off = trawoff + (hook["va"] - tvaddr)
+    if insn_off + 7 > len(data) or bytes(data[insn_off:insn_off + 3]) != b"\x48\x8D\x98":
         return False
+    disp_off = insn_off + 3
     cur = struct.unpack_from("<I", data, disp_off)[0]
     if cur != hook["offset"]:
         return False
@@ -976,6 +1088,196 @@ def convert_format5_to_format2(fmt5_path, out_path):
 # ---------------------------------------------------------------------------
 # High-level operations
 # ---------------------------------------------------------------------------
+def count_xref_ids(dll_path, id_set):
+    """Data slots holding known address-library IDs AND read by code.
+
+    A mod our ID machinery can help must resolve game addresses through
+    IDs baked into its binary: a rip-relative load from a .data/.rdata
+    slot whose value is a known library ID. Returns that count, or None
+    when capstone is missing, no ID set was given, or the PE is unreadable.
+
+    Zero (with a real ID set) means: no statically recoverable game
+    references. Flags/format/translation fixes cannot help such a mod -
+    its game coupling is version-gated logic, hardcoded RVAs, or vtable
+    slots, all invisible to the address library.
+    """
+    if not HAS_CAPSTONE or not id_set:
+        return None
+    try:
+        with open(dll_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    sections = find_pe_sections(data)
+    if not sections:
+        return None
+    by_name = {n: (v, o, s) for n, v, _, o, s in sections}
+    if ".text" not in by_name:
+        return None
+
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = True
+    rip_targets = set()
+    try:
+        for begin, end in get_functions_from_pdata(data, sections):
+            if end - begin > 0x10000:
+                continue
+            off = rva_to_offset(begin, sections)
+            if off is None:
+                continue
+            for ins in md.disasm(data[off:off + (end - begin)], begin):
+                for op in ins.operands:
+                    if op.type == x86.X86_OP_MEM and op.mem.base == x86.X86_REG_RIP:
+                        rip_targets.add(ins.address + ins.size + op.mem.disp)
+    except Exception:
+        return None
+    if not rip_targets:
+        return None
+
+    count = 0
+    for sname in (".data", ".rdata"):
+        if sname not in by_name:
+            continue
+        vaddr, rawoff, rawsize = by_name[sname]
+        for k in range(0, rawsize - 8):
+            rva = vaddr + k
+            if rva not in rip_targets:
+                continue
+            for width, fmt in ((8, "<Q"), (4, "<I")):
+                if k + width > rawsize:
+                    continue
+                val = struct.unpack_from(fmt, data, rawoff + k)[0]
+                if val in id_set:
+                    count += 1
+                    break
+    return count
+
+
+def find_version_gates(dll_path):
+    """Find game-version gate patterns in an SKSE plugin.
+
+    Three shapes, all read-only reported (never patched here):
+    - iface_version_read: SKSEPlugin_Load reads [rcx+4] (runtimeVersion
+      from the SKSEInterface* first arg). The seed of every gate.
+    - packed_compare: cmp against a packed 1.x runtime constant
+      (0x01______). The rungs of the version ladder.
+    - version_string_ref: code references a version-gate string
+      ("version", "mismatch", ...). File-parse gates never touch packed
+      constants; their error strings are the fingerprint.
+
+    Returns list of dicts {kind, rva, func, detail}. Empty (not None)
+    when capstone works but nothing found; None when unavailable.
+    """
+    if not HAS_CAPSTONE:
+        return None
+    try:
+        with open(dll_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    sections = find_pe_sections(data)
+    if not sections:
+        return None
+
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = True
+    funcs = get_functions_from_pdata(data, sections)
+    if not funcs:
+        return None
+
+    load_rva = find_export_rva(data, sections, b"SKSEPlugin_Load")
+    load_bounds = None
+    if load_rva is not None:
+        for b, e in funcs:
+            if b <= load_rva < e:
+                load_bounds = (b, e)
+                break
+
+    # Version-gate strings in .rdata, keyed by RVA (rip targets are RVAs).
+    # Two noise guards from corpus calibration:
+    # - skip undecodable bytes (wide strings misread as ascii produce
+    #   phantom keyword hits like "<unicode conversion error>");
+    # - word boundaries ("conversion" is not "version").
+    import re as _re
+    _gate_pat = _re.compile(
+        r"(?<![a-z])(?:load_version|version|mismatch|incompatible|outdated|not supported)(?![a-z])")
+    keystrings = {}
+    for name, vaddr, vsize, rawoff, rawsize in sections:
+        if name not in (".rdata", ".data"):
+            continue
+        blob = data[rawoff:rawoff + rawsize]
+        for m in _re.finditer(rb"[ -~]{4,80}\x00", blob):
+            try:
+                s = m.group(0)[:-1].decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            if "\ufffd" in s:
+                continue
+            if _gate_pat.search(s.lower()):
+                keystrings[vaddr + m.start()] = s
+
+    gates = []
+    for b, e in funcs:
+        if e - b > 0x10000:
+            continue
+        off = rva_to_offset(b, sections)
+        if off is None:
+            continue
+        try:
+            block = data[off:off + (e - b)]
+        except Exception:
+            continue
+        try:
+            insns = list(md.disasm(block, b))
+        except Exception:
+            continue
+        in_loader = load_bounds is not None and load_bounds[0] <= b < load_bounds[1]
+        # SKSEPlugin_Load receives SKSEInterface* in rcx; it is usually
+        # copied to a callee-saved reg first. Track one level of aliasing
+        # so [rbx+4] reads still match the runtimeVersion field.
+        iface_regs = {x86.X86_REG_RCX} if in_loader else set()
+        for ins in insns:
+            if in_loader and ins.mnemonic == "mov" and len(ins.operands) == 2:
+                o0, o1 = ins.operands
+                if o0.type == x86.X86_OP_REG and o1.type == x86.X86_OP_REG \
+                        and o1.reg in iface_regs:
+                    iface_regs.add(o0.reg)
+            for op in ins.operands:
+                if op.type == x86.X86_OP_MEM and op.mem.base in iface_regs \
+                        and op.mem.disp == 4 and in_loader:
+                    gates.append({"kind": "iface_version_read",
+                                  "rva": ins.address, "func": b,
+                                  "detail": f"{ins.mnemonic} {ins.op_str}"})
+                if op.type == x86.X86_OP_MEM and op.mem.base == x86.X86_REG_RIP \
+                        and ins.mnemonic in ("lea", "mov", "cmp"):
+                    tgt = ins.address + ins.size + op.mem.disp
+                    if tgt in keystrings:
+                        gates.append({"kind": "version_string_ref",
+                                      "rva": ins.address, "func": b,
+                                      "detail": f"{ins.mnemonic} {ins.op_str} "
+                                                f"-> {keystrings[tgt][:60]!r}"})
+                if op.type == x86.X86_OP_IMM and ins.mnemonic in (
+                        "cmp", "test", "mov", "lea", "sub", "add", "xor"):
+                    v = op.imm & 0xFFFFFFFF
+                    # Packed runtime: (1<<24)|(minor<<16)|(build<<8)|rev.
+                    # Skyrim minors are 5/6/7 - anything else (sizes like
+                    # 0x16E3600, type tags like 0x100002D) is noise.
+                    if ((v >> 24) == 1 and ((v >> 16) & 0xFF) in (5, 6, 7)
+                            and v & 0x00FFFFFF):
+                        gates.append({"kind": "packed_compare",
+                                      "rva": ins.address, "func": b,
+                                      "detail": f"{ins.mnemonic} {ins.op_str}"})
+    # deduplicate, keep function attribution
+    seen = set()
+    uniq = []
+    for g in gates:
+        key = (g["kind"], g["rva"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(g)
+    return uniq
+
+
 def analyze_plugin(dll_path, runtime_version=None):
     """Analyze a single plugin. Returns dict with flag + versionIndependence + hooks info."""
     info = {"name": dll_path.name, "flag": None, "version_indep": None, "hooks": []}
@@ -1080,7 +1382,24 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None):
 
     # SAFE: flags correct, uses Address Library
     if has_addr and not needs_fix:
+        # Triage gate: without statically recoverable game references, ID
+        # machinery (flags, formats, translations) cannot help this mod.
+        # Seen live: version-gated init logic that crashes past the gate.
+        xref = count_xref_ids(dll_path, id_set) if id_set else None
+        if xref == 0:
+            return {
+                "name": dll_path.name,
+                "verdict": "MANUAL",
+                "reason": ("Flags look right but no game addresses are "
+                           "statically recoverable (0 xref'd IDs). Fixes here "
+                           "can't help it - likely version-gated logic or "
+                           "hardcoded offsets. Needs author or deep RE."),
+                "details": {"build_year": build_year, "has_addr": has_addr,
+                            "hooks": len(hooks), "xref_ids": 0},
+            }
         extra = f", {len(hooks)} hooks verified" if hooks else ""
+        if xref:
+            extra += f", {xref} xref'd IDs"
         return {
             "name": dll_path.name,
             "verdict": "SAFE",
@@ -1194,7 +1513,84 @@ def main():
                         help="versionlib bin path (required for hook offset fix)")
     parser.add_argument("--build-translations", action="store_true",
                         help="Build translation table from old bins + current binary")
+    parser.add_argument("--mint-missing", action="store_true",
+                        help="Mint entries for old IDs missing from the new lib, "
+                             "using --old-exe bytes as ground truth")
+    parser.add_argument("--old-exe", type=Path, default=None,
+                        help="Old game exe matching --old-lib (for --mint-missing)")
+    parser.add_argument("--old-lib", type=Path, default=None,
+                        help="Old versionlib bin (for --mint-missing)")
+    parser.add_argument("--find-gates", action="store_true",
+                        help="Report game-version gate patterns (read-only, no changes)")
     args = parser.parse_args()
+
+    # -- Mint-missing mode: old-exe ground truth for dropped IDs
+    if args.mint_missing:
+        if args.old_exe is None or not args.old_exe.exists():
+            parser.error("--old-exe is required for --mint-missing")
+        if args.old_lib is None or not args.old_lib.exists():
+            parser.error("--old-lib is required for --mint-missing")
+        game_path = args.game
+        if game_path is None:
+            game_path = Path(__file__).resolve().parent / "SkyrimSE.exe"
+        if not game_path.exists():
+            parser.error(f"game exe not found: {game_path}")
+        plugins_dir = args.plugins_dir
+        if plugins_dir is None:
+            plugins_dir = game_path.parent / "Data" / "SKSE" / "Plugins"
+        if not plugins_dir.exists():
+            parser.error(f"plugins folder not found: {plugins_dir}")
+        game_ver = runtime_version_from_exe(game_path)
+        new_lib = None
+        for p in plugins_dir.glob("versionlib-*.bin"):
+            if game_ver and extract_version_from_filename(p.name) == unpack_version(game_ver):
+                new_lib = parse_library_any(str(p))
+                if new_lib:
+                    break
+        if new_lib is None:
+            parser.error("no versionlib matching the game exe found")
+        old_exe_data, old_secs = load_exe_sections(str(args.old_exe))
+        new_exe_data, new_secs = load_exe_sections(str(game_path))
+        old_lib = parse_library_any(str(args.old_lib))
+        if old_lib is None:
+            parser.error(f"cannot parse old lib: {args.old_lib}")
+        old_ver = extract_version_from_filename(args.old_lib.name) or (0, 0, 0)
+        entries, removed, ambig = mint_missing_translations(
+            old_exe_data, old_secs, old_lib, new_exe_data, new_secs, new_lib)
+        print(f"minted={len(entries)} removed-fn={removed} ambiguous={len(ambig)}")
+        if entries:
+            ver_str = f"{old_ver[0]}.{old_ver[1]}.{old_ver[2]}"
+            dropped, total = merge_translation_block(plugins_dir, ver_str, entries)
+            print(f"merged {ver_str}: +{len(entries)} dropped-stale={dropped} total={total}")
+        return
+
+    # -- Find-gates mode: read-only version-gate report
+    if args.find_gates:
+        if args.dll is None and args.plugins_dir is None:
+            parser.error("specify --plugins-dir or --dll")
+        dlls = []
+        if args.dll:
+            dlls = [args.dll]
+        elif args.plugins_dir and args.plugins_dir.exists():
+            dlls = sorted(args.plugins_dir.glob("*.dll"))
+        for dll in dlls:
+            gates = find_version_gates(dll)
+            if gates is None:
+                print(f"{dll.name}: gate scan unavailable")
+            elif not gates:
+                print(f"{dll.name}: no version gates")
+            else:
+                from collections import Counter as _Counter
+                per_func = _Counter(g["func"] for g in gates)
+                gates.sort(key=lambda g: (-per_func[g["func"]], g["rva"]))
+                print(f"{dll.name}: {len(gates)} gate signal(s)")
+                for g in gates[:12]:
+                    mark = "*" if per_func[g["func"]] > 1 else " "
+                    print(f"   {mark}[{g['kind']}] func {hex(g['func'])} "
+                          f"@{hex(g['rva'])}: {g['detail']}")
+                if len(gates) > 12:
+                    print(f"    ... and {len(gates) - 12} more")
+        return
 
     # -- Build translations mode
     if args.build_translations:
@@ -1260,9 +1656,15 @@ def main():
     # -- Audit mode: definitive compatibility verdicts
     if args.audit:
         print(f"\n=== AUDIT {len(dlls)} plugin(s) ===\n")
+        # Triage gate needs the ID set: load it when a lib is provided.
+        id_set = None
+        if args.addresslib is not None and args.addresslib.exists():
+            lib = parse_library_any(str(args.addresslib))
+            if lib:
+                id_set = set(lib)
         counts = {"SAFE": 0, "NEEDS_FIX": 0, "BROKEN": 0, "UNKNOWN": 0}
         for dll in dlls:
-            result = _audit_plugin(dll, runtime_version)
+            result = _audit_plugin(dll, runtime_version, id_set)
             v = result["verdict"]
             counts[v] = counts.get(v, 0) + 1
             tag = {"SAFE": "[OK]", "NEEDS_FIX": "[FIX]", "BROKEN": "[!!]", "UNKNOWN": "[??]"}[v]

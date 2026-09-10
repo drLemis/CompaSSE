@@ -39,8 +39,13 @@ struct SKSEInterface {
 };
 
 static HMODULE g_selfModule = nullptr;
+// Reentrancy: log_ptr may fault on an unmapped-but-canonical pointer.
+// A nested fault re-enters this VEH (VEH preempts SEH, so log_ptr's
+// __try never sees it) -> infinite recursion. Bail out when nested.
+static thread_local bool t_inCrashVeh = false;
 
 // ---- VEH: log real crashes, skip debug events ----
+static void log_ptr(const char* name, void* p);  // defined below CrashVEH
 static LONG WINAPI CrashVEH(EXCEPTION_POINTERS* ex) {
     if (!ex || !ex->ExceptionRecord)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -51,6 +56,10 @@ static LONG WINAPI CrashVEH(EXCEPTION_POINTERS* ex) {
     // Passing them through as unhandled kills the process silently.
     if ((code & 0xFFFF0000) == 0x40010000)
         return EXCEPTION_CONTINUE_EXECUTION;
+
+    if (t_inCrashVeh)
+        return EXCEPTION_CONTINUE_SEARCH;  // nested fault: do not recurse
+    t_inCrashVeh = true;
 
     void* faultAddr = ex->ExceptionRecord->ExceptionAddress;
 
@@ -83,9 +92,73 @@ static LONG WINAPI CrashVEH(EXCEPTION_POINTERS* ex) {
                  (void*)ex->ContextRecord->R10, (void*)ex->ContextRecord->R11,
                  (void*)ex->ContextRecord->R12, (void*)ex->ContextRecord->R13,
                  (void*)ex->ContextRecord->R14, (void*)ex->ContextRecord->R15);
+        // Pointer peek: identifies game classes via vtable (see offline RTTI walk).
+        auto* c = ex->ContextRecord;
+        log_ptr("RAX", (void*)c->Rax); log_ptr("RBX", (void*)c->Rbx);
+        log_ptr("RCX", (void*)c->Rcx); log_ptr("RDX", (void*)c->Rdx);
+        log_ptr("RSI", (void*)c->Rsi); log_ptr("RDI", (void*)c->Rdi);
+        log_ptr("R8", (void*)c->R8);   log_ptr("R9", (void*)c->R9);
     }
 
+    t_inCrashVeh = false;
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Safe pointer peek for crash forensics: logs what a register points at.
+// [reg] often holds a vtable pointer -> offline RTTI walk identifies the
+// game class. __try/__except: the pointer may be garbage; never recurse.
+static void log_ptr(const char* name, void* p) {
+    uintptr_t v = (uintptr_t)p;
+    if (v < 0x10000 || v >= 0x0000800000000000ULL)
+        return;  // null / kernel / non-canonical: nothing to learn
+    // Canonical != mapped. Probe with VirtualQuery (never faults) instead
+    // of trusting the address: guard pages and unmapped holes AV on read.
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)
+        || !(mbi.State & MEM_COMMIT)
+        || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        shim_log("  [%s=%p (?)] unreadable", name, p);
+        return;
+    }
+    DWORD prot = mbi.Protect & 0xFF;
+    if (prot != PAGE_READONLY && prot != PAGE_READWRITE && prot != PAGE_WRITECOPY
+        && prot != PAGE_EXECUTE_READ && prot != PAGE_EXECUTE_READWRITE
+        && prot != PAGE_EXECUTE_WRITECOPY) {
+        shim_log("  [%s=%p (?)] unreadable", name, p);
+        return;
+    }
+    uint64_t pointee = 0;
+    __try {
+        pointee = *(volatile uint64_t*)p;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        shim_log("  [%s=%p (?)] unreadable", name, p);
+        return;
+    }
+    // Which module owns the POINTER and the POINTEE (vtable -> game exe
+    // or a DLL)? Both narrow the crashed object's class offline.
+    char modName[MAX_PATH] = "?";
+    HMODULE owner = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)p, &owner);
+    if (owner) {
+        char buf[MAX_PATH] = {};
+        GetModuleFileNameA(owner, buf, MAX_PATH);
+        const char* slash = strrchr(buf, '\\');
+        snprintf(modName, sizeof(modName), "%s+0x%llX", slash ? slash + 1 : buf,
+                 (unsigned long long)((uintptr_t)p - (uintptr_t)owner));
+    }
+    char tgtName[MAX_PATH] = "?";
+    HMODULE towner = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)(uintptr_t)pointee, &towner);
+    if (towner) {
+        char buf[MAX_PATH] = {};
+        GetModuleFileNameA(towner, buf, MAX_PATH);
+        const char* slash = strrchr(buf, '\\');
+        snprintf(tgtName, sizeof(tgtName), "%s+0x%llX", slash ? slash + 1 : buf,
+                 (unsigned long long)((uintptr_t)pointee - (uintptr_t)towner));
+    }
+    shim_log("  [%s=%p (%s) -> %p (%s)]", name, p, modName, (void*)pointee, tgtName);
 }
 
 // ---- SKSEPlugin_Load ----
