@@ -1409,7 +1409,8 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None):
         return {
             "name": dll_path.name,
             "verdict": "SAFE",
-            "reason": f"Uses Address Library, flags correct{extra}.",
+            "reason": f"Uses Address Library, flags correct{extra}. Should load, "
+                 "but that doesn't guarantee it works in-game.",
             "details": {"build_year": build_year, "has_addr": has_addr,
                         "hooks": len(hooks)},
         }
