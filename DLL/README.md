@@ -96,18 +96,18 @@ parse, but older plugins only understand format 1 or 2.
 ## Architecture
 
 ```
-+-------------------------------------------------------------+
-|                    Skyrim SE Process                         |
-|                                                             |
++------------------------------------------------------------+
+|                    Skyrim SE Process                       |
+|                                                            |
 |  +----------+   +----------+   +----------+   +--------+   |
 |  | Plugin A |   | Plugin B |   | Plugin C |   |  SKSE  |   |
 |  | (V2 fmt) |   | (V1 fmt) |   | (V5 fmt) |   |        |   |
 |  +----+-----+   +----+-----+   +----+-----+   +---+----+   |
-|       |              |              |             |         |
-| ------+--------------+--------------+-------------+---------|
-|       |              |              |             |         |
-|  +----v--------------v--------------v-------------v------+  |
-|  |           !CompaSSE.dll (13 hooks)                    |  |
+|       |              |              |             |        |
+| ------+--------------+--------------+-------------+--------|
+|       |              |              |             |        |
+|  +----v--------------v--------------v-------------v-----+  |
+|  |           !CompaSSE.dll (13 hooks)                   |  |
 |  |                                                      |  |
 |  |  GetProcAddress hook                                 |  |
 |  |    Patches SKSEPlugin_Version flags so SKSE          |  |
@@ -131,17 +131,17 @@ parse, but older plugins only understand format 1 or 2.
 |  |    Log access violations with module info +          |  |
 |  |    register dump                                     |  |
 |  +------------------------------------------------------+  |
-|                         |                                   |
-|  -----------------------+-----------------------------------|
-|                         |                                   |
-|  +----------------------v--------------------------------+  |
+|                         |                                  |
+|  -----------------------+----------------------------------|
+|                         |                                  |
+|  +----------------------v-------------------------------+  |
 |  |              Temp files in %TEMP%                    |  |
-|  |  !CompaSSE_{pid}_fmt0.bin                  |  |
-|  |  !CompaSSE_{pid}_fmt1.bin                  |  |
-|  |  !CompaSSE_{pid}_fmt2.bin                  |  |
-|  |  !CompaSSE_{pid}_fmt5.bin                  |  |
+|  |  !CompaSSE_{pid}_fmt0.bin                            |  |
+|  |  !CompaSSE_{pid}_fmt1.bin                            |  |
+|  |  !CompaSSE_{pid}_fmt2.bin                            |  |
+|  |  !CompaSSE_{pid}_fmt5.bin                            |  |
 |  +------------------------------------------------------+  |
-+-------------------------------------------------------------+
++------------------------------------------------------------+
 ```
 
 ### File structure
@@ -246,7 +246,7 @@ Only CommonLibSSE-ng with AE support can read this.
 | Format | File                     | Size             | Entry count |
 |--------|--------------------------|------------------|-------------|
 |   1    | version-1-7-104-0.bin    | 3,570,871 bytes  | 395,946     |
-|   2    | (transcoded from fmt5)   | ~9,200,000 bytes | ~435,000 + remaps |
+|   2    | (transcoded from fmt5)   | ~9,200,000 bytes | ~435,000+   |
 |   5    | versionlib-1-7-104-0.bin | 2,263,132 bytes  | 565,759     |
 
 The format 1 file has fewer entries because it only includes IDs that have
