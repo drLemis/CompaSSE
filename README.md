@@ -108,17 +108,18 @@ compatible version based on what the mod can parse:
 - Format 2 callers (most mods) get a transcoded temp file
 - Format 1 callers (old CommonLibSSE) get a transcoded temp file
 
-The shim also merges legacy IDs from old address library versions and
-applies cross-version translation tables so mods get the offsets they
-expect for the current game version.
+The shim also applies cross-version translation tables so mods get the
+offsets they expect for the current game version.
 
 ## Building from source
 
 Prerequisites: Visual Studio Build Tools (MSVC), Python 3.x
 
 ```powershell
-# Build the shim DLL
-cmd /c DLL\build_shim.bat
+# Build the shim DLL (from the DLL folder: the script uses relative paths)
+cd DLL
+cmd /c build_shim.bat
+cd ..
 
 # Build the release bundle (PyInstaller + shim DLL)
 .\build_release.ps1

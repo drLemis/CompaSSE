@@ -15,7 +15,7 @@ needed - everything happens in memory when SKSE loads each plugin.
 6. [Address Library Formats](#address-library-formats)
 7. [Format Detection (Decoder)](#format-detection-decoder)
 8. [Serve Logic](#serve-logic)
-9. [Merging and Translation](#merging-and-translation)
+9. [Translation](#translation)
 10. [GetProcAddress + LoadLibrary Hooks](#getprocaddress--loadlibrary-hooks)
 11. [MessageBox Interception](#messagebox-interception)
 12. [Crash VEH](#crash-veh)
@@ -246,13 +246,13 @@ Only CommonLibSSE-ng with AE support can read this.
 | Format | File                     | Size             | Entry count |
 |--------|--------------------------|------------------|-------------|
 |   1    | version-1-7-104-0.bin    | 3,570,871 bytes  | 395,946     |
-|   2    | (transcoded from fmt5)   | 14,127,419 bytes | 831,011     |
+|   2    | (transcoded from fmt5)   | ~9,200,000 bytes | ~435,000 + remaps |
 |   5    | versionlib-1-7-104-0.bin | 2,263,132 bytes  | 565,759     |
 
 The format 1 file has fewer entries because it only includes IDs that have
 non-zero offsets in the current runtime. Format 5 includes ALL IDs (zeros
-for unmapped ones). The merged format 2 combines format 5 with legacy IDs
-from old bins (1.5.97, 1.5.80, 1.5.62) for a total of ~831K entries.
+for unmapped ones). Format 2 is transcoded from the non-zero fmt5 entries
+(~435K on 1.7.104) with translation-table remaps applied on top.
 
 ## Format Detection (Decoder)
 
@@ -320,7 +320,7 @@ unmodified. SKSE itself needs the actual address library.
 
 **`version-` prefix (old SE plugins):**
 - If the path matches the **current runtime** version (e.g. contains
-  "1-7-104"): serve merged format 1 from the temp file
+  "1-7-104"): serve transcoded format 1 from the temp file
 - If it's an **old version**: pass through directly (real file is already
   format 1)
 
@@ -335,9 +335,9 @@ buffers for all four formats:
 ```
 Real .bin (fmt5) ---+--- g_fmt5 (raw copy)
                     +--- g_fmt5_patched (translated offsets)
-                    +--- g_fmt2 (transcoded, merged with old bins)
-                    +--- g_fmt1 (transcoded from merged fmt2)
-                    +--- g_fmt0 (transcoded from merged fmt2)
+                    +--- g_fmt2 (transcoded, translations applied)
+                    +--- g_fmt1 (transcoded from fmt2)
+                    +--- g_fmt0 (transcoded from fmt2)
 ```
 
 When the source is format 1/2, the process is similar but starts from fmt2
@@ -369,30 +369,17 @@ Caller requests versionlib-*.bin
 +- Unknown -> fmt2 temp file
 
 Caller requests version-*.bin
-+- Current runtime version -> merged fmt1 temp file
++- Current runtime version -> transcoded fmt1 temp file
 +- Old version -> pass-through (real file is already fmt1)
 ```
 
-## Merging and Translation
+## Translation
 
-### Old bin merging
-
-The `merge_old_entries()` function scans `version-*.bin` files in the
-plugins folder (sorted newest-first) and adds any {id, offset} pair whose
-ID is absent from the current runtime's mapping, or whose offset is 0 in
-the current runtime (format 5 stores 0 for unmapped IDs).
-
-**Important**: Only `version-1-5-*.bin` files are merged. Files with
-`minor >= 7` (e.g. `version-1-7-104-0.bin`) are skipped because they use
-a different ID scheme than the `versionlib-` format 5 file and would
-corrupt the map with wrong offsets.
-
-Currently merges from:
-- `version-1-5-97-0.bin` (382,728 entries)
-- `version-1-5-80-0.bin` (149 entries)
-- `version-1-5-62-0.bin` (12,972 entries)
-
-Result: 831,011 total entries (up from 565,759 in the base fmt5).
+No old-bin merging happens at serve time: legacy readers get the current
+runtime's data, transcoded, with translation-table remaps applied. Old
+game versions feed the system one step earlier - `CompaSSE.exe
+--build-translations` mints the remap rows from old bins plus old-exe
+ground truth (see the main README).
 
 ### Translation table
 
@@ -523,9 +510,8 @@ Data/SKSE/Plugins/!CompaSSE.log
 | `install_hooks: enable ok` | All hooks enabled |
 | `GetProcAddress: patched SKSEPlugin_Version flags for module at ADDR` | Version flags patched |
 | `loadtime LoadLibraryW: patched SKSEPlugin_Version mod=...` | Flags patched at load time |
-| `serve VERSIONLIB: decoder=N format=N for MODULE` | Format detection result |
 | `serve VERSIONLIB -> format N (transcoded) for MODULE` | Temp file served |
-| `merge: +N IDs, filled N zeros from FILE` | Old bin merge result |
+| `serve PATH -> pass-through for SKSE (MODULE)` | SKSE gets the real file |
 | `load_translations: loaded N remapped IDs from N version tables` | Translation table loaded |
 | `MessageBoxW intercepted! caption=X text=Y` | Error dialog logged |
 
