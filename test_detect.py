@@ -304,6 +304,48 @@ def main():
     t14b.write_bytes(make_pe64([(".text", 0x1000, 0x100, 0x400, 0x100)]))
     check("T14.zero", C.pe_build_dt(t14b) is None, "zero ts")
 
+
+    # ---------------------------------------------------------------- T19: cutoffs
+    x19 = C.crossed_cutoffs
+    check("T19.all", x19((1, 6, 640), (1, 7, 104))
+          == [(1, 6, 653), (1, 6, 1130), (1, 7, 99)], "640->104")
+    check("T19.one", x19((1, 6, 1170), (1, 7, 104)) == [(1, 7, 99)],
+          "1170->104")
+    check("T19.none", x19((1, 7, 104), (1, 7, 104)) == []
+          and x19((1, 7, 99), (1, 7, 104)) == [], "same/adjacent")
+    check("T19.guards", x19(None, (1, 7, 104)) == []
+          and x19((1, 7, 104), None) == []
+          and x19((1, 0, 0), (1, 7, 104)) == [], "none/placeholder")
+
+    import compasse_gui as G
+    r19 = 0x01070680  # 1.7.104.0, SKSE-true packing
+    old19 = 0x01062800  # 1.6.640.0
+    base_vi = {"indep_val": 0x1, "indep_ex_val": 0, "has_addr": True,
+               "has_sigs": False, "has_unknown": False, "needs_indep": True,
+               "runtime_ver": old19, "compat": [old19]}
+
+    def_info = {"flag": {"flag_off": 0, "flag_val": 0, "needs_patch": True},
+                "version_indep": dict(base_vi), "hooks": []}
+    v19 = G.classify(def_info, 2023, r19)
+    check("T19.gui-needsfix", v19["cat"] == "NEEDS_FIX"
+          and "1.6.653" in v19["why"] and "1.7.99" in v19["why"], v19["cat"])
+
+    try_info = {"flag": {"flag_off": 0, "flag_val": 0, "needs_patch": True},
+                "version_indep": dict(base_vi, compat=[r19]), "hooks": []}
+    v19b = G.classify(try_info, 2023, r19)
+    check("T19.gui-tryfirst", v19b["cat"] == "MANUAL"
+          and "1.7.99" in v19b["why"], v19b["cat"])
+
+    ok_info = {"flag": {"flag_off": 0, "flag_val": 2, "needs_patch": False},
+               "version_indep": {"indep_val": 0x5, "indep_ex_val": 0x2,
+                                 "has_addr": True, "has_sigs": False,
+                                 "has_unknown": False, "needs_indep": False,
+                                 "runtime_ver": r19, "compat": [r19]},
+               "hooks": []}
+    v19c = G.classify(ok_info, 2024, r19)
+    check("T19.gui-builtforyou", v19c["cat"] == "OK"
+          and "leave it alone" in v19c["why"], v19c["cat"])
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
