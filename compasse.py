@@ -49,6 +49,22 @@ KVI_TARGET = KVI_ADDR_LIB_POST_AE | KVI_STRUCTS_POST629  # 0x5
 # versionIndependenceEx flags
 KVIEX_ADDR_LIB_V5 = 1 << 1  # 0x2
 
+# Structural breaks no flag patch can bridge (community-reported:
+# ExtraDataList vtable + cascade in 6.653, more in 6.1130 and 7.99).
+# A plugin built before one and run past it may crash on struct drift
+STRUCTURAL_CUTOFFS = ((1, 6, 653), (1, 6, 1130), (1, 7, 99))
+
+def crossed_cutoffs(declared, running):
+    """Cutoffs strictly after declared and at/under running, or [].
+
+    Either side missing (or a pre-1.5.0 placeholder like 1.0.0.0).
+    """
+    if not declared or not running:
+        return []
+    if declared < (1, 5, 0) or running < (1, 5, 0):
+        return []
+    return [c for c in STRUCTURAL_CUTOFFS if declared < c <= running]
+
 # SKSE build-time rejection window: plugins built in this range get
 # "must be recompiled" when they declare AddressLibraryPostAE but lack V5.
 _BUILD_TIME_SENTINEL = 520128000      # 1986-06-19 (sentinel "no timestamp")
@@ -56,8 +72,10 @@ _BUILD_TIME_CUTOFF = 1748217600       # 2025-05-26
 
 
 def runtime_version_from_exe(exe_path):
-    """Packed runtime version (e.g. 1.7.104.0 -> 0x01076800) from the exe.
+    """Packed runtime version (e.g. 1.7.104.0 -> 0x01070680) from the exe.
 
+    Packing matches SKSE (major<<24 | minor<<16 | build<<4 | rev), so the
+    value compares equal to compatibleVersions entries in plugins.
     Reads the VS_FIXEDFILEINFO FileVersion of the PE. Returns None if it
     cannot be determined.
     """
@@ -82,14 +100,14 @@ def runtime_version_from_exe(exe_path):
         minor = ffi[2] & 0xFFFF
         build = ffi[3] >> 16
         rev = ffi[3] & 0xFFFF
-        return (major << 24) | (minor << 16) | (build << 8) | rev
+        return (major << 24) | (minor << 16) | (build << 4) | rev
     except Exception:
         return None
 
 def unpack_version(packed):
-    """Unpack version integer to (major, minor, patch) tuple."""
+    """Unpack version integer to (major, minor, build) tuple."""
     if packed is None: return None
-    return (packed >> 24, (packed >> 16) & 0xFF, (packed >> 8) & 0xFF)
+    return (packed >> 24, (packed >> 16) & 0xFF, (packed >> 4) & 0xFFF)
 
 def pe_build_dt(dll_path):
     """PE TimeDateStamp as datetime (UTC), or None if missing/unreadable."""
@@ -556,7 +574,7 @@ def patch_flag(dll_path):
 def check_version_independence(dll_path, runtime_version=None):
     """Check versionIndependence + versionIndependenceEx fields.
 
-    runtime_version: packed game runtime (1.7.104.0 -> 0x01076800). If None,
+    runtime_version: packed game runtime (1.7.104.0 -> 0x01070680). If None,
     the compatibleVersions membership check is skipped.
 
     Returns dict with:
@@ -594,6 +612,16 @@ def check_version_independence(dll_path, runtime_version=None):
         if first_compat != 0:
             runtime_ver = first_compat
 
+    compat_list = []
+    for ci in range(16):
+        co = compat_off + ci * 4
+        if co + 4 > len(data):
+            break
+        v = struct.unpack_from("<I", data, co)[0]
+        if v == 0:
+            break
+        compat_list.append(v)
+
     has_addr = bool(indep_val & KVI_ADDR_LIB_POST_AE)
     has_sigs = bool(indep_val & KVI_SIGNATURES)
     has_structs = bool(indep_val & KVI_STRUCTS_POST629)
@@ -615,15 +643,6 @@ def check_version_independence(dll_path, runtime_version=None):
         pre_cutoff = _BUILD_TIME_SENTINEL <= build_time < _BUILD_TIME_CUTOFF
         needs_indep = pre_cutoff and not has_ex_v5
     else:
-        compat_list = []
-        for ci in range(16):
-            co = compat_off + ci * 4
-            if co + 4 > len(data):
-                break
-            v = struct.unpack_from("<I", data, co)[0]
-            if v == 0:
-                break
-            compat_list.append(v)
         needs_indep = bool(compat_list) and runtime_version is not None \
             and runtime_version not in compat_list
 
@@ -635,12 +654,12 @@ def check_version_independence(dll_path, runtime_version=None):
         "has_unknown": has_unknown,
         "needs_indep": needs_indep,
         "runtime_ver": runtime_ver,
+        "compat": compat_list,
     }
 
 def _packed_to_ver(packed):
     """Convert packed version uint32 to 'M.m.b.r' string."""
-    b = packed.to_bytes(4, "little")
-    return f"{b[3]}.{b[2]}.{b[1]}.{b[0]}"
+    return f"{packed >> 24}.{((packed >> 16) & 0xFF)}.{((packed >> 4) & 0xFFF)}.{packed & 0xF}"
 
 def patch_version_independence(dll_path):
     """Patch versionIndependence to 0x5 and versionIndependenceEx |= 0x2.
@@ -1332,6 +1351,15 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None):
     has_unknown = vi is not None and vi.get("has_unknown", False)
     needs_fix = flag_patch or indep_patch
 
+    declared_tup = unpack_version(vi["runtime_ver"]) \
+        if vi and vi.get("runtime_ver") else None
+    run_tup = unpack_version(runtime_version) if runtime_version else None
+    crossed = crossed_cutoffs(declared_tup, run_tup)
+    cross_names = ", ".join(f"{a}.{b}.{c}" for a, b, c in crossed)
+    cross_suffix = (f" Crosses structural break(s) {cross_names}: struct "
+                    "drift may crash it even patched - test in-game.") \
+        if crossed else ""
+
     # Rule 1: built with CommonLibSSE? (heuristic: build year + has SKSE export)
     # Rule 2: uses Address Library? (versionIndependence flag bit)
     # Rule 3: has hardcoded offsets? (capstone hook scan finds REL::ID + offset)
@@ -1340,11 +1368,17 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None):
 
     # BROKEN: old build, no Address Library, likely hardcoded offsets
     if old_build and not has_addr and not needs_fix:
+        reason = (f"Built {build_year}, no Address Library. "
+                  "Likely hardcoded offsets - will crash on current runtime.")
+        if crossed and vi and vi.get("runtime_ver"):
+            reason += (f" Built for {_packed_to_ver(vi['runtime_ver'])}, "
+                       f"{len(crossed)} structural break(s) since "
+                       f"({cross_names}) - unfixable without a source "
+                       "recompile. No patcher bridges that.")
         return {
             "name": dll_path.name,
             "verdict": "BROKEN",
-            "reason": (f"Built {build_year}, no Address Library. "
-                       "Likely hardcoded offsets - will crash on current runtime."),
+            "reason": reason,
             "details": {"build_year": build_year, "has_addr": has_addr,
                         "hooks": len(hooks)},
         }
@@ -1370,7 +1404,7 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None):
         return {
             "name": dll_path.name,
             "verdict": "NEEDS_FIX",
-            "reason": "; ".join(reasons) + extra,
+            "reason": "; ".join(reasons) + extra + cross_suffix,
             "details": {"build_year": build_year, "has_addr": has_addr,
                         "hooks": len(hooks)},
         }
@@ -1631,6 +1665,9 @@ def main():
     exe_sections = None
     addresslib = None
     runtime_version = None
+    if args.game:
+        runtime_version = runtime_version_from_exe(args.game) \
+            if args.game.exists() else None
     if args.fix and (args.game or args.dll):
         game_path = args.game
         if game_path is None:
@@ -1663,6 +1700,10 @@ def main():
     # -- Audit mode: definitive compatibility verdicts
     if args.audit:
         print(f"\n=== AUDIT {len(dlls)} plugin(s) ===\n")
+        if runtime_version:
+            print(f"  game runtime: {_packed_to_ver(runtime_version)}\n")
+        else:
+            print("  (no --game given: version-specific checks skipped)\n")
         # Triage gate needs the ID set: load it when a lib is provided.
         id_set = None
         if args.addresslib is not None and args.addresslib.exists():

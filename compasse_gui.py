@@ -85,18 +85,36 @@ def _get_build_date_str(dll_path):
     return dt.strftime("%Y %B %d").replace(" 0", " ")
 
 
-def classify(info, build_year):
-    """Turn analyze_plugin output + build year into a verdict dict."""
+def classify(info, build_year, runtime_version=None):
+    """Turn analyze_plugin output + build year into a verdict dict.
+
+    runtime_version (packed, from the user's game exe) enables the
+    built-for-you branches: a plugin declaring the running version is
+    judged against its own era, not current flag fashion.
+    """
     flag = info.get("flag")
     vi = info.get("version_indep")
     hooks = info.get("hooks", [])
     rv = (vi or {}).get("runtime_ver")
     version = core._packed_to_ver(rv) if rv else None
+    compat = (vi or {}).get("compat") or []
+    declares_running = (runtime_version is not None
+                        and runtime_version in compat)
+    run_str = core._packed_to_ver(runtime_version) if runtime_version else None
+    declared_tup = core.unpack_version(rv) if rv else None
+    run_tup = core.unpack_version(runtime_version) if runtime_version else None
+    crossed = core.crossed_cutoffs(declared_tup, run_tup)
+    cross_note = ""
+    if crossed:
+        names = ", ".join(f"{a}.{b}.{c}" for a, b, c in crossed)
+        cross_note = (f" Crosses structural break(s) {names}: even patched, "
+                      "struct drift may still crash it - test in-game.")
 
     def _base(cat, badge, key, why, fix_desc="", safe=False, needs_fix=False, items=None):
         return dict(cat=cat, badge=badge, key=key, why=why, fix_desc=fix_desc,
                     safe=safe, needs_fix=needs_fix, version=version,
-                    build_year=build_year, fix_items=items or [])
+                    build_year=build_year, fix_items=items or [],
+                    run_ver=run_str)
 
     # Not an SKSE plugin at all
     if flag is None and vi is None:
@@ -146,9 +164,12 @@ def classify(info, build_year):
     # Build year undetermined: fall back to flag analysis
     if build_year is None:
         if flag_patch or indep_patch:
+            why = ("Cannot determine build year. Plugin needs flag patches "
+                   "but safety is uncertain.")
+            if crossed:
+                why += cross_note
             return _base("MANUAL", "MANUAL CHECK", "MANUAL",
-                         "Cannot determine build year. Plugin needs flag patches "
-                         "but safety is uncertain.",
+                         why,
                          "Review manually before patching.", False, True, items)
         return _base("OK", "OK", "OK",
                      "No patches needed. Build year unknown but flags look correct.")
@@ -157,12 +178,21 @@ def classify(info, build_year):
 
     # Plugin needs patching
     if any_patch:
+        if declares_running:
+            return _base("MANUAL", "MANUAL CHECK", "MANUAL",
+                         (f"Declares your game version ({run_str}) but predates "
+                          "the current flag scheme. Try it unpatched first - "
+                          "patch only if SKSE rejects it." + cross_note),
+                         "Try loading first; patch on rejection.", False, True, items)
+
         if old and addrlib:
             parts = [
                 f"Built {build_year} (old CommonLibSSE). "
                 "Uses Address Library but SKSE rejects it due to "
                 "outdated version flags.",
             ]
+            if crossed:
+                parts.append(cross_note.strip())
             fix_desc = "Patch the flags so SKSE accepts it."
             if hooks:
                 fix_desc += f"  Also re-resolve {len(hooks)} hook offset(s)."
@@ -175,24 +205,39 @@ def classify(info, build_year):
                 "still rejects it, likely missing version-independence flags "
                 "needed to declare compatibility."
             )
+            if crossed:
+                why += cross_note
             return _base("NEEDS_FIX", "NEEDS FIX", "NEEDS_FIX",
                          why, "Patch the flags so SKSE accepts it.", True, True, items)
 
         if old and not addrlib:
+            why = (f"Built {build_year} (old). Does not use Address Library. "
+                   "Likely has hardcoded Skyrim addresses. "
+                   "Auto-patching would break it.")
+            if crossed and version:
+                names = ", ".join(f"{a}.{b}.{c}" for a, b, c in crossed)
+                why += (f" Built for {version}, {len(crossed)} structural "
+                        f"break(s) since ({names}) - unfixable without a "
+                        "source recompile. No patcher bridges that.")
             return _base("DANGEROUS", "DANGEROUS", "DANGEROUS",
-                         (f"Built {build_year} (old). Does not use Address Library. "
-                          "Likely has hardcoded Skyrim addresses. "
-                          "Auto-patching would break it."),
+                         why,
                          "Needs manual port or recompile with CommonLibNG.",
                          False, True, items)
 
         # recent + no addrlib, or other ambiguous
+        why = (f"Built {build_year}. Does not declare Address Library usage. "
+               "Flags need patching but safety is unclear.")
+        if crossed:
+            why += cross_note
         return _base("MANUAL", "MANUAL CHECK", "MANUAL",
-                     (f"Built {build_year}. Does not declare Address Library usage. "
-                      "Flags need patching but safety is unclear."),
+                     why,
                      "Review manually before patching.", False, True, items)
 
     # No patches needed based on flags
+    if declares_running:
+        return _base("OK", "OK", "OK",
+                     f"Declares your game version ({run_str}). Built for it - leave it alone.")
+
     if has_unknown:
         return _base("MANUAL", "MANUAL CHECK", "MANUAL",
                      (f"Unknown versionIndependence flags "
@@ -306,11 +351,14 @@ class PluginCard(tk.Frame):
         # Version / era line (secondary info)
         ver = verdict.get("version")
         bdate = verdict.get("build_date")
+        run = verdict.get("run_ver")
         yline = ""
         if bdate:
             yline += f"{bdate} - "
         if ver:
             yline += f"Skyrim SSE {ver}"
+        if run and run != ver:
+            yline += f"  (your game: {run})"
         if yline:
             tk.Label(body, text=yline,
                      font=(FONT_FAMILY, 9),
@@ -790,6 +838,7 @@ class HealerTab:
         )
         if path:
             self.plugin_var.set(path)
+            self.scan()
 
     def _browse_old_game(self):
         path = filedialog.askopenfilename(
@@ -1152,7 +1201,7 @@ class AutoPorterGUI:
                 continue
             build_year = _get_build_year(dll)
             build_date = _get_build_date_str(dll)
-            v = classify(info, build_year)
+            v = classify(info, build_year, runtime_version)
             v["build_date"] = build_date
             self._scan_data.append((dll, info, v))
             counts[v["cat"]] = counts.get(v["cat"], 0) + 1
