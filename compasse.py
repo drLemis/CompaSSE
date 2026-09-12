@@ -237,7 +237,11 @@ def find_versionlib(plugins_dir, version_tuple):
 def build_translations(game_exe, plugins_dir, game_version=None):
     """Build translation_table.bin from old bins + current binary.
 
-    Returns (version_count, total_entries) on success, raises on error.
+    Only IDs ABSENT from the current library are emitted. IDs present in
+    the current library need no row: served temps are built from the
+    current bin, so they already carry the current offset (such rows are
+    permanent no-ops behind the shim's != guard). Returns
+    (version_count, total_entries) on success, raises on error.
     """
     exe_data, sections = load_exe_sections(game_exe)
     if not exe_data:
@@ -1611,6 +1615,29 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
         "details": {"build_year": build_year, "has_addr": has_addr},
     }
 
+
+def _read_quarantine_ini(ini_path):
+    """IDs already quarantined. Mirrors the DLL parser (ASCII digits)."""
+    ids = set()
+    try:
+        with open(ini_path, "r", encoding="ascii", errors="strict") as f:
+            lines = f.read().splitlines()
+    except (OSError, ValueError):
+        return ids
+    import re as _re
+    for line in lines:
+        line = line.strip()
+        if not line or line[0] in ";#[":
+            continue
+        m = _re.match(r"(0[xX][0-9a-fA-F]+|\d+)", line)
+        if m:
+            try:
+                v = int(m.group(1), 0)
+            except ValueError:
+                continue
+            if 0 < v < (1 << 40):
+                ids.add(v)
+    return ids
 
 
 def diagnose_run(plugins_dir, apply=False):

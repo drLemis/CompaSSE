@@ -271,6 +271,57 @@ static bool is_old_version_path(const wchar_t* path) {
     return g_exeVersion[0] && !wcsstr(path, g_exeVersion);
 }
 
+// Quarantine list from CompaSSE\quarantine.ini (one decimal/hex ID per
+// line, ';' '#' and [sections] ignored). Missing/unparseable file = empty.
+static std::vector<uint64_t> g_quarantine;
+static bool g_quarantine_loaded = false;
+
+static void load_quarantine() {
+    if (g_quarantine_loaded) return;
+    g_quarantine_loaded = true;
+    if (!g_self) return;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(g_self, path, MAX_PATH)) return;
+    wchar_t* bs = wcsrchr(path, L'\\');
+    if (!bs) return;
+    *bs = 0;
+    wcscat_s(path, L"\\CompaSSE\\quarantine.ini");
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[8192];
+    DWORD rd = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &rd, nullptr);
+    CloseHandle(h);
+    if (!ok || rd == 0) return;
+    buf[rd] = 0;
+    if (buf[0] == '\0') return;
+    // Tolerate a UTF-8 BOM (Notepad-saved files); reject UTF-16 outright.
+    char* text = buf;
+    if (rd > 3 && (unsigned char)buf[0] == 0xEF) {
+        if ((unsigned char)buf[1] != 0xBB || (unsigned char)buf[2] != 0xBF) return;
+        text += 3;
+    } else if (rd > 2 && (unsigned char)buf[0] == 0xFF) {
+        shim_log("load_quarantine: ignoring non-ANSI file (save as ANSI/UTF-8)");
+        return;
+    }
+    int skipped = 0;
+    char* ctx = nullptr;
+    for (char* line = strtok_s(text, "\r\n", &ctx); line;
+         line = strtok_s(nullptr, "\r\n", &ctx)) {
+        while (*line == ' ' || *line == '\t') ++line;
+        if (!*line || *line == ';' || *line == '#' || *line == '[') continue; // not an entry
+        unsigned long long v = 0;
+        bool hex = (line[0] == '0' && (line[1] == 'x' || line[1] == 'X'));
+        int n = sscanf_s(line, hex ? "%llx" : "%llu", &v);
+        if (n != 1 || v == 0 || v >= (1ULL << 40)) { ++skipped; continue; }
+        if (g_quarantine.size() >= 8192) break;
+        g_quarantine.push_back((uint64_t)v);
+    }
+    // Only malformed ID lines count as skipped; comments never do.
+    shim_log("load_quarantine: %zu ID(s)%s", g_quarantine.size(),
+             skipped ? " (some entries skipped)" : "");
+}
 
 // ---- Translation table (cross-version ID remapping) ----
 struct TranslationEntry { uint64_t old_id; uint32_t offset; };
@@ -334,12 +385,18 @@ static void load_translations() {
             g_flatTranslations.push_back(te);
         }
     }
-    // Sort by old_id for binary search; deduplicate (keep newest version's entry)
-    std::sort(g_flatTranslations.begin(), g_flatTranslations.end(),
-              [](const TranslationEntry& a, const TranslationEntry& b) { return a.old_id < b.old_id; });
-    auto last = std::unique(g_flatTranslations.begin(), g_flatTranslations.end(),
-                            [](const TranslationEntry& a, const TranslationEntry& b) { return a.old_id == b.old_id; });
-    g_flatTranslations.erase(last, g_flatTranslations.end());
+    // Deduplicate, keeping the newest version's entry. File order is oldest
+    // to newest (build writes versions ascending, merges append), so the
+    // last row per ID wins. (std::sort is not stable, so the old
+    // sort+unique kept an arbitrary row - a cross-version lottery.)
+    {
+        std::map<uint64_t, uint32_t> newest;
+        for (auto& te : g_flatTranslations) newest[te.old_id] = te.offset;
+        g_flatTranslations.clear();
+        g_flatTranslations.reserve(newest.size());
+        for (auto& kv : newest)
+            g_flatTranslations.push_back(TranslationEntry{kv.first, kv.second});
+    }
     shim_log("load_translations: loaded %zu remapped IDs from %zu version tables",
              g_flatTranslations.size(), (size_t)verCount);
 }
@@ -499,7 +556,19 @@ static void ensure_buffers(const wchar_t* binPath) {
         g_fmt5 = src;
         std::map<uint64_t, uint64_t> have;
         uint32_t mergedPtr = ptr_size;
+        static const uint64_t kKeepIds[] = { 41450 };
         for (auto& e : entries) if (e.second != 0) have[e.first] = e.second;
+        for (auto id : kKeepIds) {
+            size_t pos = 96 + (size_t)id * 4;
+            if (pos + 4 <= src.size())
+                have[id] = (uint64_t)src[pos] | ((uint64_t)src[pos + 1] << 8) |
+                           ((uint64_t)src[pos + 2] << 16) | ((uint64_t)src[pos + 3] << 24);
+        }
+        if (!g_quarantine_loaded) load_quarantine();
+        int quarantined = 0;
+        for (auto id : g_quarantine) quarantined += (int)have.erase(id);
+        if (quarantined > 0)
+            shim_log("ensure_buffers: quarantined %d ID(s)", quarantined);
         load_translations();
         int remapped = apply_translations(have);
         std::vector<std::pair<uint64_t, uint64_t>> merged(have.begin(), have.end());
@@ -550,7 +619,7 @@ static void ensure_buffers(const wchar_t* binPath) {
             return;
         }
         if (srcFmt == 2) {
-        g_fmt2 = src;
+            g_fmt2 = src;
         } else {
             // parse_format2 already sorts entries; encode canonical fmt2.
             if (!encode_format2(g_fmt2, version, name, ptr_size, entries)) {
@@ -660,7 +729,7 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
     if (hasVersionPrefix) {
         shim_log("serve %ls -> pass-through version- file for %ls (decoder=%d)",
                  path, modName[0] ? modName : L"(unknown)", (int)type);
-            return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
+        return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     } else if (type == DECODER_V1) format = 1;
     else format = 2;
 

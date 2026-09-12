@@ -259,6 +259,22 @@ if (-not (Test-Path -LiteralPath $CompaSSEDir)) {
     Write-Ok "Created CompaSSE subfolder"
 }
 
+# ---- Default quarantine.ini (never overwrite user edits) ----
+$IniTarget = Join-Path $CompaSSEDir 'quarantine.ini'
+if (-not (Test-Path -LiteralPath $IniTarget)) {
+    $IniBody = @(
+        '; CompaSSE quarantine.ini - slot-0 IDs withheld from transcoded temps.'
+        '; One ID per line (decimal or 0x hex). Trailing text is ignored.'
+        "';', '#' and [sections] start comments/sections and are skipped."
+        '; Withheld BEFORE translations, so a future verified address still applies.'
+        ''
+    ) -join "`r`n"
+    Invoke-Dry "Create default quarantine.ini" { Set-Content -LiteralPath $IniTarget -Value $IniBody -Encoding Ascii -NoNewline:$false }
+    Write-Ok 'Created default quarantine.ini'
+} else {
+    Write-Skip 'quarantine.ini exists - left untouched'
+}
+
 # ---- Build translation table ----
 if (-not $NoTranslations) {
     Write-Step 'Building translation table'
