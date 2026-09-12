@@ -41,11 +41,22 @@ A Python CLI/GUI that fixes the version flags SKSE checks during load:
 # Audit all plugins - shows which are safe, which need fixes, which are dead
 python compasse.py --audit --plugins-dir <dir>
 
+# Explain last launch's startup errors (shim + SKSE logs); --apply appends
+# suggested IDs to CompaSSE/quarantine.ini (backed up, no dupes)
+python compasse.py --diagnose --plugins-dir <dir>
+
 # Scan and show flag status
 python compasse.py --scan --plugins-dir <dir>
 
 # Apply fixes (requires game exe + address library)
 python compasse.py --fix --plugins-dir <dir> --game SkyrimSE.exe --addresslib versionlib.bin
+
+# Ambiguous hooks (several pattern matches) are resolved through callee
+# identity when the mod's original game+lib are given: the candidate
+# calling the original callee wins. Anything else stays manual review.
+python compasse.py --fix --dll Mod.dll --game SkyrimSE.exe \
+    --addresslib versionlib-new.bin \
+    --old-exe SkyrimSE-old.exe --old-lib versionlib-old.bin
 
 # Build translation table (auto-detects paths from game exe location)
 python compasse.py --build-translations --game SkyrimSE.exe --plugins-dir <dir>

@@ -1612,8 +1612,160 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
     }
 
 
-def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dry_run=True):
-    """Fix a single plugin. Returns list of action strings."""
+
+def diagnose_run(plugins_dir, apply=False):
+    """Post-launch forensics over the shim + SKSE logs.
+
+    Matches startup errors to causes (stale temp, removed ID, misclassified
+    decoder, silent abort). Report-only unless apply=True, which appends
+    quarantine suggestions to quarantine.ini (backed up, deduped).
+    """
+    import re as _re
+    from datetime import date as _date
+    shim_log = plugins_dir / "CompaSSE" / "!CompaSSE.log"
+    skse_log = Path.home() / "Documents" / "My Games" / "Skyrim Special Edition" \
+        / "SKSE" / "skse64.log"
+
+    serves = {}   # mod basename -> [(req_path, decision)]
+    boxes = []    # (caption, text)
+    if shim_log.exists():
+        for line in shim_log.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _re.search(r"serve (.*?) -> (.*?) for (.*)$", line)
+            if m:
+                mod = Path(m.group(3).strip()).name
+                serves.setdefault(mod, []).append((m.group(1), m.group(2)))
+                continue
+            m = _re.search(r"MessageBox[WA] intercepted! caption=(.*?) text=(.*)$", line)
+            if m:
+                boxes.append((m.group(1).strip(), m.group(2).strip()))
+
+    disabled = []  # dll basenames SKSE gave up on
+    if skse_log.exists():
+        for line in skse_log.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _re.search(r"plugin (\S+\.dll).*disabled, fatal", line)
+            if m and m.group(1) not in disabled:
+                disabled.append(m.group(1))
+
+    # Current + ever ID sets from shipped bins (newest versionlib wins).
+    id_set, ever_set = set(), set()
+    best, best_ver = None, None
+    bins = sorted(plugins_dir.glob("version*.bin"))
+    for p in bins:
+        try:
+            lib = parse_library_any(str(p))
+        except Exception:
+            continue
+        if not lib:
+            continue
+        ever_set.update(lib)
+        if p.name.startswith("versionlib-"):
+            ver = extract_version_from_filename(p.name)
+            if ver and (best_ver is None or ver > best_ver):
+                best, best_ver = lib, ver
+    if best:
+        id_set = set(best)
+    print(f"bins: {len(bins)} shipped, current={best_ver}, "
+          f"shim log={'yes' if shim_log.exists() else 'no'}, "
+          f"skse log={'yes' if skse_log.exists() else 'no'}")
+
+    dlls = sorted(plugins_dir.glob("*.dll"))
+    xref_cache = {}
+    if HAS_CAPSTONE:
+        for dll in dlls:
+            try:
+                xref_cache[dll.name] = collect_xref_ids(dll) or set()
+            except Exception:
+                xref_cache[dll.name] = set()
+
+    def holders(nid, skip=None):
+        return sorted(n for n, s in xref_cache.items()
+                      if n != skip and nid in s)
+
+    suggestions = []  # (id, mod, reason)
+    skse_loader_failed = any(c.startswith("SKSE Plugin Loader") for c, _ in boxes)
+    if skse_loader_failed and not disabled:
+        print("note: SKSE reported a load failure but skse64.log names none; "
+              "is the game run newer than the log?")
+
+    for caption, text in boxes:
+        if caption.startswith("SKSE Plugin Loader"):
+            continue
+        m = _re.search(r"Identifier not found, (\d+)", text)
+        if m:
+            nid = int(m.group(1))
+            if nid in id_set:
+                print(f"[!!] {caption}: ID {nid} IS in the current lib but "
+                      f"was not found at runtime - stale temp/DLL? redeploy "
+                      f"CompaSSE and retest before anything else.")
+            elif nid in ever_set:
+                print(f"[!!] {caption}: ID {nid} removed upstream (in older "
+                      f"libs, unmapped now) - author update, or --mint-missing "
+                      f"with an old exe. Quarantine cannot help (already absent).")
+            else:
+                print(f"[??] {caption}: ID {nid} in no shipped lib - not an "
+                      f"address ID (bad pattern match?).")
+            continue
+        m = _re.search(r"Unsupported address library format: (\d+)", text)
+        if m:
+            fmt = m.group(1)
+            got = "; ".join(f"{p} => {d}" for p, d in serves.get(caption, [])[-2:])
+            print(f"[!!] {caption}: cannot parse format {fmt} (got: {got or 'no serve logged'}) - "
+                  f"decoder misclassified; needs a fmt temp (code fix), not quarantine.")
+            continue
+
+    for mod in disabled:
+        if any(c == mod for c, _ in boxes):
+            continue  # already covered above with its own dialog
+        removed = sorted(v for v in xref_cache.get(mod, set())
+                         if v != 0 and v not in id_set and v in ever_set)
+        if not removed:
+            print(f"[??] {mod}: SKSE disabled it but no ID evidence - check "
+                  f"load order/dependencies in skse64.log.")
+            continue
+        # Top suspect: smallest removed ID worth trusting. Values < 1000 are
+        # small constants/enums, not address IDs; real removals (10109)
+        # sort above them.
+        real = [v for v in removed if v >= 1000] or removed
+        shown = ", ".join(str(v) for v in removed[:5])
+        others = holders(real[0], skip=mod)
+        print(f"[!!] {mod}: silent init abort; {len(removed)} ID(s) mapped by "
+              f"older libs but unmapped now ({shown}). Top suspect: {real[0]} "
+              f"(also held by: {', '.join(others) if others else 'none'}). "
+              f"Suggest quarantine {real[0]}, or author update.")
+        suggestions.append((real[0], mod,
+                            f"diagnosed {_date.today().isoformat()}: silent init abort"))
+
+    ini_path = plugins_dir / "CompaSSE" / "quarantine.ini"
+    if apply and suggestions:
+        have = _read_quarantine_ini(ini_path)
+        new = [(i, m, r) for i, m, r in suggestions if i not in have]
+        if not new:
+            print("quarantine.ini already covers all suggestions - nothing to do.")
+        else:
+            if ini_path.exists() and not (ini_path.parent / (ini_path.name + ".bak")).exists():
+                shutil.copy2(ini_path, ini_path.parent / (ini_path.name + ".bak"))
+            fresh = not ini_path.exists()
+            with open(ini_path, "a", encoding="ascii") as f:
+                if fresh:
+                    f.write("; CompaSSE quarantine.ini - slot-0 IDs withheld from transcoded temps.\n")
+                for i, m, r in new:
+                    f.write(f"{i} = {r}: {m}\n")
+            print(f"quarantine.ini: added {len(new)} ID(s) "
+                  f"({', '.join(str(i) for i, _, _ in new)}). Relaunch to apply.")
+    elif suggestions and not apply:
+        print("report only - rerun with --apply to write quarantine.ini.")
+    elif not suggestions:
+        print("no actionable failures found.")
+    return suggestions
+
+
+def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dry_run=True,
+               old_ctx=None):
+    """Fix a single plugin. Returns list of action strings.
+
+    old_ctx: optional (old_exe_bytes, old_sections, old_lib) triple that
+    unlocks callee-identity disambiguation for ambiguous hooks.
+    """
     actions = []
     info = analyze_plugin(dll_path, runtime_version)
 
