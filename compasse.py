@@ -26,7 +26,7 @@ import struct
 import sys
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 try:
     from capstone import Cs, CS_ARCH_X86, CS_MODE_64, x86
