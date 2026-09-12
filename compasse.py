@@ -216,6 +216,24 @@ def extract_version_from_filename(fn):
     if m: return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     return None
 
+def find_versionlib(plugins_dir, version_tuple):
+    """versionlib-*.bin path matching a filename version, else None.
+
+    Shared matcher (mint flow, GUI/healer lib loading). Callers keep
+    their own fallback and parse rules.
+    """
+    if plugins_dir is None or version_tuple is None:
+        return None
+    try:
+        bins = sorted(plugins_dir.glob("versionlib-*.bin"))
+    except OSError:
+        return None
+    want = tuple(version_tuple[:3])
+    for b in bins:
+        if extract_version_from_filename(b.name) == want:
+            return b
+    return None
+
 def build_translations(game_exe, plugins_dir, game_version=None):
     """Build translation_table.bin from old bins + current binary.
 
@@ -316,11 +334,8 @@ def build_translations(game_exe, plugins_dir, game_version=None):
         old_lib = old_bins[old_ver]
         entries = []
         for old_id, old_offset in old_lib.items():
-            # Same ID exists in current library - only translate if offset changed
+            # Same ID exists in current library: skip
             if old_id in current_lib:
-                cur_offset = current_lib[old_id]
-                if cur_offset != old_offset:
-                    entries.append((old_id, cur_offset, b""))
                 continue
             # ID missing from current library - try to match by signature
             matched_sig = b""
@@ -1004,6 +1019,67 @@ def pattern_matches_at(exe, sections, base_offset, offset, pattern):
             return False
     return True
 
+def disambiguate_hook_by_callee(hook, exe, exe_sections, addresslib,
+                                old_exe, old_secs, old_lib, candidates=None):
+    """Resolve an ambiguous hook offset through callee identity.
+
+    The hook is an E8 call: reverse-lookup the old target in the old lib,
+    forward it through the current lib, keep the candidate calling that
+    address. candidates: precomputed matches (else found by window scan).
+    Returns (status, payload): resolved / still-ambiguous / unfixable
+    (with missing callee IDs). Never guesses.
+    """
+    rel_id = hook["rel_id"]
+    old_off = hook["offset"]
+    pattern = hook["pattern"]
+    base_new = addresslib.get(rel_id)
+    if base_new is None:
+        return ("still-ambiguous", None)
+    if pattern.get(0) != 0xE8:
+        return ("still-ambiguous", None)  # not a call hook; method N/A
+    if candidates is None:
+        candidates = find_pattern_offsets(exe, exe_sections, base_new, pattern, old_off)
+    if len(candidates) == 1:
+        return ("resolved", candidates[0])
+    if not candidates:
+        return ("unfixable", None)
+
+    def rva2off(exe_data, secs, rva):
+        for name, vaddr, vsize, rawoff, rawsize in secs:
+            if vaddr <= rva < vaddr + max(vsize, rawsize):
+                off = rawoff + (rva - vaddr)
+                return off if off + 5 <= len(exe_data) else None
+        return None
+
+    base_old = old_lib.get(rel_id)
+    if base_old is None:
+        return ("still-ambiguous", None)  # no old anchor
+    old_site = base_old + old_off
+    old_foff = rva2off(old_exe, old_secs, old_site)
+    if old_foff is None or old_exe[old_foff] != 0xE8:
+        return ("still-ambiguous", None)  # old site unreadable/not a call
+    old_target = old_site + 5 + struct.unpack_from("<i", old_exe, old_foff + 1)[0]
+    rev_ids = [i for i, o in old_lib.items() if o == old_target]
+    if not rev_ids:
+        return ("still-ambiguous", None)  # callee has no ID anchor
+    expected = {addresslib[i] for i in rev_ids if i in addresslib}
+    if not expected:
+        return ("unfixable", rev_ids)  # callee gone upstream
+    winners = []
+    for c in candidates:
+        site = base_new + c
+        foff = rva2off(exe, exe_sections, site)
+        if foff is None:
+            continue
+        target = site + 5 + struct.unpack_from("<i", exe, foff + 1)[0]
+        if target in expected:
+            winners.append(c)
+    if len(winners) == 1:
+        return ("resolved", winners[0])
+    if not winners:
+        return ("unfixable", rev_ids)
+    return ("still-ambiguous", None)
+
 # ---------------------------------------------------------------------------
 # Offset patch
 # ---------------------------------------------------------------------------
@@ -1107,6 +1183,57 @@ def convert_format5_to_format2(fmt5_path, out_path):
 # ---------------------------------------------------------------------------
 # High-level operations
 # ---------------------------------------------------------------------------
+def collect_xref_ids(dll_path):
+    """ID-sized values in RIP-read .data/.rdata slots (None when unavailable)."""
+    if not HAS_CAPSTONE:
+        return None
+    try:
+        with open(dll_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    sections = find_pe_sections(data)
+    if not sections:
+        return None
+    by_name = {n: (v, o, s) for n, v, _, o, s in sections}
+    if ".text" not in by_name:
+        return None
+
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = True
+    rip_targets = set()
+    try:
+        for begin, end in get_functions_from_pdata(data, sections):
+            if end - begin > 0x10000:
+                continue
+            off = rva_to_offset(begin, sections)
+            if off is None:
+                continue
+            for ins in md.disasm(data[off:off + (end - begin)], begin):
+                for op in ins.operands:
+                    if op.type == x86.X86_OP_MEM and op.mem.base == x86.X86_REG_RIP:
+                        rip_targets.add(ins.address + ins.size + op.mem.disp)
+    except Exception:
+        return None
+    if not rip_targets:
+        return None
+
+    vals = set()
+    for sname in (".data", ".rdata"):
+        if sname not in by_name:
+            continue
+        vaddr, rawoff, rawsize = by_name[sname]
+        for k in range(0, rawsize - 8):
+            rva = vaddr + k
+            if rva not in rip_targets:
+                continue
+            for width, fmt in ((8, "<Q"), (4, "<I")):
+                if k + width > rawsize:
+                    continue
+                vals.add(struct.unpack_from(fmt, data, rawoff + k)[0])
+    return vals
+
+
 def count_xref_ids(dll_path, id_set):
     """Data slots holding known address-library IDs AND read by code.
 
@@ -1319,7 +1446,28 @@ def analyze_plugin(dll_path, runtime_version=None, include_hooks=True):
 # ---------------------------------------------------------------------------
 # Audit: definitive compatibility verdict
 # ---------------------------------------------------------------------------
-def _audit_plugin(dll_path, runtime_version=None, id_set=None):
+def _removed_ids_note(dll_path, id_set, ever_set, details):
+    """Advisory suffix about IDs older libs map but the current one doesn't."""
+    if id_set is None or not ever_set:
+        return ""
+    all_ids = collect_xref_ids(dll_path)
+    if not all_ids:
+        return ""
+    removed = sorted((v for v in all_ids
+                      if v != 0 and v not in id_set and v in ever_set),
+                     key=lambda v: (v < 1000, v))  # small constants last
+    if not removed:
+        return ""
+    shown = ", ".join(str(v) for v in removed[:5])
+    more = f" (+{len(removed) - 5} more)" if len(removed) > 5 else ""
+    details["removed_ids"] = removed
+    return (f" Note: {len(removed)} xref'd ID(s) mapped by older "
+            f"libraries but unmapped in the current runtime "
+            f"({shown}{more}) - harmless if unused/tolerated, "
+            "fatal if init aborts on them.")
+
+
+def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
     """Audit a single plugin against the definitive compatibility rules.
 
     Returns dict with:
@@ -1401,12 +1549,15 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None):
         if indep_patch:
             reasons.append(f"versionIndependence is 0x{vi['indep_val']:x} (needs 0x{KVI_TARGET:x})")
         extra = f", {len(hooks)} hook offsets stale" if hooks else ""
+        details = {"build_year": build_year, "has_addr": has_addr,
+                   "hooks": len(hooks)}
+        reason = ("; ".join(reasons) + extra + cross_suffix
+                  + _removed_ids_note(dll_path, id_set, ever_set, details))
         return {
             "name": dll_path.name,
             "verdict": "NEEDS_FIX",
-            "reason": "; ".join(reasons) + extra + cross_suffix,
-            "details": {"build_year": build_year, "has_addr": has_addr,
-                        "hooks": len(hooks)},
+            "reason": reason,
+            "details": details,
         }
 
     # NEEDS_FIX: needs flags but no address library - risky
@@ -1440,13 +1591,16 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None):
         extra = f", {len(hooks)} hooks verified" if hooks else ""
         if xref:
             extra += f", {xref} xref'd IDs"
+        reason = (f"Uses Address Library, flags correct{extra}. Should load, "
+                  "but that doesn't guarantee it works in-game.")
+        details = {"build_year": build_year, "has_addr": has_addr,
+                   "hooks": len(hooks)}
+        reason += _removed_ids_note(dll_path, id_set, ever_set, details)
         return {
             "name": dll_path.name,
             "verdict": "SAFE",
-            "reason": f"Uses Address Library, flags correct{extra}. Should load, "
-                 "but that doesn't guarantee it works in-game.",
-            "details": {"build_year": build_year, "has_addr": has_addr,
-                        "hooks": len(hooks)},
+            "reason": reason,
+            "details": details,
         }
 
     # UNKNOWN: can't determine
@@ -1517,20 +1671,37 @@ def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dr
         # The inlined-cmp pattern is often weak and matches at many offsets.
         # Only auto-patch on a UNIQUE match; otherwise report for manual review
         # (patching the wrong offset silently breaks the plugin).
-        if len(matches) > 1:
-            cand = ", ".join(f"0x{m:x}" for m in matches)
-            actions.append(
-                f"  hook REL::ID {rel_id}: offset 0x{old_off:x} stale; "
-                f"AMBIGUOUS ({len(matches)} candidates: {cand}) - manual review required"
-            )
-            continue
-
-        new_off = matches[0]
+        new_off = None
+        via = ""
+        if len(matches) > 1 and old_ctx is not None:
+            status, payload = disambiguate_hook_by_callee(
+                hook, exe, exe_sections, addresslib, *old_ctx, matches)
+            if status == "resolved":
+                new_off = payload
+                via = " (callee-verified)"
+            elif status == "unfixable":
+                callee = (" callee " + ",".join(str(i) for i in payload)
+                          if payload else "")
+                actions.append(
+                    f"  hook REL::ID {rel_id}: offset 0x{old_off:x} stale; "
+                    f"UNFIXABLE (no candidate calls the original{callee}) - "
+                    f"author update needed"
+                )
+                continue
+        if new_off is None:
+            if len(matches) > 1:
+                cand = ", ".join(f"0x{m:x}" for m in matches)
+                actions.append(
+                    f"  hook REL::ID {rel_id}: offset 0x{old_off:x} stale; "
+                    f"AMBIGUOUS ({len(matches)} candidates: {cand}) - manual review required"
+                )
+                continue
+            new_off = matches[0]
         if dry_run:
-            actions.append(f"  hook REL::ID {rel_id}: offset 0x{old_off:x} -> 0x{new_off:x} (needs patch)")
+            actions.append(f"  hook REL::ID {rel_id}: offset 0x{old_off:x} -> 0x{new_off:x}{via} (needs patch)")
         else:
             if patch_hook_offset(dll_path, hook, new_off):
-                actions.append(f"  hook REL::ID {rel_id}: offset 0x{old_off:x} -> 0x{new_off:x} (patched)")
+                actions.append(f"  hook REL::ID {rel_id}: offset 0x{old_off:x} -> 0x{new_off:x}{via} (patched)")
             else:
                 actions.append(f"  hook REL::ID {rel_id}: offset patch FAILED")
     return actions
@@ -1558,11 +1729,17 @@ def main():
                         help="Mint entries for old IDs missing from the new lib, "
                              "using --old-exe bytes as ground truth")
     parser.add_argument("--old-exe", type=Path, default=None,
-                        help="Old game exe matching --old-lib (for --mint-missing)")
+                        help="Old game exe matching --old-lib (for --mint-missing; "
+                             "also unlocks callee-identity hook relocation in --fix/--scan)")
     parser.add_argument("--old-lib", type=Path, default=None,
-                        help="Old versionlib bin (for --mint-missing)")
+                        help="Old versionlib bin (for --mint-missing; "
+                             "also unlocks callee-identity hook relocation in --fix/--scan)")
     parser.add_argument("--find-gates", action="store_true",
                         help="Report game-version gate patterns (read-only, no changes)")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Explain last launch's startup errors from the shim + SKSE logs")
+    parser.add_argument("--apply", action="store_true",
+                        help="With --diagnose: append suggested IDs to quarantine.ini")
     args = parser.parse_args()
 
     # -- Mint-missing mode: old-exe ground truth for dropped IDs
@@ -1633,6 +1810,15 @@ def main():
                     print(f"    ... and {len(gates) - 12} more")
         return
 
+    # -- Diagnose mode: post-launch forensics over the shim + SKSE logs
+    if args.diagnose:
+        if args.plugins_dir is None or not args.plugins_dir.exists():
+            parser.error("--plugins-dir is required for --diagnose")
+        diagnose_run(args.plugins_dir, apply=args.apply)
+        return
+    if args.apply:
+        parser.error("--apply needs --diagnose")
+
     # -- Build translations mode
     if args.build_translations:
 
@@ -1665,25 +1851,36 @@ def main():
     exe_sections = None
     addresslib = None
     runtime_version = None
+    old_ctx = None
     if args.game:
         runtime_version = runtime_version_from_exe(args.game) \
             if args.game.exists() else None
-    if args.fix and (args.game or args.dll):
+    if (args.fix or args.scan) and (args.game or args.dll or args.addresslib):
         game_path = args.game
-        if game_path is None:
+        if args.fix and game_path is None:
             parser.error("--game is required for --fix")
-        runtime_version = runtime_version_from_exe(game_path) if game_path.exists() else None
+        if game_path is not None:
+            runtime_version = runtime_version_from_exe(game_path) if game_path.exists() else None
+            if game_path.exists():
+                exe, exe_sections = load_exe_sections(game_path)
+            elif args.fix:
+                print(f"ERROR: game exe not found: {game_path}")
         al_path = args.addresslib
-        if al_path is None:
+        if args.fix and al_path is None:
             parser.error("--addresslib is required for --fix")
-        if game_path.exists():
-            exe, exe_sections = load_exe_sections(game_path)
-        else:
-            print(f"ERROR: game exe not found: {game_path}")
-        if al_path.exists():
-            addresslib = parse_addresslib(al_path)
-        else:
-            print(f"ERROR: address library not found: {al_path}")
+        if al_path is not None:
+            if al_path.exists():
+                addresslib = parse_library_any(str(al_path))
+                if addresslib is None and args.fix:
+                    print(f"ERROR: address library not parseable: {al_path}")
+            elif args.fix:
+                print(f"ERROR: address library not found: {al_path}")
+        if args.old_exe is not None and args.old_lib is not None \
+                and args.old_exe.exists() and args.old_lib.exists():
+            old_lib = parse_library_any(str(args.old_lib))
+            if old_lib is not None:
+                old_exe_data, old_secs = load_exe_sections(str(args.old_exe))
+                old_ctx = (old_exe_data, old_secs, old_lib)
 
     dry_run = not args.fix
 
@@ -1710,9 +1907,23 @@ def main():
             lib = parse_library_any(str(args.addresslib))
             if lib:
                 id_set = set(lib)
+        ever_set = set()
+        ever_dir = None
+        if args.plugins_dir is not None and args.plugins_dir.exists():
+            ever_dir = args.plugins_dir
+        elif args.dll is not None:
+            ever_dir = args.dll.parent
+        if ever_dir is not None:
+            for bin_path in sorted(ever_dir.glob("version*.bin")):
+                try:
+                    old_lib = parse_library_any(str(bin_path))
+                except Exception:
+                    continue
+                if old_lib:
+                    ever_set.update(old_lib)
         counts = {"SAFE": 0, "NEEDS_FIX": 0, "BROKEN": 0, "UNKNOWN": 0}
         for dll in dlls:
-            result = _audit_plugin(dll, runtime_version, id_set)
+            result = _audit_plugin(dll, runtime_version, id_set, ever_set)
             v = result["verdict"]
             counts[v] = counts.get(v, 0) + 1
             tag = {"SAFE": "[OK]", "NEEDS_FIX": "[FIX]", "BROKEN": "[!!]", "UNKNOWN": "[??]"}[v]
@@ -1752,11 +1963,13 @@ def main():
 
         if args.fix:
             for action in fix_plugin(dll, exe, exe_sections, addresslib,
-                                     runtime_version=runtime_version, dry_run=False):
+                                      runtime_version=runtime_version, dry_run=False,
+                                      old_ctx=old_ctx):
                 print(action)
         elif exe is not None and addresslib is not None:
             for action in fix_plugin(dll, exe, exe_sections, addresslib,
-                                     runtime_version=runtime_version, dry_run=True):
+                                      runtime_version=runtime_version, dry_run=True,
+                                      old_ctx=old_ctx):
                 print(action)
 
     if dry_run:

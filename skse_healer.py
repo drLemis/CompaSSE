@@ -112,6 +112,15 @@ def load_current_lib(plugins_dir, game_version=None):
     so prefer the filename-version match and only fall back to first found.
     """
     found = []
+    if game_version:
+        match = _core.find_versionlib(plugins_dir, game_version)
+        if match is not None:
+            with open(match, "rb") as f:
+                data = f.read()
+            if len(data) >= 4 and struct.unpack_from("<I", data, 0)[0] == 5:
+                lib = parse_format5(data)
+                if lib:
+                    return lib
     for p in sorted(plugins_dir.glob("versionlib-*.bin")):
         with open(p, "rb") as f:
             data = f.read()
@@ -152,6 +161,29 @@ def find_byte_sequence(exe_data, seq, start=0, end=None):
     return results
 
 
+def resolve_ambiguous_hook(id_val, scan_offset, candidates, pattern_blob,
+                           exe_data, exe_sections, current_lib,
+                           old_exe_data, old_secs, old_lib):
+    """Callee-identity verdict for one ambiguous hook: winning offset or None.
+
+    Pure; no I/O, no patching. candidates may be plain offsets or
+    (offset, target) tuples. Needs the old lib; without it there is
+    nothing to anchor the callee to.
+    """
+    if not candidates or old_lib is None or old_exe_data is None:
+        return None
+    offs = [c[0] if isinstance(c, tuple) else c for c in candidates]
+    if isinstance(pattern_blob, dict):
+        pat = dict(pattern_blob)
+    else:
+        pat = {i: b for i, b in enumerate(bytes(pattern_blob or b""))}
+    hook = {"rel_id": id_val, "offset": scan_offset, "pattern": pat}
+    status, payload = _core.disambiguate_hook_by_callee(
+        hook, exe_data, exe_sections, current_lib,
+        old_exe_data, old_secs, old_lib, offs)
+    return payload if status == "resolved" else None
+
+
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
@@ -164,8 +196,16 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
 
     old_exe_data = None
     old_exe_sections = None
+    old_lib = None
     if old_exe_path:
         old_exe_data, old_exe_sections = load_game_sections(old_exe_path)
+        try:
+            old_ver = _exe_version_tuple(old_exe_path)
+            match = _core.find_versionlib(plugins_dir, old_ver) if old_ver else None
+            if match is not None:
+                old_lib = _core.parse_library_any(str(match))
+        except Exception:
+            old_lib = None
 
     findings = []
     seen_offsets = set()
@@ -220,6 +260,24 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                         cands = sorted({m - func_off for m in actual_addrs
                                         if 0 < m - func_off < 0x20000})
                         if cands:
+                            winner = resolve_ambiguous_hook(
+                                id_val, scan_offset, cands, pattern,
+                                exe_data, exe_sections, current_lib,
+                                old_exe_data, old_exe_sections, old_lib)
+                            if winner is not None:
+                                findings.append({
+                                    "dll_path": dll_path,
+                                    "code_offset": code_off,
+                                    "id_val": id_val,
+                                    "func_rva": func_rva,
+                                    "old_offset": scan_offset,
+                                    "new_offset": winner,
+                                    "pattern": pattern,
+                                    "expected_addr": test_addr,
+                                    "actual_addr": func_off + winner,
+                                    "auto_fixable": True,
+                                })
+                                continue
                             closest = min(cands, key=lambda c: abs(c - scan_offset))
                             findings.append({
                                 "dll_path": dll_path,
@@ -261,6 +319,24 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                                         })
                                     elif uniq:
                                         cands = sorted(set(uniq))
+                                        winner = resolve_ambiguous_hook(
+                                            id_val, scan_offset, cands, old_pattern,
+                                            exe_data, exe_sections, current_lib,
+                                            old_exe_data, old_exe_sections, old_lib)
+                                        if winner is not None:
+                                            findings.append({
+                                                "dll_path": dll_path,
+                                                "code_offset": code_off,
+                                                "id_val": id_val,
+                                                "func_rva": func_rva,
+                                                "old_offset": scan_offset,
+                                                "new_offset": winner,
+                                                "pattern": old_pattern,
+                                                "expected_addr": test_addr,
+                                                "actual_addr": func_off + winner,
+                                                "auto_fixable": True,
+                                            })
+                                            continue
                                         closest = min(cands, key=lambda c: abs(c - scan_offset))
                                         findings.append({
                                             "dll_path": dll_path,
@@ -325,7 +401,106 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                                 "closest_candidate": closest[0],
                                 "auto_fixable": False,
                             })
+    try:
+        lea_findings, _, _, _ = find_lea_hooks(
+            dll_path, exe_path, plugins_dir, old_exe_path)
+        findings.extend(lea_findings)
+    except Exception:
+        pass
     return findings, dll_data, dll_sections, code
+
+
+def find_lea_hooks(dll_path, exe_path, plugins_dir, old_exe_path=None):
+    """compasse-core-shaped hooks (REL::ID + lea disp32) as healer findings.
+
+    Same finding dicts as analyze_plugin (plus "kind": "lea" and the raw
+    "hook" for patching), so cards, CLI print and heal flows work unchanged.
+    Ambiguous hooks resolve through callee identity when old-exe ground
+    truth exists; otherwise they stay manual with candidates.
+    Returns (findings, dll_data, dll_sections, code).
+    """
+    dll_data, dll_sections, _code = load_code(dll_path)
+    exe_data, exe_sections = load_game_sections(exe_path)
+    current_lib = load_current_lib(plugins_dir, _exe_version_tuple(exe_path))
+    old_exe_data = None
+    old_secs = None
+    old_lib = None
+    if old_exe_path:
+        old_exe_data, old_secs = load_game_sections(old_exe_path)
+        try:
+            old_ver = _exe_version_tuple(old_exe_path)
+            match = _core.find_versionlib(plugins_dir, old_ver) if old_ver else None
+            if match is not None:
+                old_lib = _core.parse_library_any(str(match))
+        except Exception:
+            old_lib = None
+    text_va = None
+    for name, va, _vsize, _raw, _rawsize in dll_sections:
+        if name == ".text":
+            text_va = va
+            break
+
+    def emit(dll_path, code_off, rel_id, base, old_off, new_off, base_foff,
+             hook, auto, cands=None, closest=None):
+        pat_at = new_off if new_off is not None else old_off
+        finding = {
+            "dll_path": dll_path,
+            "code_offset": code_off,
+            "id_val": rel_id,
+            "func_rva": base,
+            "old_offset": old_off,
+            "new_offset": new_off,
+            "pattern": extract_bytes_at(exe_data, base_foff + pat_at, 16) or b"",
+            "expected_addr": base_foff + old_off,
+            "actual_addr": (base_foff + new_off
+                            if new_off is not None else None),
+            "auto_fixable": auto,
+            "kind": "lea",
+            "hook": hook,
+        }
+        if not auto:
+            finding["candidates"] = [(c, None) for c in (cands or [])]
+            finding["closest_candidate"] = closest
+        return finding
+
+    findings = []
+    if current_lib is None or text_va is None:
+        return findings, dll_data, dll_sections, _code
+    for hook in _core.find_hooks(dll_path):
+        rel_id, old_off = hook["rel_id"], hook["offset"]
+        if rel_id not in current_lib:
+            continue
+        base = current_lib[rel_id]
+        base_foff = rva_to_offset(base, exe_sections)
+        if base_foff is None:
+            continue
+        if _core.pattern_matches_at(exe_data, exe_sections, base, old_off,
+                                    hook["pattern"]):
+            continue
+        matches = _core.find_pattern_offsets(exe_data, exe_sections, base,
+                                             hook["pattern"], old_off)
+        code_off = hook["va"] - text_va
+        if len(matches) == 1:
+            findings.append(emit(
+                dll_path, code_off, rel_id, base, old_off, matches[0],
+                base_foff, hook, True))
+        else:
+            winner = (resolve_ambiguous_hook(
+                rel_id, old_off, matches, hook["pattern"],
+                exe_data, exe_sections, current_lib,
+                old_exe_data, old_secs, old_lib)
+                if (matches and old_exe_data is not None) else None)
+            if winner is not None:
+                findings.append(emit(
+                    dll_path, code_off, rel_id, base, old_off, winner,
+                    base_foff, hook, True))
+            else:
+                cands = sorted(matches)
+                findings.append(emit(
+                    dll_path, code_off, rel_id, base, old_off, None,
+                    base_foff, hook, False, cands,
+                    min(cands, key=lambda c: abs(c - old_off)) if cands else None))
+    return findings, dll_data, dll_sections, _code
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +509,8 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
 def heal_plugin(dll_path, finding, backup=True):
     """Patch the plugin DLL with the corrected offset."""
     new_offset = finding["new_offset"]
+    if finding.get("kind") == "lea" and "hook" in finding:
+        return _core.patch_hook_offset(dll_path, finding["hook"], new_offset)
     code_off = finding["code_offset"]
     dll_data, dll_sections, _ = load_code(dll_path)
     text_section = None

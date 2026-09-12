@@ -95,7 +95,6 @@ def classify(info, build_year, runtime_version=None):
     """
     flag = info.get("flag")
     vi = info.get("version_indep")
-    hooks = info.get("hooks", [])
     rv = (vi or {}).get("runtime_ver")
     version = core._packed_to_ver(rv) if rv else None
     compat = (vi or {}).get("compat") or []
@@ -154,14 +153,6 @@ def classify(info, build_year, runtime_version=None):
                                "knows the plugin is version-independent.",
                 "kind": "addrlib",
             })
-    if hooks:
-        items.append({
-            "label": f"Hook offsets ({len(hooks)})",
-            "description": "Re-resolves the code hooks against the installed "
-                           "Address Library for this game version.",
-            "kind": "hooks",
-        })
-
     # Build year undetermined: fall back to flag analysis
     if build_year is None:
         if flag_patch or indep_patch:
@@ -195,8 +186,6 @@ def classify(info, build_year, runtime_version=None):
             if crossed:
                 parts.append(cross_note.strip())
             fix_desc = "Patch the flags so SKSE accepts it."
-            if hooks:
-                fix_desc += f"  Also re-resolve {len(hooks)} hook offset(s)."
             return _base("NEEDS_FIX", "NEEDS FIX", "NEEDS_FIX",
                          "  ".join(parts), fix_desc, True, True, items)
 
@@ -328,7 +317,6 @@ class PluginCard(tk.Frame):
         self.on_fix_one = on_fix_one
         self.force_fix = force_fix
         self.fixed = False
-        self.hooks_scanned = bool(info.get("hooks_scanned", False))
         self.fix_buttons = []
 
         colors = BADGE_COLORS[verdict["key"]]
@@ -372,6 +360,15 @@ class PluginCard(tk.Frame):
             tk.Label(body, text=why,
                      font=(FONT_FAMILY, 9),
                      fg=TEXT_SECONDARY, bg=CARD_BG,
+                     anchor="w", wraplength=380).pack(fill="x", pady=(0, 2))
+
+        # Stale-hook pointer: Therapist never patches hooks, so this line
+        # sends the user to the Healer tab. Bright red so it isn't missed.
+        hook_note = verdict.get("hook_note", "")
+        if hook_note:
+            tk.Label(body, text=hook_note,
+                     font=(FONT_FAMILY, 9, "bold"),
+                     fg="#dc2626", bg=CARD_BG,
                      anchor="w", wraplength=380).pack(fill="x", pady=(0, 2))
 
         # PRO mode: expose all raw details
@@ -1371,6 +1368,28 @@ class SurgeonTab:
         return self.parent.winfo_toplevel()
 
 
+def count_stale_hooks(hooks, exe_data, exe_sections, addresslib):
+    """How many detected hooks no longer match at their recorded offset.
+
+    Triage only (this tab fixes flags): stale hooks are reported with a
+    pointer to the Healer tab, never patched here. Unknown IDs are
+    skipped - neither tab can fix those.
+    """
+    stale = 0
+    for hook in hooks or []:
+        try:
+            base = (addresslib or {}).get(hook.get("rel_id"))
+            if base is None:
+                continue
+            if not core.pattern_matches_at(
+                    exe_data, exe_sections, base,
+                    hook.get("offset"), hook.get("pattern")):
+                stale += 1
+        except Exception:
+            continue
+    return stale
+
+
 class AutoPorterGUI:
     def __init__(self, root):
         self.root = root
@@ -1390,11 +1409,6 @@ class AutoPorterGUI:
         self.busy = False
         self.cards: list[PluginCard] = []
 
-        # Cached exe/addresslib (loaded lazily for fix operations)
-        self._exe = None
-        self._exe_sections = None
-        self._addresslib = None
-
         self._build()
 
     # ──────────────────────────────────────────────────────────────
@@ -1406,9 +1420,9 @@ class AutoPorterGUI:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=6, pady=(6, 0))
 
-        # Tab 1: Address Library (existing functionality)
+        # Tab 1: Therapist (flags and versions)
         self.tab_main = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.tab_main, text="  Address Library  ")
+        self.notebook.add(self.tab_main, text="  Therapist  ")
 
         # Tab 2: Healer
         self.tab_healer = tk.Frame(self.notebook, bg=BG)
@@ -1557,23 +1571,38 @@ class AutoPorterGUI:
 
     def _do_scan(self, plugins):
         self.root.after(0, self._clear_cards)
-        self._exe = None
-        self._exe_sections = None
-        self._addresslib = None
         runtime_version = (core.runtime_version_from_exe(self.game_exe)
                            if self.game_exe else None)
+        exe_data = exe_secs = addr_lib = None
+        if self.game_exe is not None:
+            try:
+                exe_data, exe_secs = core.load_exe_sections(str(self.game_exe))
+                game_ver = core.unpack_version(
+                    core.runtime_version_from_exe(self.game_exe))
+                match = core.find_versionlib(plugins, game_ver) if game_ver else None
+                if match is not None:
+                    addr_lib = core.parse_library_any(str(match))
+            except Exception:
+                exe_data = exe_secs = addr_lib = None
 
         dlls = sorted(plugins.glob("*.dll"))
         counts = {}
         self._scan_data = []
         for dll in dlls:
             try:
-                info = core.analyze_plugin(dll, runtime_version, include_hooks=False)
+                info = core.analyze_plugin(dll, runtime_version, include_hooks=True)
             except OSError:
                 continue
             build_year = _get_build_year(dll)
             build_date = _get_build_date_str(dll)
             v = classify(info, build_year, runtime_version)
+            v["build_date"] = build_date
+            if exe_data is not None and addr_lib is not None:
+                stale = count_stale_hooks(info.get("hooks"), exe_data,
+                                          exe_secs, addr_lib)
+                if stale:
+                    v["hook_note"] = (f"{stale} stale hook offset(s) - go to the "
+                                      "Healer tab to fix (or CLI --fix with old game files).")
             v["build_date"] = build_date
             self._scan_data.append((dll, info, v))
             counts[v["cat"]] = counts.get(v["cat"], 0) + 1
@@ -1648,26 +1677,18 @@ class AutoPorterGUI:
         self._run(lambda: self._fix_single_worker(card, kind))
 
     def _fix_single_worker(self, card, kind):
-        self._load_game_data()
         self._apply_fix(card, kind)
 
     # ──────────────────────────────────────────────────────────────
     # Fix engine helpers
     # ──────────────────────────────────────────────────────────────
 
-    def _load_game_data(self):
-        """Lazily load exe sections and address library for Layer 3 fixes."""
-        if self._exe is not None and self._addresslib is not None:
-            return
-        if self.game_exe and self._exe is None:
-            self._exe, self._exe_sections = core.load_exe_sections(
-                str(self.game_exe))
-        al_path = self._resolve_al()
-        if al_path and al_path.exists() and self._addresslib is None:
-            self._addresslib = core.parse_addresslib(str(al_path))
-
     def _apply_fix(self, card, kind="all"):
-        """Run the requested fix kind for one card; post result to UI thread."""
+        """Run the requested fix kind for one card; post result to UI thread.
+
+        This tab covers flags and versions only. Hook offsets live in the
+        Healer tab, which owns the old-exe ground truth they need.
+        """
         try:
             force = getattr(card, "force_fix", False)
             changed = []
@@ -1685,33 +1706,6 @@ class AutoPorterGUI:
                     ok = core.patch_version_independence(card.dll_path)
                 if ok:
                     changed.append("address lib flags")
-            if kind in ("all", "hooks") or not getattr(card, "hooks_scanned", True):
-                self._load_game_data()
-                if self._exe is not None and self._addresslib is not None:
-                    rv = (core.runtime_version_from_exe(self.game_exe)
-                          if self.game_exe else None)
-                    info = core.analyze_plugin(card.dll_path, rv)
-                    n = 0
-                    for hook in info.get("hooks", []):
-                        rel_id = hook.get("rel_id")
-                        if rel_id not in self._addresslib:
-                            continue
-                        base = self._addresslib[rel_id]
-                        old_off = hook.get("offset")
-                        if core.pattern_matches_at(
-                                self._exe, self._exe_sections, base, old_off, hook.get("pattern")):
-                            continue
-                        matches = core.find_pattern_offsets(
-                            self._exe, self._exe_sections, base,
-                            hook.get("pattern"), old_off)
-                        if len(matches) == 1:
-                            core.patch_hook_offset(card.dll_path, hook, matches[0])
-                            n += 1
-                    if n:
-                        changed.append(f"hooks patched ({n})")
-                else:
-                    changed.append("hooks skipped (no address library)")
-                card.hooks_scanned = True
             if changed:
                 msg = "; ".join(changed)
                 self.root.after(0, lambda: card.mark_fixed(True, msg))
@@ -1727,31 +1721,6 @@ class AutoPorterGUI:
     def clear(self):
         self._clear_cards()
         self.status.config(text="Ready")
-
-    # ──────────────────────────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────────────────────────
-
-    def _resolve_al(self):
-        """Return the versionlib matching the game exe, else first found.
-
-        A stale-version lib maps IDs to wrong RVAs, poisoning every hook
-        fix - same rule as the healer's loader.
-        """
-        plugins = self._plugins()
-        if not plugins or not plugins.exists():
-            return None
-        bins = sorted(plugins.glob("versionlib-*.bin"))
-        if not bins:
-            return None
-        if self.game_exe:
-            game_ver = core.unpack_version(core.runtime_version_from_exe(self.game_exe))
-            if game_ver:
-                for b in bins:
-                    if core.extract_version_from_filename(b.name) == game_ver:
-                        return b
-        return bins[0]
-
 
 # ===================================================================
 # Entry point

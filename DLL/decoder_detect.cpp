@@ -65,8 +65,10 @@ DecoderType detect_decoder(HMODULE mod) {
 }
 
 HMODULE resolve_caller_module(HMODULE self_module) {
-    void* frames[8] = {};
-    USHORT n = RtlCaptureStackBackTrace(1, 8, frames, nullptr);
+    // 32 frames: CRT ifstream opens bury the plugin frame deep behind
+    // system DLLs; 8 routinely missed it and misclassified healthy mods.
+    void* frames[32] = {};
+    USHORT n = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
     for (USHORT i = 0; i < n; ++i) {
         HMODULE mod = nullptr;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |

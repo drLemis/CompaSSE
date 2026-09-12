@@ -236,6 +236,42 @@ static wchar_t g_tempPath1[MAX_PATH];
 static wchar_t g_tempPath0[MAX_PATH];
 static wchar_t g_currentVersion[32]; // e.g. "1-7-104" extracted from versionlib filename
 
+#pragma comment(lib, "version.lib")
+
+// Current game version from the host exe, for telling current-version
+// requests (transcode + translate) apart from old-version ones (pass
+// through untouched). Empty when undeterminable: then all files count
+// as current. Lazy (InitOnce): never runs under the loader lock.
+static INIT_ONCE g_verOnce = INIT_ONCE_STATIC_INIT;
+static wchar_t g_exeVersion[32] = {}; // e.g. L"1-7-104" (major-minor-build)
+
+static BOOL CALLBACK init_exe_version(PINIT_ONCE, PVOID, PVOID*) {
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return TRUE;
+    DWORD ignored = 0;
+    DWORD sz = GetFileVersionInfoSizeW(exe, &ignored);
+    if (!sz) return TRUE;
+    std::vector<uint8_t> buf(sz);
+    if (!GetFileVersionInfoW(exe, 0, sz, buf.data())) return TRUE;
+    VS_FIXEDFILEINFO* ffi = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(buf.data(), L"\\", (void**)&ffi, &len) || !ffi || len == 0)
+        return TRUE;
+    swprintf_s(g_exeVersion, L"%u-%u-%u",
+               (ffi->dwFileVersionMS >> 16) & 0xFFFF,
+               ffi->dwFileVersionMS & 0xFFFF,
+               (ffi->dwFileVersionLS >> 16) & 0xFFFF);
+    shim_log("exe version: %ls (%ls)", g_exeVersion, exe);
+    return TRUE;
+}
+
+// True when `path` names a bin for an older game than the running one.
+static bool is_old_version_path(const wchar_t* path) {
+    InitOnceExecuteOnce(&g_verOnce, init_exe_version, nullptr, nullptr);
+    return g_exeVersion[0] && !wcsstr(path, g_exeVersion);
+}
+
+
 // ---- Translation table (cross-version ID remapping) ----
 struct TranslationEntry { uint64_t old_id; uint32_t offset; };
 static std::vector<TranslationEntry> g_flatTranslations; // flattened: all versions combined
@@ -355,6 +391,13 @@ static bool is_versionlib_handle(HANDLE h) {
     DWORD n = GetFinalPathNameByHandleW(h, buf, MAX_PATH, 0);
     if (n == 0 || n >= MAX_PATH) return false;
     return is_versionlib_path(buf);
+}
+
+// Same check, but also hands back the file path for version comparison.
+static bool versionlib_handle_path(HANDLE h, wchar_t* out) {
+    DWORD n = GetFinalPathNameByHandleW(h, out, MAX_PATH, 0);
+    if (n == 0 || n >= MAX_PATH) return false;
+    return is_versionlib_path(out);
 }
 
 // Read the real bin and build all three in-memory buffers (fmt1/fmt2/fmt5),
@@ -497,14 +540,26 @@ static void ensure_buffers(const wchar_t* binPath) {
             }
         }
     } else if (srcFmt == 1 || srcFmt == 2) {
-        // Source is format 1/2: keep as fmt2, transcode up to fmt5 and down to fmt1.
+        // Source is format 1/2: build canonical fmt2 (never serve a fmt1 blob
+        // mislabeled as fmt2 - V2 readers check format==2 strictly), then
+        // transcode up to fmt5 and down to fmt1.
         if (!parse_format2(src.data(), src.size(), entries, version, name, ptr_size)) {
             g_loadFailed = true;
             g_loading = false;
             shim_log("ensure_buffers: format2 parse failed (size=%zu, path=%ls)", src.size(), binPath);
             return;
         }
+        if (srcFmt == 2) {
         g_fmt2 = src;
+        } else {
+            // parse_format2 already sorts entries; encode canonical fmt2.
+            if (!encode_format2(g_fmt2, version, name, ptr_size, entries)) {
+                g_loadFailed = true;
+                g_loading = false;
+                shim_log("ensure_buffers: encode canonical fmt2 failed");
+                return;
+            }
+        }
         uint32_t count = 0;
         if (!format2_to_format5(src.data(), src.size(), g_fmt5, count)) {
             g_loadFailed = true;
@@ -593,36 +648,26 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
         }
     }
 
-    // Format selection:
-    // - version- prefix (ANY caller): the real version-*.bin file IS format 1. Pass through.
-    //   Both old CommonLibSSE (AIAgent) and mid-version CommonLibSSE (PrismaUI) need fmt1.
-    // - versionlib- prefix (ConsoleUtilSSE etc.): decoder-based (V2→2, V5→5)
-    DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
-    int format;
-    if (hasVersionPrefix) {
-        format = 1;  // version- prefix: real file is fmt1, pass through directly
-    } else if (type == DECODER_V2) format = 2;
-    else if (type == DECODER_V5) format = 5;
-    else format = 2;  // unknown caller: default to fmt2 (most CommonLibSSE mods)
-
-    // Version- prefix: serve merged fmt1 for current runtime, pass through for old.
-    // Versionlib- prefix: serve format matching the caller's decoder type.
-    if (hasVersionPrefix) {
-        bool isCurrentRuntime = g_currentVersion[0] && wcsstr(path, g_currentVersion);
-        if (isCurrentRuntime) {
-            format = 1;  // Serve merged fmt1 for current runtime
-            g_serving_alt = true;
-        } else {
-            return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
-        }
-    } else if (format == 5) {
+    if (is_old_version_path(path)) {
+        shim_log("serve %ls -> pass-through old-version file for %ls", path,
+                 modName[0] ? modName : L"(unknown)");
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     }
 
-    // All formats get a transcoded temp file (source may be fmt2 or fmt5).
+    // Pass through by default, transcode only on format mismatch
+    DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
+    int format;
+    if (hasVersionPrefix) {
+        shim_log("serve %ls -> pass-through version- file for %ls (decoder=%d)",
+                 path, modName[0] ? modName : L"(unknown)", (int)type);
+            return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
+    } else if (type == DECODER_V1) format = 1;
+    else format = 2;
+
+    // Transcode the requested file itself to the caller's format; only
+    // fmt1/fmt2 temps are ever served (nothing routes to fmt5).
     AcquireSRWLockExclusive(&g_lock);
     ensure_buffers(path);
-    g_serving_alt = false;  // Reset reentrancy guard (was set for current-runtime version- bin)
     if (g_loadFailed) {
         ReleaseSRWLockExclusive(&g_lock);
         shim_log("serve: load failed, serving real file");
@@ -637,7 +682,8 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
     const wchar_t* tempPath = tempFmt == 5 ? g_tempPath5 : tempFmt == 1 ? g_tempPath1 : tempFmt == 0 ? g_tempPath0 : g_tempPath2;
     ReleaseSRWLockExclusive(&g_lock);
 
-    shim_log("serve %ls -> format %d (transcoded) for %ls", path, tempFmt, modName);
+    shim_log("serve %ls -> format %d (transcoded, decoder=%d) for %ls", path, tempFmt,
+             (int)type, modName[0] ? modName : L"(unknown)");
 
     return fpCreateFileW(tempPath, access, share, sa, disp, flags, tmpl);
 }
@@ -698,16 +744,17 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
 
     int format;
     if (hasVersionPrefix) {
-        format = 1;  // version- prefix: real file is fmt1, pass through
-    } else if (type == DECODER_V2) format = 2;
-    else if (type == DECODER_V5) format = 5;
-    else format = 2;  // unknown caller: default to fmt2 (most CommonLibSSE mods)
+        return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+    }
+    {
+        wchar_t fpath[MAX_PATH];
+        if (versionlib_handle_path(hFile, fpath) && is_old_version_path(fpath))
+            return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+    }
+    format = (caller && type == DECODER_V1) ? 1 : 2;
 
         wchar_t modName[MAX_PATH] = L"(unknown)";
         if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
-
-        if (format == 1 || (format == 2 && g_srcFmt == 2))
-            return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
 
         AcquireSRWLockExclusive(&g_lock);
         bool ok = g_loaded && ensure_temp_file(format);

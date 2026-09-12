@@ -263,10 +263,15 @@ import table. This happens in `decoder_detect.cpp`.
 
 | Imports                                  | Detected as  | Format served  |
 |------------------------------------------|--------------|----------------|
-| `CreateFileMapping*` + `istream` symbols | `DECODER_V5` | Format 5       |
+| `CreateFileMapping*` + `istream` symbols | `DECODER_V5` | Format 2 *     |
 | `CreateFileMapping*` only (no istream)   | `DECODER_V2` | Format 2       |
-| `istream` symbols only (no mmap)         | `DECODER_V1` | Format 2       |
-| Neither                                  | `DECODER_V2` | Format 2 (def) |
+| `istream` symbols only (no mmap)         | `DECODER_V1` | Format 1       |
+| Neither / caller unresolvable            | —            | Format 2 *     |
+
+\* `DECODER_V5` does not route to passthrough: the heuristic misfires on
+CommonLibSSE-NG <= 3.7 (cache-mmap false positives), so the whole
+ambiguous bucket gets the faithful fmt2 temp instead. There is no
+per-mod allowlist - filenames are not capabilities.
 
 **Why this works:** CommonLibSSE's address library reader evolved alongside
 its I/O strategy:
@@ -276,8 +281,8 @@ its I/O strategy:
 - po3_PapyrusExtender: memory-maps without istream -> format 2
 
 The import table captures this evolution because the I/O method is baked in
-at compile time. Note: even DECODER_V1 callers get served format 2 because
-format 2 is a superset that all CommonLibSSE versions can parse.
+at compile time. V1 readers check `format == 1` strictly, so they get
+format 1 temps - serving them format 2 would fail their version check.
 
 ### Caller resolution
 
@@ -286,8 +291,14 @@ stack from inside the hook, skipping the shim's own frames and system DLLs
 (ntdll, kernel32, msvcrt, etc.), to find the plugin module that triggered
 the hook.
 
-When the stack walk fails (returns null), the shim defaults to format 2 -
-the most broadly compatible format.
+When the stack walk fails (returns null), the caller joins the ambiguous
+bucket and gets the faithful fmt2 temp - the format every pre-2026 reader
+parses. (An earlier revision passed unknown callers through; that stranded
+fmt2-only mods on the real fmt5 file. Conversely, an even earlier revision
+served fmt2 temps that dropped zero offsets, stranding a healthy mod on a
+missing ID. Both lessons are encoded in the serve logic.) The walk captures
+32 frames: CRT `ifstream` opens bury the plugin frame deep behind system
+DLLs and 8 frames routinely missed them.
 
 ### Caching
 
@@ -316,13 +327,17 @@ unmodified. SKSE itself needs the actual address library.
 **`versionlib-` prefix (most plugins):**
 - `DECODER_V5` -> pass-through (real fmt5 file)
 - `DECODER_V2` -> format 2 (transcoded temp file)
-- `DECODER_V1` or `DECODER_NONE` -> format 2 (default, most compatible)
+- `DECODER_V1` -> format 1 (transcoded temp file; V1 readers check
+  `format == 1` strictly, so fmt2 is rejected - never serve fmt2 to V1)
+- `DECODER_NONE` (unknown caller) -> format 2 (default, most compatible)
 
 **`version-` prefix (old SE plugins):**
-- If the path matches the **current runtime** version (e.g. contains
-  "1-7-104"): serve transcoded format 1 from the temp file
-- If it's an **old version**: pass through directly (real file is already
-  format 1)
+- ALWAYS pass through the real file. It is already format 1, exactly what
+  old CommonLibSSE readers check for (`format == 1` strictly). Never
+  substitute versionlib-derived data: the two files have different ID
+  coverage, so a merged file drops IDs healthy mods need (observed live:
+  ActorLimitFix "Identifier not found, 41450" when served a
+  versionlib-derived temp instead of its real version- file).
 
 The current runtime is detected by extracting the version string from the
 bin filename and storing it in `g_currentVersion`.
@@ -361,16 +376,20 @@ caller reads the temp file as if it were the real address library.
 ### Format selection summary
 
 ```
-Caller requests versionlib-*.bin
+Caller requests current-version versionlib-*.bin
 +- Caller is SKSE -> pass-through (real file)
-+- Caller is V5 (mmap + istream) -> pass-through (real fmt5 file)
-+- Caller is V2 (default for null caller) -> fmt2 temp file
-+- Caller is V1 (istream only) -> fmt2 temp file
-+- Unknown -> fmt2 temp file
++- Caller is V1 (istream only, old CommonLibSSE) -> fmt1 temp file
++- Anyone else (V2, V5-heuristic, unresolvable) -> faithful fmt2 temp
+   (all IDs incl. zeros + translations).
+```
 
-Caller requests version-*.bin
-+- Current runtime version -> transcoded fmt1 temp file
-+- Old version -> pass-through (real file is already fmt1)
+Caller requests version-*.bin (any version)
++- ALWAYS pass-through (real file is already fmt1)
+
+Caller requests an old-version versionlib-*.bin
++- ALWAYS pass-through (it is another mod's fallback chain; the shim's
+   buffers are built from the current bins, so serving them would
+   substitute wrong-version data)
 ```
 
 ## Translation
@@ -519,9 +538,12 @@ Data/SKSE/Plugins/!CompaSSE.log
 
 ### Caller identification
 Some mods call address library APIs through syscall stubs or deeply inlined
-code, causing `resolve_caller_module()` to return null. In these cases the
-shim defaults to format 2. If a mod needs a different format and can't be
-identified, it will fail.
+code, causing `resolve_caller_module()` to return null. Those callers join
+the ambiguous bucket (faithful fmt2 temp). The residual risk is a
+fmt5-*only* reader that cannot be identified; no such mod has been observed
+(all observed fmt5 readers also parse fmt2). If one ever appears, its
+"Unsupported address library format: 2" dialog together with the serve
+log identifies it in one step.
 
 ### Translation table coverage
 The translation table covers known ID remappings between major game versions.
