@@ -304,6 +304,153 @@ def main():
     t14b.write_bytes(make_pe64([(".text", 0x1000, 0x100, 0x400, 0x100)]))
     check("T14.zero", C.pe_build_dt(t14b) is None, "zero ts")
 
+    # ---------------------------------------------------------------- T17: co-save surgeon
+    import skse_surgeon as S
+
+    def make_cosave(uids):
+        out = bytearray(struct.pack("<5I", 0x45534B53, 1, 0x02030010,
+                                    0x01070680, len(uids)))
+        for uid, chunks in uids:
+            body = bytearray()
+            for t, v, payload in chunks:
+                body += struct.pack("<III", t, v, len(payload)) + payload
+            out += struct.pack("<III", uid, len(chunks), len(body)) + body
+        return bytes(out)
+
+    t17 = tmp / "t17.skse"
+    t17.write_bytes(make_cosave([
+        (0x00000000, [(0x504C474E, 0, b"AB")]),
+        (0x12345678, [(0x52454753, 1, b"CDEF"), (0x52454753, 1, b"")]),
+    ]))
+    h17, b17, trail17 = S.parse_cosave(t17)
+    check("T17.parse", h17["numPlugins"] == 2 and len(b17) == 2
+          and trail17 == 0, repr((h17, len(b17), trail17)))
+    check("T17.fcc", S.fcc(0x504C474E) == "PLGN", S.fcc(0x504C474E))
+    check("T17.uid", S.parse_uid("PLGN") == 0x504C474E, "PLGN")
+    check("T17.uidhex", S.parse_uid("0x12345678") == 0x12345678, "hex")
+    removed17, left17 = S.drop_plugin(t17, 0x12345678)
+    h17b, b17b, trail17b = S.parse_cosave(t17)
+    check("T17.drop", left17 == 1 and len(b17b) == 1
+          and b17b[0]["uid"] == 0 and trail17b == 0
+          and h17b["numPlugins"] == 1, repr((removed17, left17)))
+    try:
+        S.drop_plugin(t17, 0)
+        check("T17.core-refuse", False, "uid 0 dropped!")
+    except ValueError:
+        check("T17.core-refuse", True, "")
+    try:
+        S.drop_plugin(t17, 0xDEADBEEF)
+        check("T17.missing", False, "dropped absent uid!")
+    except ValueError:
+        check("T17.missing", True, "")
+    (tmp / "t17b.skse").write_bytes(b"junk")
+    try:
+        S.parse_cosave(tmp / "t17b.skse")
+        check("T17.junk", False, "parsed junk!")
+    except ValueError:
+        check("T17.junk", True, "")
+
+    # ---------------------------------------------------------------- T17b: uid owners
+    plugdir = tmp / "plugdir"
+    plugdir.mkdir()
+    secs17 = [(".text", 0x1000, 0x100, 0x400, 0x100),
+              (".rdata", 0x2000, 0x100, 0x800, 0x100)]
+    (plugdir / "a.dll").write_bytes(
+        put(make_pe64(secs17), 0x400 + 0x20, struct.pack("<I", 0xA1B2C3D4)))
+    (plugdir / "b.dll").write_bytes(
+        put(make_pe64(secs17), 0x800 + 0x10, struct.pack("<I", 0xA1B2C3D4)))
+    check("T17.owner-text",
+          S.find_uid_owners(0xA1B2C3D4, str(plugdir)) == ["a.dll"],
+          "text only, not rdata")
+    check("T17.owner-zero", S.find_uid_owners(0, str(plugdir)) == [],
+          "uid 0 never scanned")
+    check("T17.owner-missing",
+          S.find_uid_owners(0xDEADBEEF, str(plugdir)) == [], "absent uid")
+    check("T17.owner-nodir",
+          S.find_uid_owners(0xA1B2C3D4, str(tmp / "nodir")) == [], "no dir")
+    stage17 = tmp / "stage17"
+    (stage17 / "Some Mod").mkdir(parents=True)
+    (stage17 / "Some Mod" / "s.dll").write_bytes(
+        put(make_pe64(secs17), 0x400 + 0x08, struct.pack("<I", 0xA1B2C3D4)))
+    loc17 = S.locate_uid(0xA1B2C3D4, str(plugdir), str(stage17))
+    check("T17.locate",
+          loc17["installed"] == ["a.dll"]
+          and len(loc17["staged"]) == 1
+          and loc17["staged"][0].endswith("s.dll"), repr(loc17))
+    loc17b = S.locate_uid(0xDEADBEEF, str(plugdir), str(stage17))
+    check("T17.locate-empty", loc17b == {"installed": [], "staged": []},
+          repr(loc17b))
+    check("T17.describe",
+          S.describe_chunks({"chunks": [{"type": 0x504C474E}, {"type": 0x52454753},
+                                         {"type": 0x504C474E}, {"type": 0xDEADBEEF}]})
+          == "plugin list, event registrations", "known vocab")
+    check("T17.describe-empty",
+          S.describe_chunks({"chunks": [{"type": 0xDEADBEEF}]}) == "", "unknown only")
+
+    # ---------------------------------------------------------------- T17b: PLGN list
+    plgn = struct.pack("<H", 3)
+    plgn += b"\x00" + struct.pack("<H", 10) + b"Skyrim.esm"
+    plgn += b"\x01" + struct.pack("<H", 10) + b"Update.esm"
+    plgn += b"\xFE" + struct.pack("<H", 1) + struct.pack("<H", 9) + b"Light.esl"
+    t17c = tmp / "t17c.skse"
+    t17c.write_bytes(make_cosave([
+        (0x00000000, [(0x504C474E, 0, plgn)]),
+        (0x12345678, [(0x52454753, 1, b"X")]),
+    ]))
+    h17c, b17c, _ = S.parse_cosave(t17c)
+    pl17 = S.plugin_list_chunk(b17c[0], t17c)
+    check("T17.plgn", pl17 == [(0, "Skyrim.esm"), (1, "Update.esm"),
+                               (0xFE001, "Light.esl")], repr(pl17))
+    check("T17.fmtidx", S.fmt_index(1) == "01" and S.fmt_index(0xFE001) == "FE001",
+          "idx fmt")
+    mods17 = tmp / "mods17"
+    (mods17 / "Data").mkdir(parents=True)
+    (mods17 / "Data" / "Skyrim.esm").write_bytes(b"")
+    (mods17 / "Data" / "update.ESM").write_bytes(b"")
+    miss17 = S.missing_mods(pl17, mods17 / "Data")
+    check("T17.missing-mods", miss17 == ["Light.esl"], repr(miss17))
+    check("T17.no-plgn", S.plugin_list_chunk(b17c[1], t17c) is None,
+          "block without PLGN")
+
+    # ---------------------------------------------------------------- T18: save names + ess
+    n18 = S.parse_save_filename(
+        "Quicksave0_E6FDD12E_0_426C6F77732D5468652D486F726E73_"
+        "WhiterunWorld_002311_20260823010902_9_1.skse")
+    check("T18.name", n18 is not None and n18["character"] == "Blows-The-Horns"
+          and n18["location"] == "WhiterunWorld" and n18["level"] == 9
+          and n18["date"] == "2026-08-23 01:09"
+          and n18["label"] == "Quicksave0", repr(n18))
+    check("T18.name-underscored",
+          (S.parse_save_filename("My_cool_save_0_00_4142_Loc_000000_20260101000000_3_7")
+           or {}).get("label") == "My_cool_save", "underscores")
+    check("T18.name-bad", S.parse_save_filename("weirdname.ess") is None
+          and S.parse_save_filename("A_B_C") is None, "rejects junk")
+
+    def wstr(s):
+        b = s.encode("ascii")
+        return struct.pack("<H", len(b)) + b
+
+    rgb18 = bytes(range(32))
+    blob18 = bytearray(b"TESV_SAVEGAME" + struct.pack("<III", 92, 12, 9))
+    blob18 += wstr("Hero") + struct.pack("<I", 5) + wstr("Town")
+    blob18 += wstr("023.11.11") + wstr("NordRace")
+    blob18 += struct.pack("<HffQII", 1, 1.5, 2.5, 0, 4, 2) + rgb18
+    tmp.joinpath("t18.ess").write_bytes(bytes(blob18))
+    e18 = S.read_ess_info(tmp / "t18.ess")
+    conv18 = b"".join(bytes([rgb18[i * 4 + 2], rgb18[i * 4 + 3], rgb18[i * 4]])
+                      for i in range(8))
+    check("T18.ess", e18 is not None and e18["player"] == "Hero"
+          and e18["level"] == 5 and e18["location"] == "Town"
+          and e18["day"] == 23 and e18["time"] == "11:11"
+          and e18["shot"] == (4, 2, conv18), repr(e18))
+    ppm18 = S.ess_thumbnail((4, 2, conv18), maxw=2)
+    check("T18.ppm", ppm18 is not None and ppm18.startswith(b"P6\n2 1\n255\n")
+          and ppm18[11:] == bytes([2, 3, 0, 10, 11, 8]), repr(ppm18[:14]))
+    (tmp / "t18b.ess").write_bytes(b"junk")
+    check("T18.ess-junk", S.read_ess_info(tmp / "t18b.ess") is None, "junk")
+    check("T18.thumb-bad", S.ess_thumbnail(None) is None
+          and S.ess_thumbnail((0, 0, b"")) is None, "bad shots")
+
 
     # ---------------------------------------------------------------- T19: cutoffs
     x19 = C.crossed_cutoffs

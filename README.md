@@ -131,6 +131,7 @@ CompaSSE/
 +- compasse.py              # CLI tool (audit/scan/fix)
 +- compasse_gui.py          # GUI tool (per-mod cards)
 +- skse_healer.py           # Stale-offset detector/healer (also a GUI tab)
++- skse_surgeon.py          # Co-save surgeon: list/drop plugin blocks (also a GUI tab)
 +- test_detect.py           # Synthetic self-check: python test_detect.py
 +- CompaSSE.spec            # PyInstaller spec for GUI exe
 +- build_release.ps1        # Release bundle builder
