@@ -1787,23 +1787,27 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
             "details": details,
         }
 
-    # NEEDS_FIX: needs flags but no address library - risky.
+    # BROKEN: needs flags but hardcoded offsets - patching only converts
+    # SKSE's clean reject into a load-and-crash.
+    if needs_fix and not has_vi:
+        return {
+            "name": dll_path.name,
+            "verdict": "BROKEN",
+            "reason": (f"Built {build_year or '?'}, no Address Library. "
+                       "Likely hardcoded offsets - flag patches would only "
+                       "break it further. Needs author recompile."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # NEEDS_FIX: signature scanner with a stale Ex flag.
     if needs_fix and not has_addr:
-        if has_sigs:
-            return {
-                "name": dll_path.name,
-                "verdict": "NEEDS_FIX",
-                "reason": ("Uses signature scanning (version-independent) "
-                           "but the Address Library V5 flag is stale. "
-                           "Patch only if SKSE rejects it."),
-                "details": {"build_year": build_year, "has_addr": has_addr,
-                            "hooks": len(hooks)},
-            }
         return {
             "name": dll_path.name,
             "verdict": "NEEDS_FIX",
-            "reason": (f"Built {build_year or '?'}, no Address Library. "
-                       "Flag patches applied but hardcoded offsets may still break it."),
+            "reason": ("Uses signature scanning (version-independent) "
+                       "but the Address Library V5 flag is stale. "
+                       "Patch only if SKSE rejects it."),
             "details": {"build_year": build_year, "has_addr": has_addr,
                         "hooks": len(hooks)},
         }
@@ -2050,11 +2054,17 @@ def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dr
     actions = []
     info = analyze_plugin(dll_path, runtime_version)
     run_tup = unpack_version(runtime_version) if runtime_version else None
+    vi = info["version_indep"]
+    hardcoded = vi is not None and not vi.get("has_addr", False) \
+        and not vi.get("has_sigs", False)
 
     # Layer 1: flag patch (runs first so Layer 2's |= 0x2 doesn't shadow it).
-    # Skipped where V5 is unenforced: Ex=0 is inert there.
+    # Skipped where V5 is unenforced: Ex=0 is inert there. Never applied
+    # to hardcoded mods: claiming version independence only crashes them.
     if info["flag"] and info["flag"]["needs_patch"]:
-        if not _v5_enforced(run_tup):
+        if hardcoded:
+            actions.append(f"  flag: hardcoded offsets, skipped (needs author recompile)")
+        elif not _v5_enforced(run_tup):
             actions.append(f"  flag: Ex=0 but pre-V5 runtime, skipped (harmless there)")
         elif dry_run:
             actions.append(f"  flag: needs patch (0 -> 2)")
@@ -2065,9 +2075,11 @@ def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dr
                 actions.append(f"  flag: patch FAILED")
 
     # Layer 2: versionIndependence patch
-    vi = info["version_indep"]
     if vi and vi["needs_indep"]:
-        if dry_run:
+        if hardcoded:
+            actions.append(f"  versionIndependence: hardcoded offsets, skipped "
+                           f"(needs author recompile)")
+        elif dry_run:
             actions.append(
                 f"  versionIndependence: needs patch "
                 f"(0x{vi['indep_val']:x} -> 0x{KVI_TARGET:x})"

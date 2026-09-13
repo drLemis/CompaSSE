@@ -702,6 +702,16 @@ def main():
           and C.compat_match([], r19) is None
           and C.compat_match([r19], None) is None, "helper")
 
+    # ---------------------------------------------------------------- T36: CLI hardcoded gate
+    ph = tmp / "t36h.dll"
+    make_plugin(ph, 0x0, 0x0, [old19], 2023)
+    ah = C._audit_plugin(ph, r19)
+    check("T36.broken", ah["verdict"] == "BROKEN", ah["verdict"])
+    before36 = ph.read_bytes()
+    acts36 = C.fix_plugin(ph, None, None, None, runtime_version=r19, dry_run=False)
+    check("T36.untouched", ph.read_bytes() == before36, repr(acts36))
+    check("T36.skip", any("hardcoded" in a for a in acts36), repr(acts36))
+
     # ---------------------------------------------------------------- T31: PRO mode keeps the hatch
     try:
         import tkinter as tk
