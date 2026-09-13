@@ -691,6 +691,36 @@ def backup_bytes(path, data):
     with open(path, "wb") as f:
         f.write(data)
 
+def backup_path(dll_path):
+    """Stored original for one DLL, or None."""
+    bak = Path(dll_path).parent / "CompaSSE" / "backups" \
+        / (Path(dll_path).name + ".bak")
+    return bak if bak.exists() else None
+
+def restore_one(dll_path):
+    """Copy one stored original back. Returns True if there was one."""
+    bak = backup_path(dll_path)
+    if bak is None:
+        return False
+    shutil.copy2(bak, dll_path)
+    return True
+
+def list_backups(plugins_dir):
+    """(dll_path, bak_path) pairs with a stored original, or []."""
+    out_dir = Path(plugins_dir) / "CompaSSE" / "backups"
+    if not out_dir.is_dir():
+        return []
+    return [(Path(plugins_dir) / b.name[:-4], b)
+            for b in sorted(out_dir.glob("*.bak"))]
+
+def restore_backups(plugins_dir):
+    """Copy every stored original back. Returns the restored count."""
+    done = 0
+    for dll_path, _ in list_backups(plugins_dir):
+        if restore_one(dll_path):
+            done += 1
+    return done
+
 def patch_flag(dll_path):
     """Patch versionIndependenceEx 0->2 with backup. Returns True if patched."""
     data = bytearray(open(dll_path, "rb").read())
@@ -2147,6 +2177,8 @@ def main():
                         help="Explain last launch's startup errors from the shim + SKSE logs")
     parser.add_argument("--apply", action="store_true",
                         help="With --diagnose: append suggested IDs to quarantine.ini")
+    parser.add_argument("--restore", action="store_true",
+                        help="Restore original DLLs from CompaSSE/backups (undo fixes)")
     args = parser.parse_args()
 
     # -- Mint-missing mode: old-exe ground truth for dropped IDs
@@ -2225,6 +2257,29 @@ def main():
         return
     if args.apply:
         parser.error("--apply needs --diagnose")
+
+    # -- Restore mode: undo fixes from stored originals
+    if args.restore:
+        if args.dll is not None:
+            if restore_one(args.dll):
+                print(f"Restored {args.dll.name}")
+            else:
+                print(f"No saved original for {args.dll.name} - nothing to undo.")
+            return
+        plugins_dir = args.plugins_dir
+        if plugins_dir is None and args.game is not None:
+            plugins_dir = args.game.parent / "Data" / "SKSE" / "Plugins"
+        if plugins_dir is None or not plugins_dir.exists():
+            parser.error("--plugins-dir (or --game) is required for --restore")
+        pairs = list_backups(plugins_dir)
+        if not pairs:
+            print("No saved originals found - nothing to undo.")
+            return
+        done = restore_backups(plugins_dir)
+        print(f"Restored {done} file(s):")
+        for dll_path, _ in pairs:
+            print(f"  {dll_path.name}")
+        return
 
     # -- Build translations mode
     if args.build_translations:

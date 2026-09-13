@@ -719,6 +719,59 @@ def main():
         check("T31.pro", bool(_p31.fix_buttons), "PRO hides fix")
         _r31.destroy()
 
+    # ---------------------------------------------------------------- T33: restore originals
+    plug33 = tmp / "plug33"
+    (plug33 / "CompaSSE" / "backups").mkdir(parents=True)
+    (plug33 / "a.dll").write_bytes(b"patched")
+    (plug33 / "CompaSSE" / "backups" / "a.dll.bak").write_bytes(b"original")
+    (plug33 / "b.dll").write_bytes(b"untouched")
+    want33 = [(plug33 / "a.dll",
+               plug33 / "CompaSSE" / "backups" / "a.dll.bak")]
+    check("T33.list", C.list_backups(plug33) == want33,
+          repr(C.list_backups(plug33)))
+    check("T33.restore", C.restore_backups(plug33) == 1
+          and (plug33 / "a.dll").read_bytes() == b"original"
+          and (plug33 / "b.dll").read_bytes() == b"untouched", "bytes")
+    check("T33.empty", C.list_backups(tmp / "nope") == []
+          and C.restore_backups(tmp / "nope") == 0, "missing dir")
+
+    # ---------------------------------------------------------------- T34: restore one DLL
+    plug34 = tmp / "plug34"
+    (plug34 / "CompaSSE" / "backups").mkdir(parents=True)
+    (plug34 / "c.dll").write_bytes(b"patched")
+    (plug34 / "CompaSSE" / "backups" / "c.dll.bak").write_bytes(b"original")
+    check("T34.path", C.backup_path(plug34 / "c.dll")
+          == plug34 / "CompaSSE" / "backups" / "c.dll.bak", "bak path")
+    check("T34.one", C.restore_one(plug34 / "c.dll") is True
+          and (plug34 / "c.dll").read_bytes() == b"original", "bytes")
+    check("T34.missing", C.backup_path(plug34 / "d.dll") is None
+          and C.restore_one(plug34 / "d.dll") is False, "no backup")
+
+    # ---------------------------------------------------------------- T35: per-card Undo fix button
+    try:
+        import tkinter as tk
+        _r35 = tk.Tk()
+        _r35.withdraw()
+    except Exception as _e:
+        check("T35.gui-skip", True, f"no display ({_e})")
+        check("T35.click-skip", True, f"no display ({_e})")
+    else:
+        _v35 = {"key": "OK", "badge": "OK", "why": "fine",
+                "needs_fix": False}
+        _i35 = {"flag": None, "version_indep": None, "hooks": []}
+        _calls35 = []
+        _u35 = G.PluginCard(_r35, plug34 / "c.dll", _i35, _v35,
+                            on_fix_one=lambda *a: None,
+                            on_restore_one=lambda c: _calls35.append(c.dll_path.name))
+        check("T35.button", _u35.undo_btn is not None, "backup, no button")
+        _u35._on_undo_click()
+        check("T35.click", _calls35 == ["c.dll"], repr(_calls35))
+        _n35 = G.PluginCard(_r35, plug34 / "d.dll", _i35, _v35,
+                            on_fix_one=lambda *a: None,
+                            on_restore_one=lambda c: None)
+        check("T35.none", _n35.undo_btn is None, "no backup, button shown")
+        _r35.destroy()
+
     # ---------------------------------------------------------------- T26: one operation at a time
     seq26 = []
     w26 = G.BusyState()

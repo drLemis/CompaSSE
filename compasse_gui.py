@@ -559,15 +559,18 @@ class PendingCard(tk.Frame):
 class PluginCard(tk.Frame):
     """A card representing one scanned plugin with status + controls."""
 
-    def __init__(self, parent, dll_path, info, verdict, on_fix_one, force_fix=False, **kw):
+    def __init__(self, parent, dll_path, info, verdict, on_fix_one,
+                 on_restore_one=None, force_fix=False, **kw):
         super().__init__(parent, bg=CARD_BG, relief="solid", bd=1, **kw)
         self.dll_path = dll_path
         self.info = info
         self.verdict = verdict
         self.on_fix_one = on_fix_one
+        self.on_restore_one = on_restore_one
         self.force_fix = force_fix
         self.fixed = False
         self.fix_buttons = []
+        self.undo_btn = None
 
         colors = BADGE_COLORS[verdict["key"]]
 
@@ -726,7 +729,28 @@ class PluginCard(tk.Frame):
             # Ribbon-only treatment: no extra text for healthy mods.
             self.fix_btn = None
 
+        # ── Undo fix (only when a stored original exists) ──
+        if self.on_restore_one is not None \
+                and core.backup_path(dll_path) is not None:
+            self.undo_btn = tk.Button(
+                body, text="Undo fix",
+                font=(FONT_FAMILY, 9),
+                relief="raised", bd=1, padx=12, pady=2,
+                bg="#f3f4f6", fg=TEXT_SECONDARY,
+                activebackground="#e5e7eb", activeforeground=TEXT_PRIMARY,
+                cursor="hand2", command=self._on_undo_click)
+            self.undo_btn.pack(fill="x", pady=(4, 0))
+
     # ── Card actions ──────────────────────────────────────────────
+
+    def _on_undo_click(self):
+        if self.undo_btn is not None:
+            try:
+                self.undo_btn.config(state="disabled")
+            except Exception:
+                pass
+        if self.on_restore_one is not None:
+            self.on_restore_one(self)
 
     def _on_fix_kind(self, kind):
         self._disable_all_fix()
@@ -766,6 +790,11 @@ class PluginCard(tk.Frame):
         self.status_lbl.config(text="Working\u2026")
 
     def set_working(self, working):
+        if self.undo_btn is not None:
+            try:
+                self.undo_btn.config(state="disabled" if working else "normal")
+            except Exception:
+                pass
         if not self.fix_buttons:
             return
         if working:
@@ -1725,6 +1754,7 @@ class AutoPorterGUI:
         state = "disabled" if working else "normal"
         self.scan_btn.config(state=state)
         self.clear_btn.config(state=state)
+        self.restore_btn.config(state=state)
         self.pro_btn.config(state=state)
         self.rebuild_btn.config(state=state)
         for c in self.cards:
@@ -1798,6 +1828,9 @@ class AutoPorterGUI:
 
         self.clear_btn = ttk.Button(bf, text="Clear", command=self.clear)
         self.clear_btn.pack(side="left")
+
+        self.restore_btn = ttk.Button(bf, text="Undo fixes", command=self.restore)
+        self.restore_btn.pack(side="left", padx=(6, 0))
 
         self.pro_mode = tk.BooleanVar(value=False)
         self.pro_btn = tk.Checkbutton(
@@ -2038,6 +2071,7 @@ class AutoPorterGUI:
     def _add_scanned_card(self, dll, info, v):
         card = PluginCard(self.sf.inner, dll, info, v,
                           on_fix_one=self._fix_single,
+                          on_restore_one=self._restore_single,
                           force_fix=self.pro_mode.get())
         self._place_card(card)
         self.cards.append(card)
@@ -2079,6 +2113,7 @@ class AutoPorterGUI:
         card.destroy()
         new = PluginCard(self.sf.inner, dll, info, v,
                          on_fix_one=self._fix_single,
+                         on_restore_one=self._restore_single,
                          force_fix=self.pro_mode.get())
         ncol = 2
         new.grid(row=idx // ncol, column=idx % ncol, sticky="nsew",
@@ -2128,6 +2163,7 @@ class AutoPorterGUI:
         for dll, info, v in scanned:
             card = PluginCard(self.sf.inner, dll, info, v,
                               on_fix_one=self._fix_single,
+                              on_restore_one=self._restore_single,
                               force_fix=self.pro_mode.get())
             self._place_card(card)
             self.cards.append(card)
@@ -2141,9 +2177,84 @@ class AutoPorterGUI:
             c.destroy()
         self.cards.clear()
         self.notice_frame.pack_forget()
+
+    # ──────────────────────────────────────────────────────────────
+    # Restore originals (undo fixes)
+    # ──────────────────────────────────────────────────────────────
+
+    def restore(self):
+        plugins = self._plugins()
+        if plugins is None:
+            messagebox.showerror(
+                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
+            return
+        pairs = core.list_backups(plugins)
+        if not pairs:
+            messagebox.showinfo(
+                "Nothing to undo", "No saved originals found.")
+            return
+        if not messagebox.askyesno(
+            "Undo fixes",
+            f"Restore {len(pairs)} original file(s)?\n\n"
+            "This undoes all fixes.",
+        ):
+            return
+        if not self.work.acquire(f"Restoring {len(pairs)} file(s)..."):
+            messagebox.showinfo("Please wait", "Still working - try again.")
+            return
+        _launch(self.root, self.work, lambda: self._restore_worker(plugins))
+
+    def _restore_worker(self, plugins):
+        try:
+            done = core.restore_backups(plugins)
+        except Exception as exc:
+            self.root.after(
+                0, lambda: messagebox.showerror("Error", str(exc)))
+            return
+        self.root.after(0, lambda: self._finish_restore(done))
+
+    def _finish_restore(self, done):
+        self.list_dlls()
+        messagebox.showinfo(
+            "Done", f"Restored {done} file(s). Scan again to check them.")
         self.c_need.config(text="")
         self.c_ok.config(text="")
         self.c_other.config(text="")
+
+    def _restore_single(self, card):
+        if not self.work.acquire(f"Restoring {card.dll_path.name}..."):
+            messagebox.showinfo("Please wait", "Still working - try again.")
+            return
+        _launch(self.root, self.work,
+                lambda: self._restore_single_worker(card))
+
+    def _restore_single_worker(self, card):
+        try:
+            ok = core.restore_one(card.dll_path)
+        except Exception as exc:
+            self.root.after(
+                0, lambda: messagebox.showerror("Error", str(exc)))
+            return
+        dll = card.dll_path
+        self.root.after(0, lambda: self._finish_single_restore(card, dll, ok))
+
+    def _finish_single_restore(self, card, dll, ok):
+        if not ok:
+            messagebox.showinfo(
+                "Nothing to undo", f"No saved original for {dll.name}.")
+            return
+        try:
+            idx = self.cards.index(card)
+        except ValueError:
+            return
+        card.destroy()
+        new = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
+        ncol = 2
+        new.grid(row=idx // ncol, column=idx % ncol, sticky="nsew",
+                 padx=4, pady=4)
+        self.cards[idx] = new
+        self._scan_data = [(d, i, v) for d, i, v in self._scan_data if d != dll]
+        self._update_summary()
 
     # ──────────────────────────────────────────────────────────────
     # Fix Single
