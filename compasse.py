@@ -70,6 +70,21 @@ def crossed_cutoffs(declared, running):
 _BUILD_TIME_SENTINEL = 520128000      # 1986-06-19 (sentinel "no timestamp")
 _BUILD_TIME_CUTOFF = 1748217600       # 2025-05-26
 
+# 1.7.99 game update (2026-08-20): new address library format plus hook
+# layout changes. A plugin built before it and run on 1.7.99+ may crash
+# even when its flags look right and its IDs resolve.
+_CUTOFF_1_7_99_TS = 1786579200        # 2026-08-20 00:00 UTC
+
+def _built_before_1_7_99(dll_path):
+    try:
+        import datetime
+        dt = pe_build_dt(dll_path)
+        if dt is None:
+            return False
+        return dt.timestamp() < _CUTOFF_1_7_99_TS
+    except Exception:
+        return False
+
 # Old SKSE never checks Ex: only 1.7+ enforces the V5 scheme.
 _V5_ENFORCED_FROM = (1, 7, 0)
 
@@ -1850,6 +1865,36 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
                 "details": {"build_year": build_year, "has_addr": has_addr,
                             "hooks": len(hooks), "xref_ids": 0},
             }
+        if (1, 7, 99) in crossed:
+            details = {"build_year": build_year, "has_addr": has_addr,
+                       "hooks": len(hooks)}
+            reason = (f"Loads but was built for an older game and crosses "
+                      f"the 1.7.99 game update: it may crash "
+                      f"in-game even patched - test in-game, ask the author "
+                      f"for an update for your game.")
+            reason += _removed_ids_note(dll_path, id_set, ever_set, details)
+            return {
+                "name": dll_path.name,
+                "verdict": "MANUAL",
+                "reason": reason,
+                "details": details,
+            }
+        if (run_tup is not None and tuple(run_tup[:3]) >= (1, 7, 99)
+                and declared_tup is None
+                and _built_before_1_7_99(dll_path)):
+            details = {"build_year": build_year, "has_addr": has_addr,
+                       "hooks": len(hooks)}
+            reason = (f"Loads but was built before the 1.7.99 game update "
+                      f"and declares no game version: its hooks may be stale "
+                      f"on {_packed_to_ver(runtime_version)} - turn it off "
+                      f"to play, then ask the author for an update.")
+            reason += _removed_ids_note(dll_path, id_set, ever_set, details)
+            return {
+                "name": dll_path.name,
+                "verdict": "MANUAL",
+                "reason": reason,
+                "details": details,
+            }
         extra = f", {len(hooks)} hooks verified" if hooks else ""
         if xref:
             extra += f", {xref} xref'd IDs"
@@ -1943,6 +1988,34 @@ def diagnose_run(plugins_dir, apply=False):
             m = _re.search(r"plugin (\S+\.dll).*disabled, fatal", line)
             if m and m.group(1) not in disabled:
                 disabled.append(m.group(1))
+
+    # CrashLogger crash-*.log: name the faulting mod so an in-game crash
+    # is never a silent "no actionable failures". Hook-offset crashes are
+    # not address ID issues: quarantine cannot help them.
+    crash_fault = None  # (mod_name, exception, location)
+    try:
+        crash_dir = Path.home() / "Documents" / "My Games" \
+            / "Skyrim Special Edition" / "SKSE"
+        crash_logs = sorted(crash_dir.glob("crash-*.log"),
+                            key=lambda p: p.stat().st_mtime)
+        if crash_logs:
+            newest = crash_logs[-1]
+            text = newest.read_text(encoding="utf-8", errors="replace")
+            m = _re.search(
+                r'Unhandled exception "([^"]+)" at 0x[0-9A-Fa-f]+ '
+                r"(\S+\.dll)(?:\+([0-9A-Fa-f]+))?", text)
+            if m:
+                crash_fault = (m.group(2), m.group(1),
+                               m.group(2) + ("+" + m.group(3) if m.group(3)
+                                             else ""))
+    except OSError:
+        crash_fault = None
+    if crash_fault:
+        mod, exc, loc = crash_fault
+        print(f"[!!] {mod}: crashed the game ({exc} at {loc}). "
+              f"Not an address ID issue - quarantine cannot help. "
+              f"Turn it off to play, then ask the author for an update "
+              f"for your game.", flush=True)
 
     # Current + ever ID sets from shipped bins (newest versionlib wins).
     id_set, ever_set = set(), set()
@@ -2052,7 +2125,7 @@ def diagnose_run(plugins_dir, apply=False):
                   f"({', '.join(str(i) for i, _, _ in new)}). Relaunch to apply.")
     elif suggestions and not apply:
         print("report only - rerun with --apply to write quarantine.ini.")
-    elif not suggestions:
+    elif not suggestions and not crash_fault:
         print("no actionable failures found.")
     return suggestions
 

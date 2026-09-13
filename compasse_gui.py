@@ -429,6 +429,23 @@ def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None)
                       f"(0x{vi['indep_val']:x}). Cannot verify safety."),
                      "Review manually.", False, False, [])
 
+    has_addr_only = bool(vi and vi.get("has_addr", False))
+    if (1, 7, 99) in crossed and has_addr_only and not any_patch:
+        return _base("MANUAL", "MANUAL CHECK", "MANUAL",
+                     "Made for an older game. It loads but may still crash. "
+                     "Turn it off to play, then ask the author for an update.",
+                     "Turn it off to play; ask the author for an update.",
+                     False, False, [])
+    if (run_tup is not None and tuple(run_tup[:3]) >= (1, 7, 99)
+            and declared_tup is None and has_addr_only and not any_patch
+            and dll_path is not None
+            and core._built_before_1_7_99(dll_path)):
+        return _base("MANUAL", "MANUAL CHECK", "MANUAL",
+                     "Made before the latest game update. It loads but may "
+                     "still crash. Turn it off to play, then ask the author "
+                     "for an update.",
+                     "Turn it off to play; ask the author for an update.",
+                     False, False, [])
     ok_why = ("All flags and version info look correct. Should load, "
               "but that doesn't guarantee it works in-game.")
     if crossed:

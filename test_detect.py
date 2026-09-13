@@ -1075,6 +1075,57 @@ def main():
     check("T28.unreadable", G.game_version_line(_empty28) == "Game: empty28.exe",
           G.game_version_line(_empty28))
 
+    # ---------------------------------------------------------------- T39: pre-1.7.99 builds on 1.7.99+
+    # DSD-1.4.3 shape: Address Library flags look right, declares no game
+    # version, built May 2026 (before the 2026-08-20 1.7.99 update), run on
+    # 1.7.104. Must be MANUAL, never SAFE: its hooks go stale on 1.7.99+.
+    from datetime import datetime as _dt
+    def make_plugin_ts(path, indep, ex, compat, ts):
+        spec = [(".text", 0x1000, 0x200, 0x400, 0x200),
+                (".rdata", 0x2000, 0x600, 0x600, 0x600),
+                (".edata", 0x3000, 0x200, 0xC00, 0x200)]
+        blob = bytearray(make_pe64(spec, export=(0x3000, 0x200), timestamp=ts))
+        struct.pack_into("<I", blob, 0x600 + 0x304, ex)
+        struct.pack_into("<I", blob, 0x600 + 0x308, indep)
+        for i, v in enumerate(compat[:16]):
+            struct.pack_into("<I", blob, 0x600 + 0x30C + i * 4, v)
+        eo = 0xC00
+        struct.pack_into("<I", blob, eo + 24, 1)
+        struct.pack_into("<I", blob, eo + 28, 0x3040)
+        struct.pack_into("<I", blob, eo + 32, 0x3050)
+        struct.pack_into("<I", blob, eo + 36, 0x3060)
+        struct.pack_into("<I", blob, eo + 0x40, 0x2000)
+        struct.pack_into("<I", blob, eo + 0x50, 0x3070)
+        struct.pack_into("<H", blob, eo + 0x60, 0)
+        blob[eo + 0x70:eo + 0x70 + 19] = b"SKSEPlugin_Version\x00"
+        path.write_bytes(bytes(blob))
+    _pre99 = int(_dt(2026, 5, 19, tzinfo=_tz.utc).timestamp())
+    _post99 = int(_dt(2026, 9, 1, tzinfo=_tz.utc).timestamp())
+    check("T39.cutoff", C._CUTOFF_1_7_99_TS == 1786579200, "constant moved")
+    _dsd = tmp / "t39dsd.dll"
+    make_plugin_ts(_dsd, 0x1, 0x1, [], _pre99)
+    check("T39.pre", C._built_before_1_7_99(_dsd) is True, "May 2026")
+    _new = tmp / "t39new.dll"
+    make_plugin_ts(_new, 0x1, 0x1, [], _post99)
+    check("T39.post", C._built_before_1_7_99(_new) is False, "Sep 2026")
+    _a39 = C._audit_plugin(_dsd, r19)
+    check("T39.audit-manual", _a39["verdict"] == "MANUAL", _a39["verdict"])
+    _info39 = C.analyze_plugin(_dsd, r19, include_hooks=False)
+    _v39 = G.classify(_info39, 2026, r19, _dsd)
+    check("T39.gui-manual", _v39["cat"] == "MANUAL", _v39["cat"])
+    check("T39.gui-plain", "0x" not in _v39["why"] and "flag" not in _v39["why"].lower(),
+          _v39["why"][:80])
+    _a39n = C._audit_plugin(_new, r19)
+    check("T39.new-safe", _a39n["verdict"] == "SAFE", _a39n["verdict"])
+    # Crossed declared version stays MANUAL even with perfect flags.
+    _old = tmp / "t39old.dll"
+    make_plugin_ts(_old, 0x5, 0x2, [old19], _pre99)
+    _a39c = C._audit_plugin(_old, r19)
+    check("T39.crossed", _a39c["verdict"] == "MANUAL", _a39c["verdict"])
+    _info39c = C.analyze_plugin(_old, r19, include_hooks=False)
+    _v39c = G.classify(_info39c, 2026, r19, _old)
+    check("T39.gui-crossed", _v39c["cat"] == "MANUAL", _v39c["cat"])
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
