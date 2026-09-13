@@ -639,6 +639,26 @@ def main():
     ab = C._audit_plugin(pb, r1170)
     check("T22b.gui", vb["cat"] == "OK", vb["cat"])
     check("T22b.audit", ab["verdict"] == "SAFE", ab["verdict"])
+    # C: version-locked, built for and declaring 1.6.1170. Leave alone.
+    pc = tmp / "t22c.dll"
+    make_plugin(pc, 0x0, 0x0, [r1170], 2024)
+    vc = G.classify(C.analyze_plugin(pc, r1170, include_hooks=False), 2024, r1170)
+    ac = C._audit_plugin(pc, r1170)
+    check("T22c.gui", vc["cat"] == "OK" and "leave it alone" in vc["why"], vc["cat"])
+    check("T22c.audit", ac["verdict"] == "SAFE", ac["verdict"])
+    # D: declares 1.7.104 across structural breaks -> MANUAL.
+    pd = tmp / "t22d.dll"
+    make_plugin(pd, 0x0, 0x0, [old19, r19], 2023)
+    ad = C._audit_plugin(pd, r19)
+    check("T22d.audit-manual", ad["verdict"] == "MANUAL", ad["verdict"])
+    vd = G.classify(C.analyze_plugin(pd, r19, include_hooks=False), 2023, r19)
+    check("T22d.gui-manual", vd["cat"] == "MANUAL", vd["cat"])
+    # F: correct flags, declares 1.7.104, built for 1.6.640 -> MANUAL.
+    pf = tmp / "t22f.dll"
+    make_plugin(pf, 0x5, 0x2, [old19, r19], 2023)
+    vf = G.classify(C.analyze_plugin(pf, r19, include_hooks=False), 2023, r19)
+    check("T22f.gui-manual", vf["cat"] == "MANUAL" and "test in-game" in vf["why"],
+          vf["cat"])
     # E: --fix must not touch working old-runtime Ex bytes.
     pe = tmp / "t22e.dll"
     make_plugin(pe, 0x1, 0x0, [old19], 2023)

@@ -231,6 +231,15 @@ def classify(info, build_year, runtime_version=None):
 
     # No patches needed based on flags
     if declares_running:
+        if crossed:
+            names = ", ".join(f"{a}.{b}.{c}" for a, b, c in crossed)
+            return _base("MANUAL", "MANUAL CHECK", "MANUAL",
+                         (f"Declares your game version ({run_str}) but "
+                          f"crosses structural break(s) ({names}): struct "
+                          f"drift may still crash it - test in-game, patch "
+                          f"only if SKSE rejects it."),
+                         "Test in-game first; patch on rejection.",
+                         False, False, items)
         return _base("OK", "OK", "OK",
                      f"Declares your game version ({run_str}). Built for it - leave it alone.")
 
@@ -240,9 +249,16 @@ def classify(info, build_year, runtime_version=None):
                       f"(0x{vi['indep_val']:x}). Cannot verify safety."),
                      "Review manually.", False, False, [])
 
-    return _base("OK", "OK", "OK",
-                 "All flags and version info look correct. Should load, "
-                 "but that doesn't guarantee it works in-game.")
+    ok_why = ("All flags and version info look correct. Should load, "
+              "but that doesn't guarantee it works in-game.")
+    if crossed:
+        ok_why += cross_note
+    if (vi and vi.get("has_addr", False) and not vi.get("has_ex_v5", True)
+            and vi.get("pre_cutoff", False) and not v5_here):
+        ok_why += (" Note: flags predate the V5 scheme (inert on this "
+                   "runtime); if a newer SKSE ever reports 'must be "
+                   "recompiled', patch the flags.")
+    return _base("OK", "OK", "OK", ok_why)
 
 
 # ===================================================================

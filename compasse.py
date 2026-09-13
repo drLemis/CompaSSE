@@ -1629,12 +1629,49 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
     cross_suffix = (f" Crosses structural break(s) {cross_names}: struct "
                     "drift may crash it even patched - test in-game.") \
         if crossed else ""
+    declares_running = (vi is not None and runtime_version is not None
+                        and runtime_version in (vi.get("compat") or []))
 
     # Rule 1: built with CommonLibSSE? (heuristic: build year + has SKSE export)
     # Rule 2: uses Address Library? (versionIndependence flag bit)
     # Rule 3: has hardcoded offsets? (capstone hook scan finds REL::ID + offset)
 
     old_build = build_year is not None and build_year < 2025
+
+    # BROKEN: unknown flags. Compat entries don't save those.
+    if has_unknown:
+        return {
+            "name": dll_path.name,
+            "verdict": "BROKEN",
+            "reason": (f"Unknown versionIndependence flags (0x{vi['indep_val']:x}). "
+                       "Cannot verify compatibility."),
+            "details": {"build_year": build_year, "has_addr": has_addr},
+        }
+
+    # SAFE: declares the running game, so SKSE loads it. Structural
+    # drift can still crash it: MANUAL then, not SAFE.
+    if declares_running:
+        if crossed:
+            return {
+                "name": dll_path.name,
+                "verdict": "MANUAL",
+                "reason": (f"Declares your game version "
+                           f"({_packed_to_ver(runtime_version)}) but crosses "
+                           f"structural break(s) ({cross_names}): struct "
+                           f"drift may still crash it - test in-game, patch "
+                           f"only if SKSE rejects it."),
+                "details": {"build_year": build_year, "has_addr": has_addr,
+                            "hooks": len(hooks)},
+            }
+        return {
+            "name": dll_path.name,
+            "verdict": "SAFE",
+            "reason": (f"Declares your game version "
+                       f"({_packed_to_ver(runtime_version)}). Built for it - "
+                       f"leave it alone."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
 
     # BROKEN: old build, no version independence, nothing patchable.
     # Signature scanners never land here.
@@ -1652,16 +1689,6 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
             "reason": reason,
             "details": {"build_year": build_year, "has_addr": has_addr,
                         "hooks": len(hooks)},
-        }
-
-    # BROKEN: unknown flags, can't verify
-    if has_unknown:
-        return {
-            "name": dll_path.name,
-            "verdict": "BROKEN",
-            "reason": (f"Unknown versionIndependence flags (0x{vi['indep_val']:x}). "
-                       "Cannot verify compatibility."),
-            "details": {"build_year": build_year, "has_addr": has_addr},
         }
 
     # NEEDS_FIX: flag patches will make it work
@@ -1704,6 +1731,14 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
                         "hooks": len(hooks)},
         }
 
+    def _v5_hint():
+        if (vi and has_addr and not vi.get("has_ex_v5", True)
+                and vi.get("pre_cutoff", False) and not v5_here):
+            return (" Note: flags predate the V5 scheme (inert on this "
+                    "runtime); if a newer SKSE ever reports 'must be "
+                    "recompiled', patch the flags.")
+        return ""
+
     # SAFE: flags correct, uses Address Library
     if has_addr and not needs_fix:
         # Triage gate: without statically recoverable game references, ID
@@ -1728,7 +1763,8 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
                   "but that doesn't guarantee it works in-game.")
         details = {"build_year": build_year, "has_addr": has_addr,
                    "hooks": len(hooks)}
-        reason += _removed_ids_note(dll_path, id_set, ever_set, details)
+        reason += cross_suffix + _v5_hint() \
+            + _removed_ids_note(dll_path, id_set, ever_set, details)
         return {
             "name": dll_path.name,
             "verdict": "SAFE",
@@ -1743,7 +1779,7 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
             "verdict": "SAFE",
             "reason": ("Uses signature scanning (version-independent). "
                        "Should load, but that doesn't guarantee it works "
-                       "in-game." + cross_suffix),
+                       "in-game." + cross_suffix + _v5_hint()),
             "details": {"build_year": build_year, "has_addr": has_addr,
                         "hooks": len(hooks)},
         }
@@ -2245,15 +2281,18 @@ def main():
                     continue
                 if old_lib:
                     ever_set.update(old_lib)
-        counts = {"SAFE": 0, "NEEDS_FIX": 0, "BROKEN": 0, "UNKNOWN": 0}
+        counts = {"SAFE": 0, "NEEDS_FIX": 0, "BROKEN": 0, "UNKNOWN": 0,
+                  "MANUAL": 0}
         for dll in dlls:
             result = _audit_plugin(dll, runtime_version, id_set, ever_set)
             v = result["verdict"]
             counts[v] = counts.get(v, 0) + 1
-            tag = {"SAFE": "[OK]", "NEEDS_FIX": "[FIX]", "BROKEN": "[!!]", "UNKNOWN": "[??]"}[v]
+            tag = {"SAFE": "[OK]", "NEEDS_FIX": "[FIX]", "BROKEN": "[!!]",
+                   "UNKNOWN": "[??]", "MANUAL": "[??]"}[v]
             print(f"  {tag} {result['name']}: {result['reason']}")
         print(f"\n  {counts['SAFE']} safe, {counts['NEEDS_FIX']} needs fix, "
-              f"{counts['BROKEN']} broken, {counts['UNKNOWN']} unknown")
+              f"{counts['BROKEN']} broken, {counts['UNKNOWN']} unknown, "
+              f"{counts['MANUAL']} manual")
         return
 
     # -- Scan / Fix mode
