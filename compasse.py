@@ -2388,7 +2388,6 @@ def main():
             print(f"  game runtime: {_packed_to_ver(runtime_version)}\n")
         else:
             print("  (no --game given: version-specific checks skipped)\n")
-        # Triage gate needs the ID set: load it when a lib is provided.
         id_set = None
         if args.addresslib is not None and args.addresslib.exists():
             lib = parse_library_any(str(args.addresslib))
@@ -2408,6 +2407,9 @@ def main():
                     continue
                 if old_lib:
                     ever_set.update(old_lib)
+        if ever_dir is not None and not list(ever_dir.glob("version*.bin")):
+            print("  (no Address Library files found - mods needing game "
+                  "addresses will fail at startup)\n")
         counts = {"SAFE": 0, "NEEDS_FIX": 0, "BROKEN": 0, "UNKNOWN": 0,
                   "MANUAL": 0}
         for dll in dlls:

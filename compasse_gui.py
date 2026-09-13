@@ -1871,6 +1871,14 @@ class AutoPorterGUI:
             cursor="hand2", command=self.rebuild_translations)
         self.rebuild_btn.pack(side="right", padx=(0, 10), pady=6)
 
+        # ── Missing game-data notice (hidden unless no Address Library) ──
+        self.lib_frame = tk.Frame(parent, bg="#fee2e2")
+        self.lib_lbl = tk.Label(
+            self.lib_frame, text="", font=(FONT_FAMILY, 9),
+            fg="#7f1d1d", bg="#fee2e2", anchor="w", justify="left")
+        self.lib_lbl.pack(side="left", fill="x", expand=True,
+                          padx=(10, 6), pady=6)
+
         # ── Summary bar ──
         sf = tk.Frame(parent, bg=BG)
         sf.pack(fill="x", padx=10, pady=(4, 2))
@@ -1932,6 +1940,7 @@ class AutoPorterGUI:
             return
         self._clear_cards()
         self._check_table_stamp(plugins)
+        self._check_addresslib(plugins)
         self._ctx = None
         self._counts = {}
         self._scan_data = []
@@ -2047,6 +2056,27 @@ class AutoPorterGUI:
         self.notice_lbl.config(text=text)
         self.rebuild_btn.config(text=button, state="normal")
         self.notice_frame.pack(fill="x", padx=10, pady=(4, 0))
+
+    def _check_addresslib(self, plugins, game_ver=None):
+        """Warn when no Address Library file matches the game. Returns found."""
+        self.lib_frame.pack_forget()
+        if game_ver is None:
+            if self.game_exe is None:
+                return False
+            packed = core.runtime_version_from_exe(self.game_exe)
+            game_ver = core.unpack_version(packed) if packed else None
+        if game_ver is None:
+            return False
+        if core.find_versionlib(plugins, game_ver) is not None:
+            return True
+        game_str = f"{game_ver[0]}.{game_ver[1]}.{game_ver[2]}"
+        self.lib_lbl.config(
+            text=(f"No Address Library file for your game ({game_str}) in "
+                  f"Plugins. Mods that need game addresses will fail at "
+                  f"startup - install the all-in-one Address Library, "
+                  f"then Scan again."))
+        self.lib_frame.pack(fill="x", padx=10, pady=(4, 0))
+        return False
 
     def rebuild_translations(self):
         plugins = self._plugins()
@@ -2192,6 +2222,7 @@ class AutoPorterGUI:
             c.destroy()
         self.cards.clear()
         self.notice_frame.pack_forget()
+        self.lib_frame.pack_forget()
 
     # ──────────────────────────────────────────────────────────────
     # Restore originals (undo fixes)
@@ -2346,6 +2377,7 @@ def main():
     if app.game_exe and app._plugins() and app._plugins().exists():
         app.list_dlls()
         app._check_table_stamp(app._plugins())
+        app._check_addresslib(app._plugins())
     root.mainloop()
 
 

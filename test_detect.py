@@ -758,6 +758,26 @@ def main():
     vx0 = G.classify(C.analyze_plugin(px, r19, include_hooks=False), 2023, r19)
     check("T37.gui-red", vx0["cat"] == "DANGEROUS", vx0["cat"])
 
+    # ---------------------------------------------------------------- T38: missing library notice
+    try:
+        import tkinter as tk
+        _r38 = tk.Tk()
+        _r38.withdraw()
+    except Exception as _e:
+        check("T38.skip", True, f"no display ({_e})")
+    else:
+        _app38 = G.AutoPorterGUI(_r38)
+        _plug38 = tmp / "plug38"
+        _plug38.mkdir(parents=True)
+        check("T38.missing",
+              _app38._check_addresslib(_plug38, (1, 6, 640)) is False
+              and "1.6.640" in _app38.lib_lbl.cget("text"), "no banner")
+        (_plug38 / "versionlib-1-6-640-0.bin").write_bytes(b"x")
+        check("T38.found",
+              _app38._check_addresslib(_plug38, (1, 6, 640)) is True,
+              "banner stuck")
+        _r38.destroy()
+
     # ---------------------------------------------------------------- T31: PRO mode keeps the hatch
     try:
         import tkinter as tk
