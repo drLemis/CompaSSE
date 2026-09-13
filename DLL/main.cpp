@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <Psapi.h>
 #include <cstdint>
 #include <cstdio>

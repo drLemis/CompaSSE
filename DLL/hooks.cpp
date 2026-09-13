@@ -516,7 +516,7 @@ static void ensure_buffers(const wchar_t* binPath) {
     const wchar_t* vlib = wcsstr(binPath, L"versionlib-");
     const wchar_t* vonly = !vlib ? wcsstr(binPath, L"version-") : nullptr;
     if (vonly) {
-        // version-*.bin → try versionlib-*.bin as alt (has more entries, fmt5 source)
+        // version-*.bin gets versionlib-*.bin as alt (more entries, fmt5 source)
         wcscpy_s(altPath, binPath);
         wchar_t* vp = wcsstr(altPath, L"version-");
         if (vp) wmemmove(vp + 11, vp + 8, wcslen(vp + 8) + 1);

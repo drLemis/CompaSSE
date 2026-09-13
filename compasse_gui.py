@@ -587,11 +587,11 @@ class PluginCard(tk.Frame):
 
         colors = BADGE_COLORS[verdict["key"]]
 
-        # ── Left accent bar ──
+        # -- Left accent bar --
         self.bar = tk.Frame(self, bg=colors["bar"], width=4)
         self.bar.pack(side="left", fill="y")
 
-        # ── Content area ──
+        # -- Content area --
         body = tk.Frame(self, bg=CARD_BG)
         body.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=10)
 
@@ -662,7 +662,7 @@ class PluginCard(tk.Frame):
                          fg=TEXT_SECONDARY, bg=CARD_BG,
                          anchor="w", justify="left").pack(fill="x", pady=(0, 2))
 
-        # ── Controls (only when the plugin needs fixing, or forced in pro mode) ──
+        # -- Controls (only when the plugin needs fixing, or forced in pro mode) --
         if verdict["needs_fix"] or force_fix:
             fix_items = verdict.get("fix_items", [])
 
@@ -742,7 +742,7 @@ class PluginCard(tk.Frame):
             # Ribbon-only treatment: no extra text for healthy mods.
             self.fix_btn = None
 
-        # ── Undo fix (only when a stored original exists) ──
+        # -- Undo fix (only when a stored original exists) --
         if self.on_restore_one is not None \
                 and core.backup_path(dll_path) is not None:
             self.undo_btn = tk.Button(
@@ -754,7 +754,7 @@ class PluginCard(tk.Frame):
                 cursor="hand2", command=self._on_undo_click)
             self.undo_btn.pack(fill="x", pady=(4, 0))
 
-    # ── Card actions ──────────────────────────────────────────────
+    # -- Card actions ----------------------------------------------
 
     def _on_undo_click(self):
         if self.undo_btn is not None:
@@ -1752,7 +1752,7 @@ class AutoPorterGUI:
         root.minsize(700, 520)
         root.configure(bg=BG)
 
-        # ── State ──
+        # -- State --
         self.game_exe = find_game_exe()
         self.work = BusyState()
         self.cards = []
@@ -1775,12 +1775,12 @@ class AutoPorterGUI:
         self.root.title(f"CompaSSE v{core.VERSION} - {desc}" if working
                         else f"CompaSSE v{core.VERSION}")
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Layout
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def _build(self):
-        # ── Notebook (tabs) ──
+        # -- Notebook (tabs) --
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=6, pady=(6, 0))
 
@@ -1796,10 +1796,10 @@ class AutoPorterGUI:
         self.tab_surgeon = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_surgeon, text="  Surgeon  ")
 
-        # ── Build main tab (existing UI, reparented to tab_main) ──
+        # -- Build main tab (existing UI, reparented to tab_main) --
         self._build_main_tab()
 
-        # ── Build healer tab ──
+        # -- Build healer tab --
         self.healer_tab = HealerTab(
             self.tab_healer,
             game_exe=self.game_exe,
@@ -1807,7 +1807,7 @@ class AutoPorterGUI:
             work=self.work,
         )
 
-        # ── Build surgeon tab ──
+        # -- Build surgeon tab --
         self.surgeon_tab = SurgeonTab(self.tab_surgeon,
                                       plugins_dir_fn=self._plugins,
                                       work=self.work)
@@ -1815,7 +1815,7 @@ class AutoPorterGUI:
     def _build_main_tab(self):
         parent = self.tab_main
 
-        # ── Auto-detected location hint ──
+        # -- Auto-detected location hint --
         pf = tk.Frame(parent, bg=BG)
         pf.pack(fill="x", padx=10, pady=(10, 4))
         if self.game_exe:
@@ -1832,7 +1832,7 @@ class AutoPorterGUI:
                      font=(FONT_FAMILY, 10),
                      fg="#dc2626", bg=BG, anchor="w").pack(fill="x")
 
-        # ── Buttons ──
+        # -- Buttons --
         bf = tk.Frame(parent, bg=BG)
         bf.pack(fill="x", padx=10, pady=(4, 4))
 
@@ -1855,7 +1855,7 @@ class AutoPorterGUI:
             selectcolor=BG, cursor="hand2")
         self.pro_btn.pack(side="left", padx=(12, 0))
 
-        # ── Data notice (hidden until a scan finds stale helper data) ──
+        # -- Data notice (hidden until a scan finds stale helper data) --
         self.notice_frame = tk.Frame(parent, bg="#fef3c7")
         self.notice_lbl = tk.Label(
             self.notice_frame, text="", font=(FONT_FAMILY, 9),
@@ -1871,7 +1871,7 @@ class AutoPorterGUI:
             cursor="hand2", command=self.rebuild_translations)
         self.rebuild_btn.pack(side="right", padx=(0, 10), pady=6)
 
-        # ── Missing game-data notice (hidden unless no Address Library) ──
+        # -- Missing game-data notice (hidden unless no Address Library) --
         self.lib_frame = tk.Frame(parent, bg="#fee2e2")
         self.lib_lbl = tk.Label(
             self.lib_frame, text="", font=(FONT_FAMILY, 9),
@@ -1879,7 +1879,7 @@ class AutoPorterGUI:
         self.lib_lbl.pack(side="left", fill="x", expand=True,
                           padx=(10, 6), pady=6)
 
-        # ── Summary bar ──
+        # -- Summary bar --
         sf = tk.Frame(parent, bg=BG)
         sf.pack(fill="x", padx=10, pady=(4, 2))
 
@@ -1901,13 +1901,13 @@ class AutoPorterGUI:
                                 fg=TEXT_SECONDARY, bg=BG, anchor="w")
         self.c_other.pack(side="left")
 
-        # ── Scrollable card area ──
+        # -- Scrollable card area --
         self.sf = ScrollFrame(parent)
         self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Browse handlers
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def _plugins(self):
         """Return the plugins dir derived from the game exe next to the tool."""
@@ -1915,18 +1915,18 @@ class AutoPorterGUI:
             return None
         return plugins_dir_for(self.game_exe)
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Threading helpers
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def _run(self, fn, desc="Working..."):
         """Run fn in a background thread; all action buttons lock meanwhile."""
         if self.work.acquire(desc):
             _launch(self.root, self.work, fn)
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Scan
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def scan(self):
         plugins = self._plugins()
@@ -2224,9 +2224,9 @@ class AutoPorterGUI:
         self.notice_frame.pack_forget()
         self.lib_frame.pack_forget()
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Restore originals (undo fixes)
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def restore(self):
         plugins = self._plugins()
@@ -2302,9 +2302,9 @@ class AutoPorterGUI:
         self._scan_data = [(d, i, v) for d, i, v in self._scan_data if d != dll]
         self._update_summary()
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Fix Single
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def _fix_single(self, card, kind="all"):
         if not card.verdict["safe"] and kind == "all":
@@ -2325,9 +2325,9 @@ class AutoPorterGUI:
     def _fix_single_worker(self, card, kind):
         self._apply_fix(card, kind)
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Fix engine helpers
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def _apply_fix(self, card, kind="all"):
         """Run the requested fix kind for one card; post result to UI thread.
