@@ -86,6 +86,44 @@ def module_supports_fmt5_bytes(data):
     return any(m in data for m in FMT5_MARKERS)
 
 
+def _encode_table_header(fmt, stamp=None):
+    """Table header bytes. fmt 3 carries the build game version ("M.m.b");
+    the shim skips fmt-3 tables built for another game."""
+    out = bytearray(b"TRTL" + struct.pack("<I", fmt))
+    if fmt == 3:
+        sb = (stamp or "").encode("ascii")
+        out += struct.pack("<I", len(sb)) + sb
+        out += b"\x00" * (((len(sb) + 3) & ~3) - len(sb))
+    return bytes(out)
+
+
+def _table_header(data):
+    """(fmt, stamp_or_None, body_offset) or None when not a table.
+
+    fmt 2 rows carry cached signatures (Python-side only); fmt 1 and 3
+    rows are plain <QI pairs. Anything else is refused.
+    """
+    if len(data) < 12 or data[:4] != b"TRTL":
+        return None
+    fmt = struct.unpack_from("<I", data, 4)[0]
+    o = 8
+    stamp = None
+    if fmt == 3:
+        if o + 4 > len(data):
+            return None
+        n = struct.unpack_from("<I", data, o)[0]; o += 4
+        if n == 0 or n > 32 or o + n > len(data):
+            return None
+        try:
+            stamp = data[o:o + n].decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        o += (n + 3) & ~3
+    elif fmt not in (1, 2):
+        return None
+    return fmt, stamp, o
+
+
 def runtime_version_from_exe(exe_path):
     """Packed runtime version (e.g. 1.7.104.0 -> 0x01070680) from the exe.
 
@@ -292,33 +330,37 @@ def build_translations(game_exe, plugins_dir, game_version=None):
     if trans_bin.exists():
         with open(trans_bin, "rb") as f:
             data = f.read()
-        if len(data) >= 8 and data[:4] == b"TRTL":
-            fmt_ver = struct.unpack_from("<I", data, 4)[0]
-            o = 8
-            ver_count = struct.unpack_from("<I", data, o)[0]; o += 4
-            for _ in range(ver_count):
-                if o + 4 > len(data): break
-                ver_len = struct.unpack_from("<I", data, o)[0]; o += 4
-                if ver_len > 32 or o + ver_len > len(data): break
-                ver_str = data[o:o+ver_len].decode("ascii", errors="replace")
-                o += (ver_len + 3) & ~3
-                ver = extract_version_from_filename(ver_str.replace(".", "-"))
-                if o + 4 > len(data): break
-                entry_count = struct.unpack_from("<I", data, o)[0]; o += 4
-                sigs = {}
-                for _ in range(entry_count):
-                    if fmt_ver == 2:
-                        if o + 16 > len(data): break
-                        old_id = struct.unpack_from("<Q", data, o)[0]; o += 8
-                        o += 4  # skip offset
-                        sig_size = struct.unpack_from("<I", data, o)[0]; o += 4
-                        sig = data[o:o+sig_size]; o += sig_size
-                        sigs[old_id] = sig
-                    else:
-                        if o + 12 > len(data): break
-                        o += 12  # skip old_id + offset (v1 has no signatures)
-                if ver and sigs:
-                    old_sigs[ver] = sigs  # only v2 provides cached signatures
+        hdr = _table_header(data)
+        if hdr is not None:
+            fmt_ver, _, o = hdr
+            if o + 4 > len(data):
+                fmt_ver = -1
+            else:
+                ver_count = struct.unpack_from("<I", data, o)[0]; o += 4
+            if fmt_ver in (1, 2, 3):
+                for _ in range(ver_count):
+                    if o + 4 > len(data): break
+                    ver_len = struct.unpack_from("<I", data, o)[0]; o += 4
+                    if ver_len > 32 or o + ver_len > len(data): break
+                    ver_str = data[o:o+ver_len].decode("ascii", errors="replace")
+                    o += (ver_len + 3) & ~3
+                    ver = extract_version_from_filename(ver_str.replace(".", "-"))
+                    if o + 4 > len(data): break
+                    entry_count = struct.unpack_from("<I", data, o)[0]; o += 4
+                    sigs = {}
+                    for _ in range(entry_count):
+                        if fmt_ver == 2:
+                            if o + 16 > len(data): break
+                            old_id = struct.unpack_from("<Q", data, o)[0]; o += 8
+                            o += 4  # skip offset
+                            sig_size = struct.unpack_from("<I", data, o)[0]; o += 4
+                            sig = data[o:o+sig_size]; o += sig_size
+                            sigs[old_id] = sig
+                        else:
+                            if o + 12 > len(data): break
+                            o += 12  # skip old_id + offset (no signatures)
+                    if ver and sigs:
+                        old_sigs[ver] = sigs  # only v2 provides cached signatures
 
     current_sigs = collect_signatures(exe_data, sections, current_lib)
     print(f"Current binary: {len(current_sigs)} signatures extracted")
@@ -342,8 +384,9 @@ def build_translations(game_exe, plugins_dir, game_version=None):
         raise RuntimeError("No old version bins or existing translations found")
 
     out = bytearray()
-    out += b"TRTL"
-    out += struct.pack("<I", 1)  # format version 1 (no signatures - DLL doesn't need them)
+    stamp_tup = unpack_version(game_version) if game_version else current_ver
+    stamp = f"{stamp_tup[0]}.{stamp_tup[1]}.{stamp_tup[2]}"
+    out += _encode_table_header(3, stamp)
     ver_count_pos = len(out)
     out += struct.pack("<I", 0)  # placeholder
     ver_count = 0
@@ -465,9 +508,13 @@ def merge_translation_block(plugins_dir, version_str, entries):
         shutil.copy2(trans_bin, bak)
 
     raw = bytearray(open(trans_bin, "rb").read())
-    if bytes(raw[:4]) != b"TRTL" or struct.unpack_from("<I", raw, 4)[0] != 1:
+    hdr = _table_header(bytes(raw))
+    if hdr is None:
         raise RuntimeError("unsupported translation table format")
-    o = 8
+    fmt, _, o = hdr
+    if fmt == 2:
+        raise RuntimeError("sig-cached tables cannot be merged")
+    header = bytes(raw[:o])
     ver_count = struct.unpack_from("<I", raw, o)[0]; o += 4
     versions = []
     for _ in range(ver_count):
@@ -493,7 +540,7 @@ def merge_translation_block(plugins_dir, version_str, entries):
         fixed.append((vs, kept))
     fixed.append((version_str, sorted(entries)))
 
-    out = bytearray(b"TRTL" + struct.pack("<I", 1) + struct.pack("<I", len(fixed)))
+    out = bytearray(header + struct.pack("<I", len(fixed)))
     for vs, ent in fixed:
         vb = vs.encode("ascii")
         out += struct.pack("<I", len(vb)) + vb + b"\x00" * (((len(vb) + 3) & ~3) - len(vb))
@@ -504,6 +551,40 @@ def merge_translation_block(plugins_dir, version_str, entries):
         f.write(out)
     total = sum(len(e) for _, e in fixed)
     return dropped, total
+
+
+def table_build_stamp(plugins_dir):
+    """Game version ("M.m.b") the translation table was built for.
+
+    None when the table is missing, legacy (unstamped), or unreadable.
+    """
+    try:
+        data = (Path(plugins_dir) / "CompaSSE"
+                / "translation_table.bin").read_bytes()
+    except OSError:
+        return None
+    hdr = _table_header(data)
+    if hdr is None:
+        return None
+    return hdr[1]
+
+
+def table_state(plugins_dir, game_str):
+    """Translation table status for the GUI: ("ok" | "stale" | "legacy"
+    | "absent", stamp_or_None). Legacy predates stamps, so the GUI
+    offers a rebuild instead of staying silent."""
+    try:
+        data = (Path(plugins_dir) / "CompaSSE"
+                / "translation_table.bin").read_bytes()
+    except OSError:
+        return ("absent", None)
+    hdr = _table_header(data)
+    if hdr is None:
+        return ("absent", None)
+    fmt, stamp, _ = hdr
+    if fmt == 3:
+        return ("ok", stamp) if stamp == game_str else ("stale", stamp)
+    return ("legacy", None)
 
 
 def find_export_rva(data, sections, export_name_bytes):

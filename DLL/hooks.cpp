@@ -323,6 +323,29 @@ static void load_quarantine() {
              skipped ? " (some entries skipped)" : "");
 }
 
+// True when a v3 build stamp ("M.m.b") names the running game.
+static bool table_stamp_current(const char* stamp) {
+    InitOnceExecuteOnce(&g_verOnce, init_exe_version, nullptr, nullptr);
+    unsigned a = 0, b = 0, c = 0;
+    int n = 0;
+    if (sscanf_s(stamp, "%u.%u.%u%n", &a, &b, &c, &n) != 3 || stamp[n] != '\0') {
+        shim_log("load_translations: unparseable build stamp, ignoring table");
+        return false;
+    }
+    if (!g_exeVersion[0]) {
+        shim_log("load_translations: exe version unknown, applying table");
+        return true;
+    }
+    wchar_t want[32];
+    swprintf_s(want, L"%u-%u-%u", a, b, c);
+    if (wcscmp(want, g_exeVersion) != 0) {
+        shim_log("load_translations: table built for %ls, running %ls - skipping",
+                 want, g_exeVersion);
+        return false;
+    }
+    return true;
+}
+
 // ---- Translation table (cross-version ID remapping) ----
 struct TranslationEntry { uint64_t old_id; uint32_t offset; };
 static std::vector<TranslationEntry> g_flatTranslations; // flattened: all versions combined
@@ -364,9 +387,23 @@ static void load_translations() {
     if (total < 8 || memcmp(buf.data(), "TRTL", 4) != 0) return;
     o = 4;
     uint32_t fmtVersion = *(uint32_t*)(buf.data() + o); o += 4;
-    if (fmtVersion != 1) {
+    if (fmtVersion != 1 && fmtVersion != 3) {
         shim_log("load_translations: unsupported format version %u", fmtVersion);
         return;
+    }
+    if (fmtVersion == 3) {
+        // Stamped with the build game version ("M.m.b"): skip tables from
+        // another game, whose minted offsets don't apply here.
+        if (o + 4 > total) return;
+        uint32_t stampLen = *(uint32_t*)(buf.data() + o); o += 4;
+        if (stampLen == 0 || stampLen > 32 || o + stampLen > total) {
+            shim_log("load_translations: bad v3 stamp, ignoring table");
+            return;
+        }
+        char stamp[33] = {};
+        memcpy(stamp, buf.data() + o, stampLen);
+        o += (stampLen + 3) & ~3u;
+        if (!table_stamp_current(stamp)) return;
     }
     uint32_t verCount = *(uint32_t*)(buf.data() + o); o += 4;
 

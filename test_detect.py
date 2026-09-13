@@ -518,6 +518,74 @@ def main():
           "markers are case-sensitive")
     check("T20.empty", C.module_supports_fmt5_bytes(b"") is False, "empty")
 
+    # ---------------------------------------------------------------- T23: table stamp
+    check("T23.enc-v3",
+          C._encode_table_header(3, "1.7.104") == b"TRTL" + struct.pack("<I", 3)
+          + struct.pack("<I", 7) + b"1.7.104" + b"\x00",
+          "v3 header bytes")
+    check("T23.enc-v1",
+          C._encode_table_header(1) == b"TRTL" + struct.pack("<I", 1),
+          "v1 header bytes")
+    v3blob = (C._encode_table_header(3, "1.7.104") + struct.pack("<I", 1)
+              + struct.pack("<I", 5) + b"1.6.0" + b"\x00\x00\x00"
+              + struct.pack("<I", 1) + struct.pack("<QI", 12, 0x1500))
+    check("T23.dec-v3", C._table_header(v3blob) == (3, "1.7.104", 20),
+          repr(C._table_header(v3blob)))
+    v1blob = b"TRTL" + struct.pack("<I", 1) + struct.pack("<I", 0)
+    check("T23.dec-v1", C._table_header(v1blob) == (1, None, 8),
+          repr(C._table_header(v1blob)))
+    check("T23.dec-bad", C._table_header(b"junk") is None
+          and C._table_header(b"TRTL" + struct.pack("<I", 9)) is None
+          and C._table_header(b"TRTL" + struct.pack("<I", 3)) is None,
+          "rejects junk")
+    # merge preserves the v3 stamp and refuses sig-cached v2 rows
+    plug23 = tmp / "plug23"
+    (plug23 / "CompaSSE").mkdir(parents=True)
+    t23 = bytearray(v3blob)
+    (plug23 / "CompaSSE" / "translation_table.bin").write_bytes(bytes(t23))
+    dropped23, total23 = C.merge_translation_block(plug23, "9.9.10", [(13, 0x1600)])
+    raw23 = (plug23 / "CompaSSE" / "translation_table.bin").read_bytes()
+    check("T23.merge-stamp", C._table_header(raw23)[:2] == (3, "1.7.104")
+          and total23 == 2, f"total={total23}")
+    (plug23 / "CompaSSE" / "translation_table.bin").write_bytes(
+        b"TRTL" + struct.pack("<I", 2) + struct.pack("<I", 0))
+    try:
+        C.merge_translation_block(plug23, "9.9.10", [(13, 0x1600)])
+        check("T23.merge-v2-refuse", False, "merged sig rows!")
+    except RuntimeError:
+        check("T23.merge-v2-refuse", True, "")
+
+    # ---------------------------------------------------------------- T24: table stamp
+    plug24 = tmp / "plug24"
+    (plug24 / "CompaSSE").mkdir(parents=True)
+    t24 = plug24 / "CompaSSE" / "translation_table.bin"
+    t24.write_bytes(C._encode_table_header(3, "1.6.1170")
+                    + struct.pack("<I", 0))
+    check("T24.stamp", C.table_build_stamp(plug24) == "1.6.1170",
+          repr(C.table_build_stamp(plug24)))
+    t24.write_bytes(b"TRTL" + struct.pack("<I", 1)
+                    + struct.pack("<I", 0))
+    check("T24.legacy", C.table_build_stamp(plug24) is None, "legacy: no warn")
+    t24.write_bytes(b"junk")
+    check("T24.junk", C.table_build_stamp(plug24) is None, "junk: no warn")
+    (plug24 / "CompaSSE" / "translation_table.bin").unlink()
+    check("T24.missing", C.table_build_stamp(plug24) is None, "missing: no warn")
+    (plug24 / "CompaSSE" / "translation_table.bin").write_bytes(
+        C._encode_table_header(3, "1.6.1170") + struct.pack("<I", 0))
+    check("T24.state-ok", C.table_state(plug24, "1.6.1170") == ("ok", "1.6.1170"),
+          repr(C.table_state(plug24, "1.6.1170")))
+    (plug24 / "CompaSSE" / "translation_table.bin").write_bytes(
+        C._encode_table_header(3, "1.7.104") + struct.pack("<I", 0))
+    check("T24.state-stale", C.table_state(plug24, "1.6.1170") == ("stale", "1.7.104"),
+          repr(C.table_state(plug24, "1.6.1170")))
+    (plug24 / "CompaSSE" / "translation_table.bin").write_bytes(
+        b"TRTL" + struct.pack("<I", 1) + struct.pack("<I", 0))
+    check("T24.state-legacy", C.table_state(plug24, "1.6.1170") == ("legacy", None),
+          repr(C.table_state(plug24, "1.6.1170")))
+    (plug24 / "CompaSSE" / "translation_table.bin").unlink()
+    check("T24.state-absent", C.table_state(plug24, "1.6.1170") == ("absent", None),
+          repr(C.table_state(plug24, "1.6.1170")))
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
