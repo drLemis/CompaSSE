@@ -70,6 +70,15 @@ def crossed_cutoffs(declared, running):
 _BUILD_TIME_SENTINEL = 520128000      # 1986-06-19 (sentinel "no timestamp")
 _BUILD_TIME_CUTOFF = 1748217600       # 2025-05-26
 
+# Old SKSE never checks Ex: only 1.7+ enforces the V5 scheme.
+_V5_ENFORCED_FROM = (1, 7, 0)
+
+def _v5_enforced(running):
+    """(major, minor, build) tuple or None (unknown: enforce)."""
+    if running is None:
+        return True
+    return tuple(running[:3]) >= _V5_ENFORCED_FROM
+
 # V5-native reader markers. Mirrored by module_supports_fmt5 in
 # DLL/decoder_detect.cpp; keep in sync (test_detect.py T20).
 FMT5_MARKERS = (
@@ -751,12 +760,14 @@ def check_version_independence(dll_path, runtime_version=None):
 
     # Mirror SKSE's two rejection paths (PluginManager.cpp):
     # 1. "must be recompiled": declares AddressLibraryPostAE,
-    #    built pre-cutoff, lacks AddressLibraryV5 in ex.
+    #    built pre-cutoff, lacks AddressLibraryV5 in ex (1.7+ SKSE only).
     # 2. "incompatible with current version": no AddressLibraryPostAE,
     #    compatibleVersions list non-empty and runtime not in it.
+    run_tup = unpack_version(runtime_version) if runtime_version else None
+    pre_cutoff = _BUILD_TIME_SENTINEL <= build_time < _BUILD_TIME_CUTOFF
     if has_addr:
-        pre_cutoff = _BUILD_TIME_SENTINEL <= build_time < _BUILD_TIME_CUTOFF
-        needs_indep = pre_cutoff and not has_ex_v5
+        needs_indep = pre_cutoff and not has_ex_v5 \
+            and _v5_enforced(run_tup)
     else:
         needs_indep = bool(compat_list) and runtime_version is not None \
             and runtime_version not in compat_list
@@ -768,6 +779,8 @@ def check_version_independence(dll_path, runtime_version=None):
         "has_sigs": has_sigs,
         "has_unknown": has_unknown,
         "needs_indep": needs_indep,
+        "pre_cutoff": pre_cutoff,
+        "has_ex_v5": has_ex_v5,
         "runtime_ver": runtime_ver,
         "compat": compat_list,
     }
@@ -1594,14 +1607,17 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
         }
 
     has_addr = vi.get("has_addr", False) if vi else False
-    flag_patch = flag is not None and flag.get("needs_patch", False)
+    # Ex=0 is inert where V5 is unenforced: don't rewrite working plugins.
+    run_tup = unpack_version(runtime_version) if runtime_version else None
+    v5_here = _v5_enforced(run_tup)
+    flag_patch = flag is not None and flag.get("needs_patch", False) \
+        and v5_here
     indep_patch = vi is not None and vi.get("needs_indep", False)
     has_unknown = vi is not None and vi.get("has_unknown", False)
     needs_fix = flag_patch or indep_patch
 
     declared_tup = unpack_version(vi["runtime_ver"]) \
         if vi and vi.get("runtime_ver") else None
-    run_tup = unpack_version(runtime_version) if runtime_version else None
     crossed = crossed_cutoffs(declared_tup, run_tup)
     cross_names = ", ".join(f"{a}.{b}.{c}" for a, b, c in crossed)
     cross_suffix = (f" Crosses structural break(s) {cross_names}: struct "
@@ -1891,10 +1907,14 @@ def fix_plugin(dll_path, exe, exe_sections, addresslib, runtime_version=None, dr
     """
     actions = []
     info = analyze_plugin(dll_path, runtime_version)
+    run_tup = unpack_version(runtime_version) if runtime_version else None
 
-    # Layer 1: flag patch (runs first so Layer 2's |= 0x2 doesn't shadow it)
+    # Layer 1: flag patch (runs first so Layer 2's |= 0x2 doesn't shadow it).
+    # Skipped where V5 is unenforced: Ex=0 is inert there.
     if info["flag"] and info["flag"]["needs_patch"]:
-        if dry_run:
+        if not _v5_enforced(run_tup):
+            actions.append(f"  flag: Ex=0 but pre-V5 runtime, skipped (harmless there)")
+        elif dry_run:
             actions.append(f"  flag: needs patch (0 -> 2)")
         else:
             if patch_flag(dll_path):

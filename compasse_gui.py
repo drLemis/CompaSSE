@@ -125,7 +125,10 @@ def classify(info, build_year, runtime_version=None):
     recent = build_year is not None and build_year >= 2025
     # versionIndependence flag bit: authoritative, matches SKSE's own check.
     addrlib = bool(vi and vi.get("has_addr", False))
-    flag_patch = flag is not None and flag.get("needs_patch", False)
+    # Ex=0 is inert where V5 is unenforced (pre-1.7): don't flag or fix it.
+    v5_here = core._v5_enforced(run_tup)
+    flag_patch = flag is not None and flag.get("needs_patch", False) \
+        and v5_here
     indep_patch = vi is not None and vi.get("needs_indep", False)
     has_unknown = vi is not None and vi.get("has_unknown", False)
 

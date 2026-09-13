@@ -586,6 +586,60 @@ def main():
     check("T24.state-absent", C.table_state(plug24, "1.6.1170") == ("absent", None),
           repr(C.table_state(plug24, "1.6.1170")))
 
+    # ---------------------------------------------------------------- T21: V5 enforcement gate
+    check("T21.new-enforces", C._v5_enforced((1, 7, 104)) is True, "1.7.104")
+    check("T21.new99", C._v5_enforced((1, 7, 99)) is True, "1.7.99")
+    check("T21.old-skip", C._v5_enforced((1, 6, 1170)) is False, "1.6.1170")
+    check("T21.veryold", C._v5_enforced((1, 5, 97)) is False, "1.5.97")
+    check("T21.unknown", C._v5_enforced(None) is True, "None=enforce")
+
+    # ---------------------------------------------------------------- T22: old-runtime verdicts
+    # Synthetic SKSE plugins: version struct hosted in .rdata.
+    from datetime import datetime, timezone as _tz
+
+    def make_plugin(path, indep, ex, compat, year):
+        e_lfanew = 0x80
+        spec = [(".text", 0x1000, 0x200, 0x400, 0x200),
+                (".rdata", 0x2000, 0x600, 0x600, 0x600),
+                (".edata", 0x3000, 0x200, 0xC00, 0x200)]
+        ts = int(datetime(year, 6, 1, tzinfo=_tz.utc).timestamp())
+        blob = bytearray(make_pe64(spec, export=(0x3000, 0x200), timestamp=ts))
+        struct.pack_into("<I", blob, 0x600 + 0x304, ex)
+        struct.pack_into("<I", blob, 0x600 + 0x308, indep)
+        for i, v in enumerate(compat[:16]):
+            struct.pack_into("<I", blob, 0x600 + 0x30C + i * 4, v)
+        eo = 0xC00
+        struct.pack_into("<I", blob, eo + 24, 1)
+        struct.pack_into("<I", blob, eo + 28, 0x3040)
+        struct.pack_into("<I", blob, eo + 32, 0x3050)
+        struct.pack_into("<I", blob, eo + 36, 0x3060)
+        struct.pack_into("<I", blob, eo + 0x40, 0x2000)
+        struct.pack_into("<I", blob, eo + 0x50, 0x3070)
+        struct.pack_into("<H", blob, eo + 0x60, 0)
+        blob[eo + 0x70:eo + 0x70 + 18] = b"SKSEPlugin_Version\x00"
+        path.write_bytes(bytes(blob))
+
+    r1170 = (1 << 24) | (6 << 16) | (1170 << 4)
+    # A: pre-2025 AddressLibrary, Ex=0, built for 1.6.640, on 1.6.1170.
+    pa = tmp / "t22a.dll"
+    make_plugin(pa, 0x1, 0x0, [old19], 2023)
+    via = C.check_version_independence(pa, r1170)
+    va = G.classify(C.analyze_plugin(pa, r1170, include_hooks=False), 2023, r1170)
+    aa = C._audit_plugin(pa, r1170)
+    check("T22a.gate", via["needs_indep"] is False, repr(via["needs_indep"]))
+    check("T22a.gui", va["cat"] == "OK", va["cat"])
+    check("T22a.audit", aa["verdict"] == "SAFE", aa["verdict"])
+    # ...but the same DLL on 1.7.104 IS enforced.
+    via19 = C.check_version_independence(pa, r19)
+    check("T22a.enforced-new", via19["needs_indep"] is True, "1.7.104 flags it")
+    # E: --fix must not touch working old-runtime Ex bytes.
+    pe = tmp / "t22e.dll"
+    make_plugin(pe, 0x1, 0x0, [old19], 2023)
+    before = pe.read_bytes()
+    acts = C.fix_plugin(pe, None, None, None, runtime_version=r1170, dry_run=False)
+    check("T22e.no-rewrite", pe.read_bytes() == before, repr(acts))
+    check("T22e.skip-note", any("pre-V5 runtime" in a for a in acts), repr(acts))
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
