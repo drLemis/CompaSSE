@@ -706,6 +706,31 @@ def main():
               "scan stuck disabled")
         check("T26.title-idle", _r26.title() == f"CompaSSE v{G.core.VERSION}",
               _r26.title())
+        import tkinter.font as _tkfont
+        _f26 = _tkfont.Font(family="TkDefaultFont", size=11, weight="bold")
+        _t26, _cut26 = G._ellipsize(_f26, "short.dll")
+        check("T26.short", _t26 == "short.dll" and _cut26 is False, repr(_t26))
+        _long26 = "x" * 200 + ".dll"
+        _t26b, _cut26b = G._ellipsize(_f26, _long26)
+        check("T26.long", _cut26b is True and _t26b.endswith("...")
+              and _f26.measure(_t26b) <= G.NAME_PX, repr(_t26b[-12:]))
+        _lp = Path("verylong_" + "n" * 150 + ".dll")
+        _lpc = G.PendingCard(_r26, _lp, on_scan=lambda *a: None)
+        check("T26.tip-cut", _lpc.name_lbl.cget("text").endswith("...")
+              and bool(_lpc.name_lbl.bind("<Enter>")),
+              _lpc.name_lbl.cget("text")[-12:])
+        from types import SimpleNamespace as _NS
+        _lpc._on_name_resize(_NS(width=120))
+        _t26c = _lpc.name_lbl.cget("text")
+        check("T26.refit-cut", _t26c.endswith("...")
+              and _lpc._font.measure(_t26c) <= 120, repr(_t26c[-12:]))
+        _lpc._on_name_resize(_NS(width=10000))
+        check("T26.refit-full", _lpc.name_lbl.cget("text") == _lp.name,
+              _lpc.name_lbl.cget("text")[-12:])
+        _spc = G.PendingCard(_r26, Path("short.dll"), on_scan=lambda *a: None)
+        check("T26.tip-full", _spc.name_lbl.cget("text") == "short.dll"
+              and not _spc.name_lbl.bind("<Enter>"),
+              _spc.name_lbl.cget("text"))
         _f26 = {"dll_path": Path("x.dll"), "id_val": 1, "func_rva": 0x1000,
                 "old_offset": 0x10, "new_offset": 0x20, "auto_fixable": True}
         _hc = G.HealerCard(_r26, _f26, None, [], on_heal=lambda *a: None)

@@ -3,6 +3,7 @@
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -75,6 +76,67 @@ BADGE_COLORS = {
 # ===================================================================
 # Concurrency: one operation at a time, UI thread only
 # ===================================================================
+
+NAME_PX = 300
+NAME_FONT_SPEC = (FONT_FAMILY, 11, "bold")
+
+def _ellipsize(font, text, max_px=NAME_PX):
+    """Shorten text to max_px with ..., returning (short, was_cut)."""
+    if font.measure(text) <= max_px:
+        return text, False
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if font.measure(text[:mid] + "...") <= max_px:
+            lo = mid + 1
+        else:
+            hi = mid
+    return text[:max(lo - 1, 0)] + "...", True
+
+
+class _HoverTip:
+    """Full text on hover, for ellipsized labels."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.win = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _event=None):
+        if self.win is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        except Exception:
+            return
+        self.win = tk.Toplevel(self.widget)
+        self.win.wm_overrideredirect(True)
+        self.win.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.win, text=self.text, font=(FONT_MONO, 8),
+                 bg="#1f2937", fg="#f9fafb", relief="solid", bd=1,
+                 padx=6, pady=3).pack()
+
+    def _hide(self, _event=None):
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
+
+
+def _name_label(parent, text):
+    """Bold name label, ellipsized with hover for long names."""
+    short, cut = _ellipsize(tkfont.Font(font=NAME_FONT_SPEC), text)
+    lbl = tk.Label(parent, text=short, font=NAME_FONT_SPEC,
+                   fg=TEXT_PRIMARY, bg=CARD_BG)
+    if cut:
+        _HoverTip(lbl, text)
+    return lbl
+
 
 class BusyState:
     """Global work lock across all tabs. acquire() disables every
@@ -423,10 +485,33 @@ class PendingCard(tk.Frame):
             cursor="hand2", command=self._on_scan_click)
         self.scan_btn.pack(side="right")
 
-        self.name_lbl = tk.Label(body, text=dll_path.name,
-                                 font=(FONT_FAMILY, 11, "bold"),
+        self._font = tkfont.Font(font=NAME_FONT_SPEC)
+        self._full_name = dll_path.name
+        self._full_px = self._font.measure(self._full_name)
+        self._tip = None
+        short, cut = _ellipsize(self._font, self._full_name)
+        self.name_lbl = tk.Label(body, text=short, font=NAME_FONT_SPEC,
                                  fg=TEXT_PRIMARY, bg=CARD_BG, anchor="w")
         self.name_lbl.pack(side="left", fill="x", expand=True)
+        if cut:
+            self._tip = _HoverTip(self.name_lbl, self._full_name)
+        self.name_lbl.bind("<Configure>", self._on_name_resize, add="+")
+
+    def _on_name_resize(self, event):
+        if event.width <= 1:
+            return
+        cur = self.name_lbl.cget("text")
+        if event.width >= self._full_px:
+            if cur != self._full_name:
+                self.name_lbl.config(text=self._full_name)
+            return
+        if self.name_lbl.winfo_reqwidth() <= event.width:
+            return
+        short, _ = _ellipsize(self._font, self._full_name, event.width)
+        if short != cur:
+            self.name_lbl.config(text=short)
+            if self._tip is None:
+                self._tip = _HoverTip(self.name_lbl, self._full_name)
 
     def _on_scan_click(self):
         self.on_scan(self)
@@ -465,9 +550,7 @@ class PluginCard(tk.Frame):
         hdr = tk.Frame(body, bg=CARD_BG)
         hdr.pack(fill="x", pady=(0, 4))
 
-        tk.Label(hdr, text=dll_path.name,
-                 font=(FONT_FAMILY, 11, "bold"),
-                 fg=TEXT_PRIMARY, bg=CARD_BG).pack(side="left")
+        _name_label(hdr, dll_path.name).pack(side="left")
 
         # Version / era line (secondary info)
         ver = verdict.get("version")
@@ -725,9 +808,7 @@ class HealerCard(tk.Frame):
 
         # Header: plugin name
         dll_path = finding["dll_path"]
-        tk.Label(body, text=dll_path.name,
-                 font=(FONT_FAMILY, 11, "bold"),
-                 fg=TEXT_PRIMARY, bg=CARD_BG).pack(anchor="w")
+        _name_label(body, dll_path.name).pack(anchor="w")
 
         # ID + offset info
         id_val = finding["id_val"]
@@ -1210,9 +1291,7 @@ class SurgeonCard(tk.Frame):
         body.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=10)
 
         title = f"{surgeon.uid_name(uid)} [0x{uid:08x}]"
-        tk.Label(body, text=title,
-                 font=(FONT_FAMILY, 11, "bold"),
-                 fg=TEXT_PRIMARY, bg=CARD_BG).pack(anchor="w")
+        _name_label(body, title).pack(anchor="w")
 
         if not is_core:
             inst = self.loc["installed"]
