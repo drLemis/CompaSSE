@@ -391,6 +391,44 @@ class ScrollFrame(tk.Frame):
 # Plugin card
 # ===================================================================
 
+class PendingCard(tk.Frame):
+    """A listed-but-unchecked DLL. One Scan button, no analysis yet."""
+
+    def __init__(self, parent, dll_path, on_scan, **kw):
+        super().__init__(parent, bg=CARD_BG, relief="solid", bd=1, **kw)
+        self.dll_path = dll_path
+        self.on_scan = on_scan
+
+        self.bar = tk.Frame(self, bg="#9ca3af", width=4)
+        self.bar.pack(side="left", fill="y")
+
+        body = tk.Frame(self, bg=CARD_BG)
+        body.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=10)
+
+        self.scan_btn = tk.Button(
+            body, text="Scan",
+            font=(FONT_FAMILY, 9, "bold"),
+            relief="raised", bd=1, padx=12, pady=2,
+            bg="#e0e7ff", fg="#3730a3",
+            activebackground="#c7d2fe", activeforeground="#1e1b4b",
+            cursor="hand2", command=self._on_scan_click)
+        self.scan_btn.pack(side="right")
+
+        self.name_lbl = tk.Label(body, text=dll_path.name,
+                                 font=(FONT_FAMILY, 11, "bold"),
+                                 fg=TEXT_PRIMARY, bg=CARD_BG, anchor="w")
+        self.name_lbl.pack(side="left", fill="x", expand=True)
+
+    def _on_scan_click(self):
+        self.on_scan(self)
+
+    def set_working(self, working):
+        try:
+            self.scan_btn.config(state="disabled" if working else "normal")
+        except Exception:
+            pass
+
+
 class PluginCard(tk.Frame):
     """A card representing one scanned plugin with status + controls."""
 
@@ -1555,6 +1593,9 @@ class AutoPorterGUI:
         self.game_exe = find_game_exe()
         self.work = BusyState()
         self.cards = []
+        self._ctx = None
+        self._counts = {}
+        self._scan_data = []
 
         self._build()
         self.work.listen(self._set_working)
@@ -1630,7 +1671,7 @@ class AutoPorterGUI:
         bf = tk.Frame(parent, bg=BG)
         bf.pack(fill="x", padx=10, pady=(4, 4))
 
-        self.scan_btn = ttk.Button(bf, text="Scan", command=self.scan)
+        self.scan_btn = ttk.Button(bf, text="Scan all", command=self.scan)
         self.scan_btn.pack(side="left", padx=(0, 6))
 
         self.clear_btn = ttk.Button(bf, text="Clear", command=self.clear)
@@ -1705,28 +1746,64 @@ class AutoPorterGUI:
             messagebox.showerror(
                 "Error", f"Plugins folder not found:\n{plugins}")
             return
-        self._run(lambda: self._do_scan(plugins))
+        self._clear_cards()
+        self._ctx = None
+        self._counts = {}
+        self._scan_data = []
+        self._run(lambda: self._do_scan(plugins), "Starting scan...")
+
+    def list_dlls(self):
+        """Instant file listing: one unchecked card per DLL, no analysis."""
+        plugins = self._plugins()
+        if plugins is None or not plugins.exists():
+            return False
+        self._clear_cards()
+        self._ctx = None
+        self._counts = {}
+        self._scan_data = []
+        for dll in sorted(plugins.glob("*.dll")):
+            card = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
+            self._place_card(card)
+            self.cards.append(card)
+        self._update_summary()
+        return True
+
+    def _place_card(self, card):
+        ncol = 2
+        row = len(self.cards) // ncol
+        col = len(self.cards) % ncol
+        card.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+        self.sf.inner.grid_columnconfigure(0, weight=1, uniform="card")
+        self.sf.inner.grid_columnconfigure(1, weight=1, uniform="card")
+
+    def _ensure_ctx(self, plugins):
+        """One-time exe/library load shared by full and single scans."""
+        if self._ctx is None:
+            runtime_version = (core.runtime_version_from_exe(self.game_exe)
+                               if self.game_exe else None)
+            exe_data = exe_secs = addr_lib = None
+            if self.game_exe is not None:
+                try:
+                    exe_data, exe_secs = core.load_exe_sections(str(self.game_exe))
+                    game_ver = core.unpack_version(
+                        core.runtime_version_from_exe(self.game_exe))
+                    match = core.find_versionlib(plugins, game_ver) if game_ver else None
+                    if match is not None:
+                        addr_lib = core.parse_library_any(str(match))
+                except Exception:
+                    exe_data = exe_secs = addr_lib = None
+            self._ctx = (runtime_version, exe_data, exe_secs, addr_lib)
+        return self._ctx
 
     def _do_scan(self, plugins):
-        self.root.after(0, self._clear_cards)
-        runtime_version = (core.runtime_version_from_exe(self.game_exe)
-                           if self.game_exe else None)
-        exe_data = exe_secs = addr_lib = None
-        if self.game_exe is not None:
-            try:
-                exe_data, exe_secs = core.load_exe_sections(str(self.game_exe))
-                game_ver = core.unpack_version(
-                    core.runtime_version_from_exe(self.game_exe))
-                match = core.find_versionlib(plugins, game_ver) if game_ver else None
-                if match is not None:
-                    addr_lib = core.parse_library_any(str(match))
-            except Exception:
-                exe_data = exe_secs = addr_lib = None
+        runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(plugins)
 
         dlls = sorted(plugins.glob("*.dll"))
-        counts = {}
-        self._scan_data = []
-        for dll in dlls:
+        total_mods = len(dlls)
+        for i, dll in enumerate(dlls):
+            self.root.after(
+                0, lambda i=i, d=dll: self.work.set_desc(
+                    f"Checking {d.name} ({i + 1}/{total_mods})"))
             try:
                 info = core.analyze_plugin(dll, runtime_version, include_hooks=True)
             except OSError:
@@ -1743,54 +1820,114 @@ class AutoPorterGUI:
                                       "Healer tab to fix (or CLI --fix with old game files).")
             v["build_date"] = build_date
             self._scan_data.append((dll, info, v))
-            counts[v["cat"]] = counts.get(v["cat"], 0) + 1
+            self._counts[v["cat"]] = self._counts.get(v["cat"], 0) + 1
             self.root.after(
                 0,
-                lambda d=dll, i=info, v=v: self._add_card(d, i, v),
+                lambda d=dll, i=info, v=v: self._add_scanned_card(d, i, v),
             )
 
-        total = len(dlls)
-        need = (counts.get("NEEDS_FIX", 0)
-                + counts.get("DANGEROUS", 0)
-                + counts.get("MANUAL", 0))
-        ok_n = counts.get("OK", 0)
-        other = counts.get("NOT_SKSE", 0)
+        self.root.after(0, self._update_summary)
 
-        def _update_summary():
-            self.c_need.config(
-                text=f"{need} of {total} need attention" if need else "")
-            self.c_ok.config(
-                text=f"{ok_n} OK" if ok_n else "")
-            parts = []
-            if other:
-                parts.append(f"{other} not SKSE")
-            self.c_other.config(text="  \u2022  ".join(parts))
-
-        self.root.after(0, _update_summary)
-
-    def _add_card(self, dll, info, v):
+    def _add_scanned_card(self, dll, info, v):
         card = PluginCard(self.sf.inner, dll, info, v,
                           on_fix_one=self._fix_single,
                           force_fix=self.pro_mode.get())
-        ncol = 2
-        row = len(self.cards) // ncol
-        col = len(self.cards) % ncol
-        card.grid(row=row, column=col, sticky="nsew",
-                  padx=4, pady=4)
-        self.sf.inner.grid_columnconfigure(0, weight=1, uniform="card")
-        self.sf.inner.grid_columnconfigure(1, weight=1, uniform="card")
+        self._place_card(card)
         self.cards.append(card)
         if self.work.busy:
             card.set_working(True)
+        self._update_summary()
+
+    def _scan_single(self, card):
+        if not self.work.acquire(f"Checking {card.dll_path.name}..."):
+            return
+        _launch(self.root, self.work,
+                lambda: self._scan_single_worker(card))
+
+    def _scan_single_worker(self, card):
+        plugins = self._plugins()
+        runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(plugins)
+        try:
+            info = core.analyze_plugin(card.dll_path, runtime_version,
+                                       include_hooks=True)
+        except OSError:
+            return
+        build_year = _get_build_year(card.dll_path)
+        v = classify(info, build_year, runtime_version)
+        v["build_date"] = _get_build_date_str(card.dll_path)
+        if exe_data is not None and addr_lib is not None:
+            stale = count_stale_hooks(info.get("hooks"), exe_data,
+                                      exe_secs, addr_lib)
+            if stale:
+                v["hook_note"] = (f"{stale} stale hook offset(s) - go to the "
+                                  "Healer tab to fix (or CLI --fix with old game files).")
+        dll, info = card.dll_path, info
+        self.root.after(0, lambda: self._finish_single(card, dll, info, v))
+
+    def _finish_single(self, card, dll, info, v):
+        try:
+            idx = self.cards.index(card)
+        except ValueError:
+            return
+        card.destroy()
+        new = PluginCard(self.sf.inner, dll, info, v,
+                         on_fix_one=self._fix_single,
+                         force_fix=self.pro_mode.get())
+        ncol = 2
+        new.grid(row=idx // ncol, column=idx % ncol, sticky="nsew",
+                 padx=4, pady=4)
+        self.cards[idx] = new
+        for i, (d, _, _) in enumerate(self._scan_data):
+            if d == dll:
+                self._scan_data[i] = (dll, info, v)
+                break
+        else:
+            self._scan_data.append((dll, info, v))
+        self._counts[v["cat"]] = self._counts.get(v["cat"], 0) + 1
+        self._update_summary()
+
+    def _update_summary(self):
+        need = (self._counts.get("NEEDS_FIX", 0)
+                + self._counts.get("DANGEROUS", 0)
+                + self._counts.get("MANUAL", 0))
+        ok_n = self._counts.get("OK", 0)
+        other = self._counts.get("NOT_SKSE", 0)
+        pending = sum(isinstance(c, PendingCard) for c in self.cards)
+        total = len(self.cards)
+        self.c_need.config(
+            text=f"{need} of {total} need attention" if need else "")
+        self.c_ok.config(
+            text=f"{ok_n} OK" if ok_n else "")
+        parts = []
+        if other:
+            parts.append(f"{other} not SKSE")
+        if pending:
+            parts.append(f"{pending} not checked yet")
+        self.c_other.config(text="  \u2022  ".join(parts))
 
     def _on_pro_toggle(self):
-        # Rebuild cards from the last scan so every one shows fix buttons
-        # when pro mode is on.
+        # Rebuild cards so every scanned one shows fix buttons when
+        # pro mode is on. Unchecked cards stay unchecked.
+        scanned = list(getattr(self, "_scan_data", []))
+        pending = [c.dll_path for c in self.cards
+                   if isinstance(c, PendingCard)]
         for c in self.cards:
             c.destroy()
         self.cards.clear()
-        for dll, info, v in getattr(self, "_scan_data", []):
-            self._add_card(dll, info, v)
+        for dll in pending:
+            card = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
+            self._place_card(card)
+            self.cards.append(card)
+        for dll, info, v in scanned:
+            card = PluginCard(self.sf.inner, dll, info, v,
+                              on_fix_one=self._fix_single,
+                              force_fix=self.pro_mode.get())
+            self._place_card(card)
+            self.cards.append(card)
+        if self.work.busy:
+            for c in self.cards:
+                c.set_working(True)
+        self._update_summary()
 
     def _clear_cards(self):
         for c in self.cards:
@@ -1872,9 +2009,8 @@ class AutoPorterGUI:
 def main():
     root = tk.Tk()
     app = AutoPorterGUI(root)
-    # Auto-scan on startup if the game exe + plugins dir are present.
     if app.game_exe and app._plugins() and app._plugins().exists():
-        root.after(100, app.scan)
+        app.list_dlls()
     root.mainloop()
 
 

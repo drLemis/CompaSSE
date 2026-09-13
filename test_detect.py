@@ -729,6 +729,85 @@ def main():
         check("T26.drop-back", str(_sc.drop_btn.cget("state")) == "normal", "")
         _r26.destroy()
 
+    # ---------------------------------------------------------------- T27: list + per-card scan
+    try:
+        import tkinter as tk
+        _r27 = tk.Tk()
+        _r27.withdraw()
+    except Exception as _e:
+        check("T27.gui-skip", True, f"no display ({_e})")
+    else:
+        import time as _time
+        _fake = tmp / "fakegame"
+        _plug27 = _fake / "Data" / "SKSE" / "Plugins"
+        _plug27.mkdir(parents=True)
+        (_fake / "SkyrimSE.exe").write_bytes(b"")
+        for _n in ("a.dll", "b.dll", "c.dll"):
+            (_plug27 / _n).write_bytes(make_pe64(
+                [(".text", 0x1000, 0x100, 0x400, 0x100)]))
+        _app27 = G.AutoPorterGUI(_r27)
+        _app27.game_exe = _fake / "SkyrimSE.exe"
+
+        check("T27.list", _app27.list_dlls() is True
+              and sum(isinstance(c, G.PendingCard) for c in _app27.cards) == 3,
+              f"{len(_app27.cards)} cards")
+        check("T27.pending-text", "3 not checked yet" in _app27.c_other.cget("text"),
+              _app27.c_other.cget("text"))
+        check("T27.scan-all-label", _app27.scan_btn.cget("text") == "Scan all",
+              _app27.scan_btn.cget("text"))
+
+        _errs27 = []
+        _orig27 = G.messagebox.showerror
+        G.messagebox.showerror = lambda *a, **k: _errs27.append(a)
+        _res27 = {"done": False}
+        try:
+            _first = _app27.cards[0]
+            _app27._scan_single(_first)
+            _deadline27 = _time.time() + 20.0
+
+            def _tick27():
+                if _res27["done"]:
+                    return
+                replaced = not any(
+                    isinstance(c, G.PendingCard)
+                    and c.dll_path == _first.dll_path
+                    for c in _app27.cards)
+                settled = replaced and not _app27.work.busy
+                if not settled and _time.time() < _deadline27:
+                    _r27.after(50, _tick27)
+                    return
+                _res27["single"] = replaced and not _app27.work.busy
+                _second = next((c for c in _app27.cards
+                                if isinstance(c, G.PendingCard)), None)
+                if _second is not None and _app27.work.acquire():
+                    _app27._scan_single(_second)
+                    _res27["refuse"] = (
+                        _second in _app27.cards
+                        and isinstance(_second, G.PendingCard)
+                        and _app27.work.busy)
+                    _app27.work.release()
+                else:
+                    _res27["refuse"] = None
+                _res27["done"] = True
+                _r27.quit()
+
+            _r27.after(50, _tick27)
+            _r27.after(25000, _r27.quit)
+            _r27.mainloop()
+            check("T27.single", _res27.get("single") and not _errs27,
+                  f"errs={_errs27} res={_res27}")
+            check("T27.single-count",
+                  "2 not checked yet" in _app27.c_other.cget("text"),
+                  _app27.c_other.cget("text"))
+            check("T27.scan-data",
+                  any(d == _first.dll_path for d, _, _ in _app27._scan_data),
+                  "missing entry")
+            check("T27.refuse", _res27.get("refuse") is True,
+                  f"res={_res27}")
+        finally:
+            G.messagebox.showerror = _orig27
+        _r27.destroy()
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
