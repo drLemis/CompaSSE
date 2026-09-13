@@ -808,6 +808,67 @@ def main():
             G.messagebox.showerror = _orig27
         _r27.destroy()
 
+    # ---------------------------------------------------------------- T25: notice vs old game
+    # Withdrawn root + real 1.6.1170 exe + legacy table: the yellow
+    # notice must appear (this stayed silent before the legacy fix).
+    try:
+        import tkinter as tk
+        _root = tk.Tk()
+        _root.withdraw()
+    except Exception as _e:
+        check("T25.gui-skip", True, f"no display ({_e})")
+    else:
+        import compasse_gui as _G
+        from pathlib import Path as _P
+        _old = _P(r"C:\Users\Lemis\AppData\Local\Temp\opencode\oldexe\SkyrimSE-1.6.1170.exe.unpacked.exe")
+        _packed = C.runtime_version_from_exe(_old) if _old.exists() else None
+        _game = C.unpack_version(_packed) if _packed else None
+        if _game is None:
+            check("T25.gui-skip", True, "old exe unreadable")
+        else:
+            _gs = f"{_game[0]}.{_game[1]}.{_game[2]}"
+            _plug = tmp / "plug25"
+            (_plug / "CompaSSE").mkdir(parents=True)
+            (_plug / "CompaSSE" / "translation_table.bin").write_bytes(
+                b"TRTL" + struct.pack("<I", 1) + struct.pack("<I", 0))
+            _app = _G.AutoPorterGUI(_root)
+            _app.game_exe = _old
+            _app._check_table_stamp(_plug)
+            _root.update_idletasks()
+            check("T25.legacy-shows",
+                  _app.notice_frame.winfo_manager() == "pack"
+                  and _gs in _app.notice_lbl.cget("text"),
+                  _app.notice_lbl.cget("text"))
+            (_plug / "CompaSSE" / "translation_table.bin").write_bytes(
+                C._encode_table_header(3, _gs) + struct.pack("<I", 0))
+            _app._check_table_stamp(_plug)
+            _root.update_idletasks()
+            check("T25.match-hides",
+                  _app.notice_frame.winfo_manager() == "", "still packed")
+            (_plug / "CompaSSE" / "translation_table.bin").write_bytes(
+                C._encode_table_header(3, "9.9.9") + struct.pack("<I", 0))
+            _app._check_table_stamp(_plug)
+            _root.update_idletasks()
+            check("T25.stale-shows",
+                  _app.notice_frame.winfo_manager() == "pack"
+                  and "9.9.9" in _app.notice_lbl.cget("text"),
+                  _app.notice_lbl.cget("text"))
+        _root.destroy()
+
+    # ---------------------------------------------------------------- T28: game version line
+    _old28 = Path(r"C:\Users\Lemis\AppData\Local\Temp\opencode\oldexe\SkyrimSE-1.6.1170.exe.unpacked.exe")
+    if _old28.exists():
+        check("T28.version", G.game_version_line(_old28) ==
+              f"Game: {_old28.name} (1.6.1170)", G.game_version_line(_old28))
+    else:
+        check("T28.version-skip", True, "no old exe around")
+    check("T28.none", G.game_version_line(None) == "Game: SkyrimSE.exe",
+          G.game_version_line(None))
+    _empty28 = tmp / "empty28.exe"
+    _empty28.write_bytes(b"")
+    check("T28.unreadable", G.game_version_line(_empty28) == "Game: empty28.exe",
+          G.game_version_line(_empty28))
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

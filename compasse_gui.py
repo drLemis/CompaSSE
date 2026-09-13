@@ -45,6 +45,15 @@ def plugins_dir_for(game_exe):
     game_dir = Path(game_exe).resolve().parent
     return game_dir / "Data" / "SKSE" / "Plugins"
 
+
+def game_version_line(game_exe):
+    """'Game: SkyrimSE.exe (1.7.104)'; version omitted when unreadable."""
+    name = Path(game_exe).name if game_exe else "SkyrimSE.exe"
+    ver = core.unpack_version(core.runtime_version_from_exe(game_exe)) \
+        if game_exe else None
+    line = f"Game: {name}"
+    return f"{line} ({ver[0]}.{ver[1]}.{ver[2]})" if ver else line
+
 # ---------------------------------------------------------------------------
 # Theme constants
 # ---------------------------------------------------------------------------
@@ -1605,6 +1614,7 @@ class AutoPorterGUI:
         self.scan_btn.config(state=state)
         self.clear_btn.config(state=state)
         self.pro_btn.config(state=state)
+        self.rebuild_btn.config(state=state)
         for c in self.cards:
             c.set_working(working)
         self.root.title(f"CompaSSE v{core.VERSION} - {desc}" if working
@@ -1654,7 +1664,7 @@ class AutoPorterGUI:
         pf = tk.Frame(parent, bg=BG)
         pf.pack(fill="x", padx=10, pady=(10, 4))
         if self.game_exe:
-            tk.Label(pf, text=f"Game: {self.game_exe.name}",
+            tk.Label(pf, text=game_version_line(self.game_exe),
                      font=(FONT_FAMILY, 10, "bold"),
                      fg=TEXT_PRIMARY, bg=BG, anchor="w").pack(fill="x")
             self.plugins_hint = tk.Label(
@@ -1686,6 +1696,22 @@ class AutoPorterGUI:
             fg="#b91c1c", bg=BG, activebackground=BG,
             selectcolor=BG, cursor="hand2")
         self.pro_btn.pack(side="left", padx=(12, 0))
+
+        # ── Data notice (hidden until a scan finds stale helper data) ──
+        self.notice_frame = tk.Frame(parent, bg="#fef3c7")
+        self.notice_lbl = tk.Label(
+            self.notice_frame, text="", font=(FONT_FAMILY, 9),
+            fg="#713f12", bg="#fef3c7", anchor="w", justify="left")
+        self.notice_lbl.pack(side="left", fill="x", expand=True,
+                             padx=(10, 6), pady=6)
+        self.rebuild_btn = tk.Button(
+            self.notice_frame, text="Update now",
+            font=(FONT_FAMILY, 9, "bold"),
+            relief="raised", bd=1, padx=12, pady=2,
+            bg="#fde047", fg="#422006",
+            activebackground="#facc15", activeforeground="#1a2e05",
+            cursor="hand2", command=self.rebuild_translations)
+        self.rebuild_btn.pack(side="right", padx=(0, 10), pady=6)
 
         # ── Summary bar ──
         sf = tk.Frame(parent, bg=BG)
@@ -1747,6 +1773,7 @@ class AutoPorterGUI:
                 "Error", f"Plugins folder not found:\n{plugins}")
             return
         self._clear_cards()
+        self._check_table_stamp(plugins)
         self._ctx = None
         self._counts = {}
         self._scan_data = []
@@ -1827,6 +1854,74 @@ class AutoPorterGUI:
             )
 
         self.root.after(0, self._update_summary)
+
+    def _check_table_stamp(self, plugins):
+        """Warn when helper data doesn't match the game, offer rebuild."""
+        self.notice_frame.pack_forget()
+        if self.game_exe is None:
+            return
+        packed = core.runtime_version_from_exe(self.game_exe)
+        game = core.unpack_version(packed) if packed else None
+        if game is None:
+            return
+        game_str = f"{game[0]}.{game[1]}.{game[2]}"
+        try:
+            state, stamp = core.table_state(plugins, game_str)
+        except Exception:
+            return
+        if state == "ok":
+            return
+        if state == "stale":
+            text = (f"Helper data is for game {stamp}, but your game is "
+                    f"{game_str}. Some old mods may not work until it is "
+                    f"updated.")
+            button = "Update now"
+        elif state == "legacy":
+            text = (f"Helper data is outdated and may not match game "
+                    f"{game_str}. Some old mods may not work until it is "
+                    f"updated.")
+            button = "Update now"
+        else:
+            text = (f"Helper data is missing. Some old mods may not work "
+                    f"until it is created.")
+            button = "Create now"
+        self.notice_lbl.config(text=text)
+        self.rebuild_btn.config(text=button, state="normal")
+        self.notice_frame.pack(fill="x", padx=10, pady=(4, 0))
+
+    def rebuild_translations(self):
+        plugins = self._plugins()
+        if plugins is None:
+            messagebox.showerror(
+                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
+            return
+        if not plugins.exists():
+            messagebox.showerror(
+                "Error", f"Plugins folder not found:\n{plugins}")
+            return
+        if not self.work.acquire("Updating helper data..."):
+            return
+        _launch(self.root, self.work, lambda: self._rebuild_worker(plugins))
+
+    def _rebuild_worker(self, plugins):
+        try:
+            ver = core.runtime_version_from_exe(self.game_exe)
+            core.build_translations(str(self.game_exe), plugins,
+                                    game_version=ver)
+        except Exception as exc:
+            msg = str(exc)
+            if "No old version bins" in msg:
+                msg = ("Could not find older game data files. Make sure "
+                       "Address Library is installed, then try again.")
+            self.root.after(
+                0, lambda: messagebox.showerror("Error", msg))
+            self.root.after(
+                0, lambda: self.rebuild_btn.config(state="normal"))
+            return
+        self.root.after(
+            0, lambda: messagebox.showinfo(
+                "Done", "Helper data is up to date for your game."))
+        self.root.after(0, lambda: self.notice_frame.pack_forget())
 
     def _add_scanned_card(self, dll, info, v):
         card = PluginCard(self.sf.inner, dll, info, v,
@@ -1933,6 +2028,7 @@ class AutoPorterGUI:
         for c in self.cards:
             c.destroy()
         self.cards.clear()
+        self.notice_frame.pack_forget()
         self.c_need.config(text="")
         self.c_ok.config(text="")
         self.c_other.config(text="")
@@ -2011,6 +2107,7 @@ def main():
     app = AutoPorterGUI(root)
     if app.game_exe and app._plugins() and app._plugins().exists():
         app.list_dlls()
+        app._check_table_stamp(app._plugins())
     root.mainloop()
 
 
