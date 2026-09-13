@@ -1673,6 +1673,25 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
                         "hooks": len(hooks)},
         }
 
+    # NEWER: built for a game newer than the running one. Flag patches
+    # can't bridge that: its offsets/structs are for the newer runtime.
+    if declared_tup and run_tup and declared_tup > run_tup:
+        behind = [c for c in STRUCTURAL_CUTOFFS if run_tup < c <= declared_tup]
+        names = ", ".join(f"{a}.{b}.{c}" for a, b, c in behind)
+        gaps = (f" It expects game changes from ({names}) your game "
+                "doesn't have." if names else "")
+        return {
+            "name": dll_path.name,
+            "verdict": "MANUAL",
+            "reason": (f"Built for a newer game "
+                       f"({_packed_to_ver(vi['runtime_ver'])}) than yours "
+                       f"({_packed_to_ver(runtime_version)}).{gaps} Flag "
+                       f"patches can't help - ask the author for a build "
+                       f"for your game."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
     # BROKEN: old build, no version independence, nothing patchable.
     # Signature scanners never land here.
     if old_build and not has_vi and not needs_fix:

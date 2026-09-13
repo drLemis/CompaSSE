@@ -639,13 +639,18 @@ static void ensure_buffers(const wchar_t* binPath) {
             shim_log("ensure_buffers: transcode merged fmt2 -> fmt1 failed");
             return;
         }
-        // g_fmt5_patched: copy of raw fmt5 with translated offsets patched in.
+        // Fill absent slots only: a present offset is correct for this game.
         g_fmt5_patched = src;
         {
             int patched = 0;
             for (const auto& te : g_flatTranslations) {
                 if (te.old_id * 4 + 96 + 4 <= g_fmt5_patched.size()) {
                     size_t pos = 96 + (size_t)te.old_id * 4;
+                    uint32_t cur = (uint32_t)g_fmt5_patched[pos]
+                        | ((uint32_t)g_fmt5_patched[pos + 1] << 8)
+                        | ((uint32_t)g_fmt5_patched[pos + 2] << 16)
+                        | ((uint32_t)g_fmt5_patched[pos + 3] << 24);
+                    if (cur != 0) continue;
                     uint32_t v = (uint32_t)te.offset;
                     g_fmt5_patched[pos]     = (uint8_t)(v & 0xFF);
                     g_fmt5_patched[pos + 1] = (uint8_t)((v >> 8) & 0xFF);
@@ -654,6 +659,8 @@ static void ensure_buffers(const wchar_t* binPath) {
                     patched++;
                 }
             }
+            if (patched > 0)
+                shim_log("ensure_buffers: fmt5 filled %d missing ID(s)", patched);
         }
     } else if (srcFmt == 1 || srcFmt == 2) {
         // Source is format 1/2: build canonical fmt2 (never serve a fmt1 blob

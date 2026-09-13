@@ -377,6 +377,20 @@ def classify(info, build_year, runtime_version=None):
         return _base("OK", "OK", "OK",
                      f"Declares your game version ({run_str}). Built for it - leave it alone.")
 
+    # Built for a game newer than the running one: flags can't bridge that.
+    if declared_tup and run_tup and declared_tup > run_tup:
+        behind = [c for c in core.STRUCTURAL_CUTOFFS
+                  if run_tup < c <= declared_tup]
+        names = ", ".join(f"{a}.{b}.{c}" for a, b, c in behind)
+        why = (f"Built for a newer game ({version}) than yours ({run_str}). "
+               "Patching its flags won't help.")
+        if names:
+            why += (f" It expects game changes from ({names}) "
+                    "your game doesn't have.")
+        why += " Ask the author for a version for your game."
+        return _base("MANUAL", "MANUAL CHECK", "MANUAL", why,
+                     "Needs a build for your game.", False, False, [])
+
     if has_unknown:
         return _base("MANUAL", "MANUAL CHECK", "MANUAL",
                      (f"Unknown versionIndependence flags "

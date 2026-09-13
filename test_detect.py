@@ -667,6 +667,19 @@ def main():
     check("T22e.no-rewrite", pe.read_bytes() == before, repr(acts))
     check("T22e.skip-note", any("pre-V5 runtime" in a for a in acts), repr(acts))
 
+    # ---------------------------------------------------------------- T29: downgrade (mod newer than game)
+    pn = tmp / "t29n.dll"
+    make_plugin(pn, 0x5, 0x2, [r19], 2025)
+    an = C._audit_plugin(pn, old19)
+    check("T29.audit", an["verdict"] == "MANUAL" and "newer" in an["reason"],
+          an["verdict"] + " | " + an["reason"])
+    vn = G.classify(C.analyze_plugin(pn, old19, include_hooks=False), 2025, old19)
+    check("T29.gui", vn["cat"] == "MANUAL" and "newer" in vn["why"]
+          and not vn["needs_fix"], vn["cat"])
+    before29 = pn.read_bytes()
+    acts29 = C.fix_plugin(pn, None, None, None, runtime_version=old19, dry_run=False)
+    check("T29.noop", pn.read_bytes() == before29 and not acts29, repr(acts29))
+
     # ---------------------------------------------------------------- T26: one operation at a time
     seq26 = []
     w26 = G.BusyState()
