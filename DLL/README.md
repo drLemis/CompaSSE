@@ -266,12 +266,23 @@ import table. This happens in `decoder_detect.cpp`.
 | `CreateFileMapping*` + `istream` symbols | `DECODER_V5` | Format 2 *     |
 | `CreateFileMapping*` only (no istream)   | `DECODER_V2` | Format 2       |
 | `istream` symbols only (no mmap)         | `DECODER_V1` | Format 1       |
-| Neither / caller unresolvable            | —            | Format 2 *     |
+| Neither / caller unresolvable            | -            | Format 2 *     |
 
 \* `DECODER_V5` does not route to passthrough: the heuristic misfires on
 CommonLibSSE-NG <= 3.7 (cache-mmap false positives), so the whole
 ambiguous bucket gets the faithful fmt2 temp instead. There is no
 per-mod allowlist - filenames are not capabilities.
+
+### V5-native detection (string markers)
+
+Import tables cannot tell a 1.7-era dual V2/V5 reader (binary_io stream,
+no mmap, no std::istream) from an old fmt2-only module, so a second
+signal scans the caller's `.rdata`/`.data` for V5-only strings
+(`AddressLibraryV5`, `Address Library V5`,
+`not an Address Library V5 file`, the `AddressLibV2` fallback path).
+Pre-V5 binaries predate those strings, so any hit positively proves a V5
+branch and the caller is served the translated fmt5 temp
+(`module_supports_fmt5`, cached per module, SEH-guarded).
 
 **Why this works:** CommonLibSSE's address library reader evolved alongside
 its I/O strategy:
@@ -378,6 +389,8 @@ caller reads the temp file as if it were the real address library.
 ```
 Caller requests current-version versionlib-*.bin
 +- Caller is SKSE -> pass-through (real file)
++- Caller has V5 string markers (dual V2/V5 reader) -> fmt5 temp
++   (translated dense bytes: native zero slots, minted missing IDs)
 +- Caller is V1 (istream only, old CommonLibSSE) -> fmt1 temp file
 +- Anyone else (V2, V5-heuristic, unresolvable) -> faithful fmt2 temp
    (all IDs incl. zeros + translations).
@@ -539,11 +552,20 @@ Data/SKSE/Plugins/!CompaSSE.log
 ### Caller identification
 Some mods call address library APIs through syscall stubs or deeply inlined
 code, causing `resolve_caller_module()` to return null. Those callers join
-the ambiguous bucket (faithful fmt2 temp). The residual risk is a
-fmt5-*only* reader that cannot be identified; no such mod has been observed
-(all observed fmt5 readers also parse fmt2). If one ever appears, its
-"Unsupported address library format: 2" dialog together with the serve
-log identifies it in one step.
+the ambiguous bucket (faithful fmt2 temp). Dual V2/V5 readers with a failed
+stack walk land here too: they still parse the fmt2 temp through their V2
+branch (data-identical for present IDs), diverging from the real file only
+for absent IDs. The serve log (`dualV5=`, `decoder=`) names the decision
+per caller, so a misroute is identifiable in one run.
+
+### V5-native detection
+Callers containing V5-only strings are served the translated fmt5 temp.
+A pre-V5 binary cannot contain those strings (verified: the marker set is
+parity-tested in `test_detect.py` T20 against the exact list in
+`decoder_detect.cpp`), so false positives are not expected. If one ever
+appears (a mod serving fmt5 bytes that only parses fmt2), its
+"Unsupported address library format: 5" dialog together with the serve
+log identifies it in one step - same workflow as before.
 
 ### Translation table coverage
 The translation table covers known ID remappings between major game versions.

@@ -493,6 +493,31 @@ def main():
     check("T19.gui-builtforyou", v19c["cat"] == "OK"
           and "leave it alone" in v19c["why"], v19c["cat"])
 
+    # ---------------------------------------------------------------- T20: fmt5 markers
+    # Shim parity: kFmt5Markers == compasse.FMT5_MARKERS.
+    import re as _re
+    dec_cpp = (HERE / "DLL" / "decoder_detect.cpp").read_text(encoding="utf-8")
+    cpp_markers = set(_re.findall(r'"((?:AddressLibraryV5|Address Library V5|'
+                                  r'not an Address Library V5 file|AddressLibV2)[^"]*)"',
+                                  dec_cpp))
+    check("T20.parity",
+          {m.decode() for m in C.FMT5_MARKERS} <= cpp_markers,
+          repr(cpp_markers))
+    neg = bytearray(make_pe64([(".text", 0x1000, 0x100, 0x400, 0x100),
+                               (".rdata", 0x2000, 0x100, 0x800, 0x100)]))
+    neg[0x800:0x800 + 24] = b"Unsupported address library"
+    neg[0x820:0x820 + 12] = b"versionlib-"
+    check("T20.old-neg", C.module_supports_fmt5_bytes(bytes(neg)) is False,
+          "old strings must not match")
+    for i, marker in enumerate(C.FMT5_MARKERS):
+        pos = bytearray(bytes(neg))
+        pos[0x840 + i * 64:0x840 + i * 64 + len(marker)] = marker
+        check(f"T20.pos-{i}", C.module_supports_fmt5_bytes(bytes(pos)) is True,
+              repr(marker))
+    check("T20.case", C.module_supports_fmt5_bytes(b"addresslibraryv5") is False,
+          "markers are case-sensitive")
+    check("T20.empty", C.module_supports_fmt5_bytes(b"") is False, "empty")
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

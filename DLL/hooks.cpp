@@ -726,15 +726,18 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
     // Pass through by default, transcode only on format mismatch
     DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
     int format;
-    if (hasVersionPrefix) {
+    bool dualV5 = caller && module_supports_fmt5(caller);
+    if (dualV5) {
+        // Dual V2/V5 reader: native dense semantics (zero slots).
+        format = 5;
+    } else if (hasVersionPrefix) {
         shim_log("serve %ls -> pass-through version- file for %ls (decoder=%d)",
                  path, modName[0] ? modName : L"(unknown)", (int)type);
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     } else if (type == DECODER_V1) format = 1;
     else format = 2;
 
-    // Transcode the requested file itself to the caller's format; only
-    // fmt1/fmt2 temps are ever served (nothing routes to fmt5).
+    // fmt5 temps go only to detected dual readers; rest keeps fmt1/2.
     AcquireSRWLockExclusive(&g_lock);
     ensure_buffers(path);
     if (g_loadFailed) {
@@ -751,8 +754,8 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
     const wchar_t* tempPath = tempFmt == 5 ? g_tempPath5 : tempFmt == 1 ? g_tempPath1 : tempFmt == 0 ? g_tempPath0 : g_tempPath2;
     ReleaseSRWLockExclusive(&g_lock);
 
-    shim_log("serve %ls -> format %d (transcoded, decoder=%d) for %ls", path, tempFmt,
-             (int)type, modName[0] ? modName : L"(unknown)");
+    shim_log("serve %ls -> format %d (transcoded, decoder=%d, dualV5=%d) for %ls", path, tempFmt,
+             (int)type, dualV5 ? 1 : 0, modName[0] ? modName : L"(unknown)");
 
     return fpCreateFileW(tempPath, access, share, sa, disp, flags, tmpl);
 }

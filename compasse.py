@@ -70,6 +70,21 @@ def crossed_cutoffs(declared, running):
 _BUILD_TIME_SENTINEL = 520128000      # 1986-06-19 (sentinel "no timestamp")
 _BUILD_TIME_CUTOFF = 1748217600       # 2025-05-26
 
+# V5-native reader markers. Mirrored by module_supports_fmt5 in
+# DLL/decoder_detect.cpp; keep in sync (test_detect.py T20).
+FMT5_MARKERS = (
+    b"AddressLibraryV5",
+    b"Address Library V5",
+    b"not an Address Library V5 file",
+    b"AddressLibV2",
+)
+
+def module_supports_fmt5_bytes(data):
+    """Raw-bytes mirror of the shim's module_supports_fmt5."""
+    if not data:
+        return False
+    return any(m in data for m in FMT5_MARKERS)
+
 
 def runtime_version_from_exe(exe_path):
     """Packed runtime version (e.g. 1.7.104.0 -> 0x01070680) from the exe.

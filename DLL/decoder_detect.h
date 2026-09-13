@@ -10,6 +10,11 @@ enum DecoderType { DECODER_NONE = 0, DECODER_V1 = 1, DECODER_V2 = 2, DECODER_V5 
 //   neither        -> DECODER_V2 (default)
 DecoderType detect_decoder(HMODULE mod);
 
+// True when the module parses Address Library format 5 natively
+// (1.7-era dual V2/V5 readers). String markers in .rdata/.data;
+// pre-V5 binaries predate them. Mirror: compasse.py FMT5_MARKERS.
+bool module_supports_fmt5(HMODULE mod);
+
 // Walk the stack (RtlCaptureStackBackTrace, up to 8 frames) and return the
 // first module that is not a system/CRT module and not the shim itself.
 // Returns nullptr if none found.

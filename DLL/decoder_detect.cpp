@@ -107,3 +107,81 @@ DecoderType decoder_for_module(HMODULE mod, HMODULE self_module) {
     LeaveCriticalSection(&cache.cs);
     return t;
 }
+
+// V5-only strings. Pre-V5 binaries predate them; keep in sync with
+// compasse.py FMT5_MARKERS.
+static const char* const kFmt5Markers[] = {
+    "AddressLibraryV5",
+    "Address Library V5",
+    "not an Address Library V5 file",
+    "AddressLibV2",
+};
+
+static bool scan_markers(const uint8_t* base, size_t size) {
+    for (const char* m : kFmt5Markers) {
+        size_t len = strlen(m);
+        if (len == 0 || len > size)
+            continue;
+        const uint8_t* p = base;
+        const uint8_t* end = base + size - len + 1;
+        for (; p < end; ++p) {
+            if (p[0] == (uint8_t)m[0] && memcmp(p, m, len) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+// POD-only locals: __try must not share scope with C++ objects (C2712).
+static bool scan_module_fmt5(HMODULE mod) {
+    const auto* dos = (const IMAGE_DOS_HEADER*)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const auto* nt = (const IMAGE_NT_HEADERS64*)((const uint8_t*)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return false;
+    const auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        char name[9] = {};
+        memcpy(name, sec->Name, 8);
+        if (strcmp(name, ".rdata") != 0 && strcmp(name, ".data") != 0)
+            continue;
+        // A fault here must never take down the game.
+        __try {
+            const uint8_t* base = (const uint8_t*)mod + sec->VirtualAddress;
+            if (scan_markers(base, sec->Misc.VirtualSize))
+                return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    return false;
+}
+
+bool module_supports_fmt5(HMODULE mod) {
+    if (!mod)
+        return false;
+
+    struct Cache {
+        std::unordered_map<HMODULE, bool> map;
+        CRITICAL_SECTION cs;
+        Cache() { InitializeCriticalSection(&cs); }
+        ~Cache() { DeleteCriticalSection(&cs); }
+    };
+    static Cache cache; // same static-init pattern as the decoder cache
+    EnterCriticalSection(&cache.cs);
+    auto it = cache.map.find(mod);
+    if (it != cache.map.end()) {
+        bool cached = it->second;
+        LeaveCriticalSection(&cache.cs);
+        return cached;
+    }
+    LeaveCriticalSection(&cache.cs);
+
+    bool found = scan_module_fmt5(mod);
+
+    EnterCriticalSection(&cache.cs);
+    cache.map[mod] = found;
+    LeaveCriticalSection(&cache.cs);
+    return found;
+}
