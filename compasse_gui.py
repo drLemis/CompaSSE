@@ -220,12 +220,14 @@ def _get_build_date_str(dll_path):
     return dt.strftime("%Y %B %d").replace(" 0", " ")
 
 
-def classify(info, build_year, runtime_version=None):
+def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None):
     """Turn analyze_plugin output + build year into a verdict dict.
 
     runtime_version (packed, from the user's game exe) enables the
     built-for-you branches: a plugin declaring the running version is
     judged against its own era, not current flag fashion.
+    dll_path + id_set enable the xref check: real game addresses in
+    the binary override flags claiming no Address Library.
     """
     flag = info.get("flag")
     vi = info.get("version_indep")
@@ -350,6 +352,17 @@ def classify(info, build_year, runtime_version=None):
                          why, "Patch the flags so SKSE accepts it.", True, True, items)
 
         if old and not addrlib:
+            xref = None
+            if dll_path is not None and id_set:
+                xref = core.count_xref_ids(dll_path, id_set)
+            if xref:
+                return _base("MANUAL", "MANUAL CHECK", "MANUAL",
+                             (f"Built {build_year} (old). Flags say no Address "
+                              f"Library but {xref} game address(es) found - "
+                              "flags may be misdeclared. Try it first - patch "
+                              "only if the game rejects it."),
+                             "Try loading first; patch on rejection.",
+                             False, True, items)
             why = (f"Built {build_year} (old). Does not use Address Library. "
                    "Likely has hardcoded Skyrim addresses. "
                    "Auto-patching would break it.")
@@ -1982,7 +1995,8 @@ class AutoPorterGUI:
                 continue
             build_year = _get_build_year(dll)
             build_date = _get_build_date_str(dll)
-            v = classify(info, build_year, runtime_version)
+            v = classify(info, build_year, runtime_version, dll,
+                         set(addr_lib) if addr_lib else None)
             v["build_date"] = build_date
             if exe_data is not None and addr_lib is not None:
                 stale = count_stale_hooks(info.get("hooks"), exe_data,
@@ -2094,7 +2108,8 @@ class AutoPorterGUI:
         except OSError:
             return
         build_year = _get_build_year(card.dll_path)
-        v = classify(info, build_year, runtime_version)
+        v = classify(info, build_year, runtime_version, card.dll_path,
+                     set(addr_lib) if addr_lib else None)
         v["build_date"] = _get_build_date_str(card.dll_path)
         if exe_data is not None and addr_lib is not None:
             stale = count_stale_hooks(info.get("hooks"), exe_data,

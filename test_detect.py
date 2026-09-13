@@ -616,7 +616,7 @@ def main():
         struct.pack_into("<I", blob, eo + 0x40, 0x2000)
         struct.pack_into("<I", blob, eo + 0x50, 0x3070)
         struct.pack_into("<H", blob, eo + 0x60, 0)
-        blob[eo + 0x70:eo + 0x70 + 18] = b"SKSEPlugin_Version\x00"
+        blob[eo + 0x70:eo + 0x70 + 19] = b"SKSEPlugin_Version\x00"
         path.write_bytes(bytes(blob))
 
     r1170 = (1 << 24) | (6 << 16) | (1170 << 4)
@@ -711,6 +711,52 @@ def main():
     acts36 = C.fix_plugin(ph, None, None, None, runtime_version=r19, dry_run=False)
     check("T36.untouched", ph.read_bytes() == before36, repr(acts36))
     check("T36.skip", any("hardcoded" in a for a in acts36), repr(acts36))
+
+    # ---------------------------------------------------------------- T37: lying flags
+    # No-Address-Library flags, but a RIP-read slot holds a known ID.
+    def make_plugin_xref(path, indep, ex, compat, year, slot_id):
+        spec = [(".text", 0x1000, 0x200, 0x400, 0x200),
+                (".rdata", 0x2000, 0x600, 0x600, 0x600),
+                (".edata", 0x3000, 0x200, 0xC00, 0x200),
+                (".pdata", 0x4000, 0x30, 0xE00, 0x30)]
+        ts = int(datetime(year, 6, 1, tzinfo=_tz.utc).timestamp())
+        blob = bytearray(make_pe64(spec, export=(0x3000, 0x200), timestamp=ts))
+        code = bytearray(b"\x90" * 0x200)
+        code[0:7] = bytes([0x48, 0x8D, 0x05, 0xF9, 0x10, 0x00, 0x00])
+        blob[0x400:0x600] = code
+        struct.pack_into("<Q", blob, 0x700, slot_id)
+        struct.pack_into("<III", blob, 0xE00, 0x1000, 0x1010, 0)
+        struct.pack_into("<I", blob, 0x600 + 0x304, ex)
+        struct.pack_into("<I", blob, 0x600 + 0x308, indep)
+        for i, v in enumerate(compat[:16]):
+            struct.pack_into("<I", blob, 0x600 + 0x30C + i * 4, v)
+        eo = 0xC00
+        struct.pack_into("<I", blob, eo + 24, 1)
+        struct.pack_into("<I", blob, eo + 28, 0x3040)
+        struct.pack_into("<I", blob, eo + 32, 0x3050)
+        struct.pack_into("<I", blob, eo + 36, 0x3060)
+        struct.pack_into("<I", blob, eo + 0x40, 0x2000)
+        struct.pack_into("<I", blob, eo + 0x50, 0x3070)
+        struct.pack_into("<H", blob, eo + 0x60, 0)
+        blob[eo + 0x70:eo + 0x70 + 19] = b"SKSEPlugin_Version\x00"
+        path.write_bytes(bytes(blob))
+
+    px = tmp / "t37x.dll"
+    make_plugin_xref(px, 0x0, 0x0, [old19], 2023, 7000)
+    check("T37.count", C.count_xref_ids(px, {7000}) == 1,
+          repr(C.count_xref_ids(px, {7000})))
+    ax = C._audit_plugin(px, r19, {7000})
+    check("T37.audit", ax["verdict"] == "MANUAL" and "misdeclared" in ax["reason"],
+          ax["verdict"] + " | " + ax["reason"])
+    vx = G.classify(C.analyze_plugin(px, r19, include_hooks=False), 2023, r19,
+                    px, {7000})
+    check("T37.gui", vx["cat"] == "MANUAL" and "misdeclared" in vx["why"],
+          vx["cat"])
+    # Without an ID set there is nothing to corroborate: stays red.
+    ax0 = C._audit_plugin(px, r19)
+    check("T37.nolib", ax0["verdict"] == "BROKEN", ax0["verdict"])
+    vx0 = G.classify(C.analyze_plugin(px, r19, include_hooks=False), 2023, r19)
+    check("T37.gui-red", vx0["cat"] == "DANGEROUS", vx0["cat"])
 
     # ---------------------------------------------------------------- T31: PRO mode keeps the hatch
     try:

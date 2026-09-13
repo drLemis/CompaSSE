@@ -1790,6 +1790,19 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
     # BROKEN: needs flags but hardcoded offsets - patching only converts
     # SKSE's clean reject into a load-and-crash.
     if needs_fix and not has_vi:
+        # Lying flags? Real game addresses in the binary override them.
+        xref = count_xref_ids(dll_path, id_set) if id_set else None
+        if xref:
+            return {
+                "name": dll_path.name,
+                "verdict": "MANUAL",
+                "reason": (f"Built {build_year or '?'}, flags say no Address "
+                           f"Library but {xref} game address(es) found in the "
+                           f"binary - flags may be misdeclared. Try it "
+                           f"unpatched first, patch only if SKSE rejects it."),
+                "details": {"build_year": build_year, "has_addr": has_addr,
+                            "hooks": len(hooks), "xref_ids": xref},
+            }
         return {
             "name": dll_path.name,
             "verdict": "BROKEN",
