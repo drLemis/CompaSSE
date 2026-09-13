@@ -438,25 +438,19 @@ static void load_translations() {
              g_flatTranslations.size(), (size_t)verCount);
 }
 
-// Apply translation table: remap old_id -> offset for the current runtime.
-// Caller holds g_lock. Returns number of remapped entries.
+// Fill IDs the current library lacks. Never overwrites: `have` was just
+// read from the current bins, so a recorded offset can only match or
+// poison (table built for another game version). Returns added count.
 static int apply_translations(std::map<uint64_t, uint64_t>& have) {
     if (g_flatTranslations.empty()) return 0;
-    int remapped = 0;
+    int added = 0;
     for (auto& te : g_flatTranslations) {
-        auto it = have.find(te.old_id);
-        if (it != have.end()) {
-            if (it->second != te.offset) {
-                it->second = te.offset;
-                remapped++;
-            }
-        } else {
-            // ID from a version we don't have a bin for - still add it
+        if (have.find(te.old_id) == have.end()) {
             have[te.old_id] = te.offset;
-            remapped++;
+            added++;
         }
     }
-    return remapped;
+    return added;
 }
 
 // Basename must match either:
@@ -603,11 +597,27 @@ static void ensure_buffers(const wchar_t* binPath) {
         }
         if (!g_quarantine_loaded) load_quarantine();
         int quarantined = 0;
-        for (auto id : g_quarantine) quarantined += (int)have.erase(id);
+        char qids[256] = {};
+        size_t qlen = 0;
+        for (auto id : g_quarantine) {
+            if (have.erase(id)) {
+                quarantined++;
+                // Name suspects: a wrong ID here breaks every holder mod.
+                if (qlen < sizeof(qids) - 24) {
+                    int n = snprintf(qids + qlen, sizeof(qids) - qlen,
+                                     "%s%llu", qlen ? "," : "",
+                                     (unsigned long long)id);
+                    if (n > 0) qlen += (size_t)n;
+                }
+            }
+        }
         if (quarantined > 0)
-            shim_log("ensure_buffers: quarantined %d ID(s)", quarantined);
+            shim_log("ensure_buffers: quarantined %d ID(s): %s%s", quarantined,
+                     qids, quarantined > 8 ? ",..." : "");
         load_translations();
-        int remapped = apply_translations(have);
+        int added = apply_translations(have);
+        if (added > 0)
+            shim_log("ensure_buffers: translations added %d missing ID(s)", added);
         std::vector<std::pair<uint64_t, uint64_t>> merged(have.begin(), have.end());
         std::sort(merged.begin(), merged.end());
         if (!encode_format2(g_fmt2, version, name, mergedPtr, merged)) {
