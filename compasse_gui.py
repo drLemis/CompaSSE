@@ -123,8 +123,10 @@ def classify(info, build_year, runtime_version=None):
 
     old = build_year is not None and build_year < 2025
     recent = build_year is not None and build_year >= 2025
-    # versionIndependence flag bit: authoritative, matches SKSE's own check.
-    addrlib = bool(vi and vi.get("has_addr", False))
+    # versionIndependence flag bits, matching SKSE's own check. Sigs count:
+    # CommonLib treats addr OR sigs as version-independent.
+    addrlib = bool(vi and (vi.get("has_addr", False)
+                           or vi.get("has_sigs", False)))
     # Ex=0 is inert where V5 is unenforced (pre-1.7): don't flag or fix it.
     v5_here = core._v5_enforced(run_tup)
     flag_patch = flag is not None and flag.get("needs_patch", False) \
@@ -183,8 +185,8 @@ def classify(info, build_year, runtime_version=None):
         if old and addrlib:
             parts = [
                 f"Built {build_year} (old CommonLibSSE). "
-                "Uses Address Library but SKSE rejects it due to "
-                "outdated version flags.",
+                "Uses Address Library or signature scanning but SKSE "
+                "rejects it due to outdated version flags.",
             ]
             if crossed:
                 parts.append(cross_note.strip())
@@ -194,7 +196,8 @@ def classify(info, build_year, runtime_version=None):
 
         if recent and addrlib:
             why = (
-                f"Built {build_year} (recent). Uses Address Library but SKSE "
+                f"Built {build_year} (recent). Uses Address Library or "
+                "signature scanning but SKSE "
                 "still rejects it, likely missing version-independence flags "
                 "needed to declare compatibility."
             )

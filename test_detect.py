@@ -632,6 +632,13 @@ def main():
     # ...but the same DLL on 1.7.104 IS enforced.
     via19 = C.check_version_independence(pa, r19)
     check("T22a.enforced-new", via19["needs_indep"] is True, "1.7.104 flags it")
+    # B: signature scanner, no compat. Never DANGEROUS/BROKEN.
+    pb = tmp / "t22b.dll"
+    make_plugin(pb, 0x2, 0x0, [], 2023)
+    vb = G.classify(C.analyze_plugin(pb, r1170, include_hooks=False), 2023, r1170)
+    ab = C._audit_plugin(pb, r1170)
+    check("T22b.gui", vb["cat"] == "OK", vb["cat"])
+    check("T22b.audit", ab["verdict"] == "SAFE", ab["verdict"])
     # E: --fix must not touch working old-runtime Ex bytes.
     pe = tmp / "t22e.dll"
     make_plugin(pe, 0x1, 0x0, [old19], 2023)

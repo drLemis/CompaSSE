@@ -763,11 +763,15 @@ def check_version_independence(dll_path, runtime_version=None):
     #    built pre-cutoff, lacks AddressLibraryV5 in ex (1.7+ SKSE only).
     # 2. "incompatible with current version": no AddressLibraryPostAE,
     #    compatibleVersions list non-empty and runtime not in it.
+    # Pure signature scanners skip both (version-independent; their
+    # compat list is informational).
     run_tup = unpack_version(runtime_version) if runtime_version else None
     pre_cutoff = _BUILD_TIME_SENTINEL <= build_time < _BUILD_TIME_CUTOFF
     if has_addr:
         needs_indep = pre_cutoff and not has_ex_v5 \
             and _v5_enforced(run_tup)
+    elif has_sigs and not has_unknown:
+        needs_indep = False
     else:
         needs_indep = bool(compat_list) and runtime_version is not None \
             and runtime_version not in compat_list
@@ -1607,6 +1611,8 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
         }
 
     has_addr = vi.get("has_addr", False) if vi else False
+    has_sigs = vi.get("has_sigs", False) if vi else False
+    has_vi = has_addr or has_sigs
     # Ex=0 is inert where V5 is unenforced: don't rewrite working plugins.
     run_tup = unpack_version(runtime_version) if runtime_version else None
     v5_here = _v5_enforced(run_tup)
@@ -1630,8 +1636,9 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
 
     old_build = build_year is not None and build_year < 2025
 
-    # BROKEN: old build, no Address Library, likely hardcoded offsets
-    if old_build and not has_addr and not needs_fix:
+    # BROKEN: old build, no version independence, nothing patchable.
+    # Signature scanners never land here.
+    if old_build and not has_vi and not needs_fix:
         reason = (f"Built {build_year}, no Address Library. "
                   "Likely hardcoded offsets - will crash on current runtime.")
         if crossed and vi and vi.get("runtime_ver"):
@@ -1676,8 +1683,18 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
             "details": details,
         }
 
-    # NEEDS_FIX: needs flags but no address library - risky
+    # NEEDS_FIX: needs flags but no address library - risky.
     if needs_fix and not has_addr:
+        if has_sigs:
+            return {
+                "name": dll_path.name,
+                "verdict": "NEEDS_FIX",
+                "reason": ("Uses signature scanning (version-independent) "
+                           "but the Address Library V5 flag is stale. "
+                           "Patch only if SKSE rejects it."),
+                "details": {"build_year": build_year, "has_addr": has_addr,
+                            "hooks": len(hooks)},
+            }
         return {
             "name": dll_path.name,
             "verdict": "NEEDS_FIX",
@@ -1717,6 +1734,18 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
             "verdict": "SAFE",
             "reason": reason,
             "details": details,
+        }
+
+    # SAFE mechanics without Address Library: pure signature scanner.
+    if has_sigs and not needs_fix:
+        return {
+            "name": dll_path.name,
+            "verdict": "SAFE",
+            "reason": ("Uses signature scanning (version-independent). "
+                       "Should load, but that doesn't guarantee it works "
+                       "in-game." + cross_suffix),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
         }
 
     # UNKNOWN: can't determine
