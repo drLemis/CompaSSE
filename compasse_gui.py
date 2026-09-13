@@ -64,6 +64,69 @@ BADGE_COLORS = {
 
 
 # ===================================================================
+# Concurrency: one operation at a time, UI thread only
+# ===================================================================
+
+class BusyState:
+    """Global work lock across all tabs. acquire() disables every
+
+    action button via listeners; refusals must show "please wait"."""
+
+    def __init__(self):
+        self._busy = False
+        self._desc = ""
+        self._listeners = []
+
+    def listen(self, fn):
+        self._listeners.append(fn)
+
+    @property
+    def busy(self):
+        return self._busy
+
+    def acquire(self, desc="Working..."):
+        if self._busy:
+            return False
+        self._busy = True
+        self._desc = desc
+        for fn in self._listeners:
+            try:
+                fn(True, desc)
+            except Exception:
+                pass
+        return True
+
+    def set_desc(self, desc):
+        self._desc = desc
+        if self._busy:
+            for fn in self._listeners:
+                try:
+                    fn(True, desc)
+                except Exception:
+                    pass
+
+    def release(self):
+        self._busy = False
+        self._desc = ""
+        for fn in self._listeners:
+            try:
+                fn(False, "")
+            except Exception:
+                pass
+
+def _launch(root, work, fn):
+    """Run fn in a worker; work.release() back on the UI thread."""
+    def _worker():
+        try:
+            fn()
+        except Exception as exc:
+            root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+        finally:
+            root.after(0, work.release)
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# ===================================================================
 # Classification helper
 # ===================================================================
 
@@ -539,6 +602,14 @@ class PluginCard(tk.Frame):
         self._disable_all_fix()
         self.status_lbl.config(text="Working\u2026")
 
+    def set_working(self, working):
+        if not self.fix_buttons:
+            return
+        if working:
+            self._disable_all_fix()
+        else:
+            self.mark_idle()
+
     def mark_idle(self):
         if not self.fixed:
             try:
@@ -583,6 +654,7 @@ class HealerCard(tk.Frame):
         self.old_exe_sections = old_exe_sections
         self.on_heal = on_heal
         self.fixed = False
+        self._note = False
         self.selected_offset = finding.get("new_offset")
 
         auto_fix = finding.get("auto_fixable", False)
@@ -761,12 +833,18 @@ class HealerCard(tk.Frame):
             self.selected_offset = sel
         if self.selected_offset is None:
             return
-        if self.heal_btn:
-            self.heal_btn.config(state="disabled")
-        self.status_lbl.config(text="Patching...")
         patched = dict(self.finding)
         patched["new_offset"] = self.selected_offset
         self.on_heal(self, patched)
+
+    def mark_busy(self):
+        if self.heal_btn:
+            self.heal_btn.config(state="disabled")
+        self.status_lbl.config(text="Patching...")
+
+    def note(self, text):
+        self._note = True
+        self.status_lbl.config(text=text, fg=TEXT_SECONDARY)
 
     def mark_fixed(self, success, message):
         self.fixed = True
@@ -777,6 +855,27 @@ class HealerCard(tk.Frame):
             fg="#16a34a" if success else "#dc2626",
         )
 
+    def set_working(self, working):
+        if working:
+            self._snap = [(w, w.cget("state"))
+                          for w in [self.heal_btn, *self.candidate_buttons]
+                          if w is not None]
+            for w, _ in self._snap:
+                try:
+                    w.config(state="disabled")
+                except Exception:
+                    pass
+        elif not self.fixed:
+            for w, st in getattr(self, "_snap", []):
+                try:
+                    w.config(state=st)
+                except Exception:
+                    pass
+            self._snap = []
+            if getattr(self, "_note", False):
+                self.status_lbl.config(text="")
+                self._note = False
+
 
 # ===================================================================
 # Healer Tab
@@ -785,16 +884,27 @@ class HealerCard(tk.Frame):
 class HealerTab:
     """Tab for detecting and fixing stale pattern scan offsets in SKSE plugins."""
 
-    def __init__(self, parent, game_exe, plugins_dir_fn):
+    def __init__(self, parent, game_exe, plugins_dir_fn, work):
         self.parent = parent
         self.game_exe = game_exe
         self._plugins_dir_fn = plugins_dir_fn
+        self.work = work
         self.cards = []
-        self.busy = False
         self._exe_data = None
         self._exe_sections = None
 
         self._build()
+        self.work.listen(self._set_working)
+
+    def _set_working(self, working, desc=""):
+        state = "disabled" if working else "normal"
+        self.scan_btn.config(state=state)
+        self.clear_btn.config(state=state)
+        self.trans_btn.config(state=state)
+        self.browse_plugin_btn.config(state=state)
+        self.browse_old_btn.config(state=state)
+        for c in self.cards:
+            c.set_working(working)
 
     def _build(self):
         # Top controls
@@ -808,8 +918,9 @@ class HealerTab:
         self.plugin_var = tk.StringVar()
         self.plugin_entry = ttk.Entry(ctrl, textvariable=self.plugin_var, width=40)
         self.plugin_entry.pack(side="left", padx=(6, 4))
-        ttk.Button(ctrl, text="Browse...", command=self._browse_plugin
-                   ).pack(side="left", padx=(0, 12))
+        self.browse_plugin_btn = ttk.Button(
+            ctrl, text="Browse...", command=self._browse_plugin)
+        self.browse_plugin_btn.pack(side="left", padx=(0, 12))
 
         # Old game exe selector (optional)
         tk.Label(ctrl, text="Old game (optional):",
@@ -818,8 +929,9 @@ class HealerTab:
         self.old_game_var = tk.StringVar()
         self.old_game_entry = ttk.Entry(ctrl, textvariable=self.old_game_var, width=40)
         self.old_game_entry.pack(side="left", padx=(6, 4))
-        ttk.Button(ctrl, text="Browse...", command=self._browse_old_game
-                   ).pack(side="left")
+        self.browse_old_btn = ttk.Button(
+            ctrl, text="Browse...", command=self._browse_old_game)
+        self.browse_old_btn.pack(side="left")
 
         # Buttons row
         btn_frame = tk.Frame(self.parent, bg=BG)
@@ -828,7 +940,9 @@ class HealerTab:
         self.scan_btn = ttk.Button(btn_frame, text="Scan", command=self.scan)
         self.scan_btn.pack(side="left", padx=(0, 6))
 
-        ttk.Button(btn_frame, text="Clear", command=self._clear_cards).pack(side="left")
+        self.clear_btn = ttk.Button(btn_frame, text="Clear",
+                                    command=self._clear_cards)
+        self.clear_btn.pack(side="left")
 
         self.trans_btn = ttk.Button(btn_frame, text="Build Translations",
                                     command=self.build_translations)
@@ -843,10 +957,6 @@ class HealerTab:
         # Scrollable card area
         self.sf = ScrollFrame(self.parent)
         self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
-
-        # Status bar
-        self.status = ttk.Label(self.parent, text="Ready", anchor="w")
-        self.status.pack(fill="x", padx=10, pady=(0, 8))
 
     # -- Browse --
 
@@ -893,7 +1003,8 @@ class HealerTab:
             messagebox.showerror("Error", f"Old game exe not found:\n{old_game_path}")
             return
 
-        self._run(lambda: self._do_scan(plugin_path, plugins_dir, old_game_path))
+        self._run(lambda: self._do_scan(plugin_path, plugins_dir, old_game_path),
+                  f"Checking {plugin_path.name}...")
 
     def _do_scan(self, plugin_path, plugins_dir, old_game_path):
         self.root.after(0, self._clear_cards)
@@ -938,11 +1049,18 @@ class HealerTab:
                           old_exe_sections=self._old_exe_sections)
         card.pack(fill="x", padx=4, pady=4)
         self.cards.append(card)
+        if self.work.busy:
+            card.set_working(True)
 
     # -- Heal --
 
     def _heal_one(self, card, patched_finding=None):
-        self._run(lambda: self._heal_worker(card, patched_finding))
+        if not self.work.acquire(f"Patching {card.finding['dll_path'].name}..."):
+            card.note("Please wait - still working...")
+            return
+        card.mark_busy()
+        _launch(self.root, self.work,
+                lambda: self._heal_worker(card, patched_finding))
 
     def _heal_worker(self, card, patched_finding=None):
         finding = patched_finding or card.finding
@@ -966,7 +1084,8 @@ class HealerTab:
             messagebox.showerror(
                 "Error", f"Plugins folder not found:\n{plugins}")
             return
-        self._run(lambda: self._do_build_translations(plugins))
+        self._run(lambda: self._do_build_translations(plugins),
+                  "Updating helper data...")
 
     def _do_build_translations(self, plugins):
         try:
@@ -983,28 +1102,9 @@ class HealerTab:
 
     # -- Helpers --
 
-    def _run(self, fn):
-        if self.busy:
-            return
-        self.busy = True
-        self.scan_btn.config(state="disabled")
-        self.trans_btn.config(state="disabled")
-        self.status.config(text="Working\u2026")
-        threading.Thread(target=self._worker, args=(fn,), daemon=True).start()
-
-    def _worker(self, fn):
-        try:
-            fn()
-        except Exception as exc:
-            self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
-        finally:
-            self.root.after(0, self._done)
-
-    def _done(self):
-        self.busy = False
-        self.scan_btn.config(state="normal")
-        self.trans_btn.config(state="normal")
-        self.status.config(text="Done")
+    def _run(self, fn, desc="Working..."):
+        if self.work.acquire(desc):
+            _launch(self.root, self.work, fn)
 
     def _clear_cards(self):
         for c in self.cards:
@@ -1051,6 +1151,7 @@ class SurgeonCard(tk.Frame):
         self.fsize = fsize
         self.on_drop = on_drop
         self.dropped = False
+        self._note = False
         uid = block["uid"]
         is_core = uid == 0
 
@@ -1139,10 +1240,16 @@ class SurgeonCard(tk.Frame):
         self.status_lbl.pack(anchor="w")
 
     def _on_drop_click(self):
+        self.on_drop(self)
+
+    def mark_busy(self):
         if self.drop_btn:
             self.drop_btn.config(state="disabled")
         self.status_lbl.config(text="Dropping...")
-        self.on_drop(self)
+
+    def note(self, text):
+        self._note = True
+        self.status_lbl.config(text=text, fg=TEXT_SECONDARY)
 
     def mark_dropped(self, success, message):
         self.dropped = True
@@ -1153,18 +1260,48 @@ class SurgeonCard(tk.Frame):
             fg="#16a34a" if success else "#dc2626",
         )
 
+    def set_working(self, working):
+        if working:
+            self._snap = [(self.drop_btn, self.drop_btn.cget("state"))] \
+                if self.drop_btn else []
+            for w, _ in self._snap:
+                try:
+                    w.config(state="disabled")
+                except Exception:
+                    pass
+        elif not self.dropped:
+            for w, st in getattr(self, "_snap", []):
+                try:
+                    w.config(state=st)
+                except Exception:
+                    pass
+            self._snap = []
+            if getattr(self, "_note", False):
+                self.status_lbl.config(text="")
+                self._note = False
+
 
 class SurgeonTab:
     """Tab listing co-save plugin blocks with per-block Drop."""
 
-    def __init__(self, parent, plugins_dir_fn=None):
+    def __init__(self, parent, plugins_dir_fn=None, work=None):
         self.parent = parent
         self._plugins_dir_fn = plugins_dir_fn
+        self.work = work or BusyState()
         self.cards = []
-        self.busy = False
         self._save_path = None
         self._preview_img = None
         self._build()
+        self.work.listen(self._set_working)
+
+    def _set_working(self, working, desc=""):
+        state = "disabled" if working else "normal"
+        self.list_btn.config(state=state)
+        self.clear_btn.config(state=state)
+        self.browse_btn.config(state=state)
+        self.backup_btn.config(state=state)
+        for c in self.cards:
+            c.set_working(working)
 
     def _build(self):
         top = tk.Frame(self.parent, bg=BG)
@@ -1182,8 +1319,9 @@ class SurgeonTab:
         self.save_var = tk.StringVar()
         self.save_entry = ttk.Entry(ctrl, textvariable=self.save_var, width=40)
         self.save_entry.pack(side="left", padx=(6, 4))
-        ttk.Button(ctrl, text="Browse...", command=self._browse_save
-                   ).pack(side="left", padx=(0, 12))
+        self.browse_btn = ttk.Button(ctrl, text="Browse...",
+                                     command=self._browse_save)
+        self.browse_btn.pack(side="left", padx=(0, 12))
 
         btn_frame = tk.Frame(left, bg=BG)
         btn_frame.pack(fill="x", pady=(2, 2))
@@ -1191,7 +1329,9 @@ class SurgeonTab:
         self.list_btn = ttk.Button(btn_frame, text="List blocks", command=self.list_blocks)
         self.list_btn.pack(side="left", padx=(0, 6))
 
-        ttk.Button(btn_frame, text="Clear", command=self._clear_cards).pack(side="left")
+        self.clear_btn = ttk.Button(btn_frame, text="Clear",
+                                    command=self._clear_cards)
+        self.clear_btn.pack(side="left")
 
         self.backup_var = tk.BooleanVar(value=True)
         self.backup_btn = tk.Checkbutton(
@@ -1221,9 +1361,6 @@ class SurgeonTab:
 
         self.sf = ScrollFrame(self.parent)
         self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
-
-        self.status = ttk.Label(self.parent, text="Ready", anchor="w")
-        self.status.pack(fill="x", padx=10, pady=(0, 8))
 
     def _browse_save(self):
         initial = _default_saves_dir()
@@ -1264,7 +1401,7 @@ class SurgeonTab:
             messagebox.showerror("Error", f"Save not found:\n{save_path}")
             return
         self._save_path = save_path
-        self._run(lambda: self._do_list(save_path))
+        self._run(lambda: self._do_list(save_path), "Reading save file...")
 
     def _do_list(self, save_path):
         self.root.after(0, self._clear_cards)
@@ -1334,10 +1471,17 @@ class SurgeonTab:
                            on_drop=self._drop_one)
         card.pack(fill="x", padx=4, pady=4)
         self.cards.append(card)
+        if self.work.busy:
+            card.set_working(True)
 
     def _drop_one(self, card):
+        if not self.work.acquire("Updating save file..."):
+            card.note("Please wait - still working...")
+            return
+        card.mark_busy()
         backup = self.backup_var.get()
-        self._run(lambda: self._drop_worker(card, backup))
+        _launch(self.root, self.work,
+                lambda: self._drop_worker(card, backup))
 
     def _drop_worker(self, card, backup):
         try:
@@ -1352,28 +1496,9 @@ class SurgeonTab:
         except ValueError as exc:
             self.root.after(0, lambda: card.mark_dropped(False, str(exc)))
 
-    def _run(self, fn):
-        if self.busy:
-            return
-        self.busy = True
-        self.list_btn.config(state="disabled")
-        self.backup_btn.config(state="disabled")
-        self.status.config(text="Working\u2026")
-        threading.Thread(target=self._worker, args=(fn,), daemon=True).start()
-
-    def _worker(self, fn):
-        try:
-            fn()
-        except Exception as exc:
-            self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
-        finally:
-            self.root.after(0, self._done)
-
-    def _done(self):
-        self.busy = False
-        self.list_btn.config(state="normal")
-        self.backup_btn.config(state="normal")
-        self.status.config(text="Done")
+    def _run(self, fn, desc="Working..."):
+        if self.work.acquire(desc):
+            _launch(self.root, self.work, fn)
 
     def _clear_cards(self):
         for c in self.cards:
@@ -1428,10 +1553,21 @@ class AutoPorterGUI:
 
         # ── State ──
         self.game_exe = find_game_exe()
-        self.busy = False
-        self.cards: list[PluginCard] = []
+        self.work = BusyState()
+        self.cards = []
 
         self._build()
+        self.work.listen(self._set_working)
+
+    def _set_working(self, working, desc=""):
+        state = "disabled" if working else "normal"
+        self.scan_btn.config(state=state)
+        self.clear_btn.config(state=state)
+        self.pro_btn.config(state=state)
+        for c in self.cards:
+            c.set_working(working)
+        self.root.title(f"CompaSSE v{core.VERSION} - {desc}" if working
+                        else f"CompaSSE v{core.VERSION}")
 
     # ──────────────────────────────────────────────────────────────
     # Layout
@@ -1462,11 +1598,13 @@ class AutoPorterGUI:
             self.tab_healer,
             game_exe=self.game_exe,
             plugins_dir_fn=self._plugins,
+            work=self.work,
         )
 
         # ── Build surgeon tab ──
         self.surgeon_tab = SurgeonTab(self.tab_surgeon,
-                                        plugins_dir_fn=self._plugins)
+                                      plugins_dir_fn=self._plugins,
+                                      work=self.work)
 
     def _build_main_tab(self):
         parent = self.tab_main
@@ -1495,8 +1633,8 @@ class AutoPorterGUI:
         self.scan_btn = ttk.Button(bf, text="Scan", command=self.scan)
         self.scan_btn.pack(side="left", padx=(0, 6))
 
-        ttk.Button(bf, text="Clear",
-                   command=self.clear).pack(side="left")
+        self.clear_btn = ttk.Button(bf, text="Clear", command=self.clear)
+        self.clear_btn.pack(side="left")
 
         self.pro_mode = tk.BooleanVar(value=False)
         self.pro_btn = tk.Checkbutton(
@@ -1534,10 +1672,6 @@ class AutoPorterGUI:
         self.sf = ScrollFrame(parent)
         self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
 
-        # ── Status bar ──
-        self.status = ttk.Label(parent, text="Ready", anchor="w")
-        self.status.pack(fill="x", padx=10, pady=(0, 8))
-
     # ──────────────────────────────────────────────────────────────
     # Browse handlers
     # ──────────────────────────────────────────────────────────────
@@ -1552,28 +1686,10 @@ class AutoPorterGUI:
     # Threading helpers
     # ──────────────────────────────────────────────────────────────
 
-    def _run(self, fn):
-        """Run *fn* in a background thread, disabling buttons while busy."""
-        if self.busy:
-            return
-        self.busy = True
-        self.scan_btn.config(state="disabled")
-        self.status.config(text="Working\u2026")
-        threading.Thread(target=self._worker, args=(fn,), daemon=True).start()
-
-    def _worker(self, fn):
-        try:
-            fn()
-        except Exception as exc:
-            self.root.after(
-                0, lambda: messagebox.showerror("Error", str(exc)))
-        finally:
-            self.root.after(0, self._done)
-
-    def _done(self):
-        self.busy = False
-        self.scan_btn.config(state="normal")
-        self.status.config(text="Done")
+    def _run(self, fn, desc="Working..."):
+        """Run fn in a background thread; all action buttons lock meanwhile."""
+        if self.work.acquire(desc):
+            _launch(self.root, self.work, fn)
 
     # ──────────────────────────────────────────────────────────────
     # Scan
@@ -1664,6 +1780,8 @@ class AutoPorterGUI:
         self.sf.inner.grid_columnconfigure(0, weight=1, uniform="card")
         self.sf.inner.grid_columnconfigure(1, weight=1, uniform="card")
         self.cards.append(card)
+        if self.work.busy:
+            card.set_working(True)
 
     def _on_pro_toggle(self):
         # Rebuild cards from the last scan so every one shows fix buttons
@@ -1696,7 +1814,11 @@ class AutoPorterGUI:
             ):
                 card.mark_idle()
                 return
-        self._run(lambda: self._fix_single_worker(card, kind))
+        if not self.work.acquire(f"Fixing {card.dll_path.name}..."):
+            card.mark_noop("Please wait - still working...")
+            return
+        _launch(self.root, self.work,
+                lambda: self._fix_single_worker(card, kind))
 
     def _fix_single_worker(self, card, kind):
         self._apply_fix(card, kind)
@@ -1742,7 +1864,6 @@ class AutoPorterGUI:
 
     def clear(self):
         self._clear_cards()
-        self.status.config(text="Ready")
 
 # ===================================================================
 # Entry point

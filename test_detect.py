@@ -667,6 +667,68 @@ def main():
     check("T22e.no-rewrite", pe.read_bytes() == before, repr(acts))
     check("T22e.skip-note", any("pre-V5 runtime" in a for a in acts), repr(acts))
 
+    # ---------------------------------------------------------------- T26: one operation at a time
+    seq26 = []
+    w26 = G.BusyState()
+    w26.listen(lambda working, desc: seq26.append((working, desc)))
+    check("T26.acquire", w26.acquire() is True and seq26 == [(True, "Working...")],
+          repr(seq26))
+    check("T26.refuse", w26.acquire() is False and seq26 == [(True, "Working...")],
+          repr(seq26))
+    check("T26.busy", w26.busy is True, "")
+    w26.release()
+    check("T26.release", seq26 == [(True, "Working..."), (False, "")]
+          and w26.busy is False, repr(seq26))
+    check("T26.desc", w26.acquire("Checking x...") is True
+          and seq26[-1] == (True, "Checking x..."), repr(seq26[-1]))
+    w26.set_desc("Checking y...")
+    check("T26.set-desc", seq26[-1] == (True, "Checking y..."), repr(seq26[-1]))
+    w26.set_desc("idle-note")
+    w26.release()
+    check("T26.reacquire", w26.busy is False, "stuck locked")
+    try:
+        import tkinter as tk
+        _r26 = tk.Tk()
+        _r26.withdraw()
+    except Exception as _e:
+        check("T26.gui-skip", True, f"no display ({_e})")
+    else:
+        _app26 = G.AutoPorterGUI(_r26)
+        check("T26.free", _app26.work.busy is False, "")
+        check("T26.lock", _app26.work.acquire() is True
+              and str(_app26.scan_btn.cget("state")) == "disabled",
+              "scan clickable mid-work")
+        check("T26.title-busy",
+              _r26.title() == f"CompaSSE v{G.core.VERSION} - Working...",
+              _r26.title())
+        _app26.work.release()
+        check("T26.unlock", str(_app26.scan_btn.cget("state")) == "normal",
+              "scan stuck disabled")
+        check("T26.title-idle", _r26.title() == f"CompaSSE v{G.core.VERSION}",
+              _r26.title())
+        _f26 = {"dll_path": Path("x.dll"), "id_val": 1, "func_rva": 0x1000,
+                "old_offset": 0x10, "new_offset": 0x20, "auto_fixable": True}
+        _hc = G.HealerCard(_r26, _f26, None, [], on_heal=lambda *a: None)
+        _hc.set_working(True)
+        check("T26.heal-lock", str(_hc.heal_btn.cget("state")) == "disabled", "")
+        _hc.set_working(False)
+        check("T26.heal-back", str(_hc.heal_btn.cget("state")) == "normal", "")
+        _hc.mark_fixed(True, "")
+        _hc.set_working(True)
+        _hc.set_working(False)
+        check("T26.fixed-stays", str(_hc.heal_btn.cget("state")) == "disabled",
+              "fixed button re-enabled")
+        _b26 = {"uid": 0x12345678,
+                "chunks": [{"type": 0x504C474E, "version": 0,
+                            "length": 0, "offset": 0}]}
+        _sc = G.SurgeonCard(_r26, Path("s.skse"), _b26, None, 100,
+                            on_drop=lambda *a: None)
+        _sc.set_working(True)
+        check("T26.drop-lock", str(_sc.drop_btn.cget("state")) == "disabled", "")
+        _sc.set_working(False)
+        check("T26.drop-back", str(_sc.drop_btn.cget("state")) == "normal", "")
+        _r26.destroy()
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
