@@ -171,6 +171,18 @@ def unpack_version(packed):
     if packed is None: return None
     return (packed >> 24, (packed >> 16) & 0xFF, (packed >> 4) & 0xFFF)
 
+def compat_match(compat, runtime_version):
+    """'exact' if runtime is declared, 'rev' if only the revision
+    nibble differs, else None."""
+    if runtime_version is None or not compat:
+        return None
+    if runtime_version in compat:
+        return "exact"
+    masked = runtime_version & ~0xF
+    if any((v & ~0xF) == masked for v in compat):
+        return "rev"
+    return None
+
 def pe_build_dt(dll_path):
     """PE TimeDateStamp as datetime (UTC), or None if missing/unreadable."""
     try:
@@ -1629,8 +1641,10 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
     cross_suffix = (f" Crosses structural break(s) {cross_names}: struct "
                     "drift may crash it even patched - test in-game.") \
         if crossed else ""
-    declares_running = (vi is not None and runtime_version is not None
-                        and runtime_version in (vi.get("compat") or []))
+    _match = compat_match(
+        vi.get("compat") if vi else None, runtime_version)
+    declares_running = _match == "exact"
+    rev_match = _match == "rev"
 
     # Rule 1: built with CommonLibSSE? (heuristic: build year + has SKSE export)
     # Rule 2: uses Address Library? (versionIndependence flag bit)
@@ -1669,6 +1683,20 @@ def _audit_plugin(dll_path, runtime_version=None, id_set=None, ever_set=None):
             "reason": (f"Declares your game version "
                        f"({_packed_to_ver(runtime_version)}). Built for it - "
                        f"leave it alone."),
+            "details": {"build_year": build_year, "has_addr": has_addr,
+                        "hooks": len(hooks)},
+        }
+
+    # REV: declares this game bar the revision nibble. Close enough to
+    # try unpatched first; patch only if SKSE rejects it.
+    if rev_match:
+        return {
+            "name": dll_path.name,
+            "verdict": "MANUAL",
+            "reason": (f"Declares your game version "
+                       f"({_packed_to_ver(runtime_version)}) except the "
+                       f"revision - try it unpatched first, patch only if "
+                       f"SKSE rejects it."),
             "details": {"build_year": build_year, "has_addr": has_addr,
                         "hooks": len(hooks)},
         }

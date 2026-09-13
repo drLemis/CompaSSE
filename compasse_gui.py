@@ -232,8 +232,9 @@ def classify(info, build_year, runtime_version=None):
     rv = (vi or {}).get("runtime_ver")
     version = core._packed_to_ver(rv) if rv else None
     compat = (vi or {}).get("compat") or []
-    declares_running = (runtime_version is not None
-                        and runtime_version in compat)
+    _match = core.compat_match(compat, runtime_version)
+    declares_running = _match == "exact"
+    rev_match = _match == "rev"
     run_str = core._packed_to_ver(runtime_version) if runtime_version else None
     declared_tup = core.unpack_version(rv) if rv else None
     run_tup = core.unpack_version(runtime_version) if runtime_version else None
@@ -316,6 +317,14 @@ def classify(info, build_year, runtime_version=None):
                           "patch only if SKSE rejects it." + cross_note),
                          "Try loading first; patch on rejection.", False, True, items)
 
+        if rev_match:
+            return _base("MANUAL", "MANUAL CHECK", "MANUAL",
+                         (f"Made for your game version ({run_str}), only the "
+                          "revision differs. Try it first - patch only if the "
+                          "game rejects it." + cross_note),
+                         "Try loading first; patch on rejection.",
+                         False, True, items)
+
         if old and addrlib:
             parts = [
                 f"Built {build_year} (old CommonLibSSE). "
@@ -351,8 +360,9 @@ def classify(info, build_year, runtime_version=None):
                         "source recompile. No patcher bridges that.")
             return _base("DANGEROUS", "DANGEROUS", "DANGEROUS",
                          why,
-                         "Needs manual port or recompile with CommonLibNG.",
-                         False, True, items)
+                         "Needs manual port or recompile with CommonLibNG. "
+                         "Flag patches would only break it further.",
+                         False, False, [])
 
         # recent + no addrlib, or other ambiguous
         why = (f"Built {build_year}. Does not declare Address Library usage. "
@@ -376,6 +386,15 @@ def classify(info, build_year, runtime_version=None):
                          False, False, items)
         return _base("OK", "OK", "OK",
                      f"Declares your game version ({run_str}). Built for it - leave it alone.")
+
+    # Declares this game bar the revision: try unpatched first.
+    if rev_match:
+        return _base("MANUAL", "MANUAL CHECK", "MANUAL",
+                     (f"Made for your game version ({run_str}), only the "
+                      "revision differs. Try it first - patch only if the "
+                      "game rejects it."),
+                     "Try loading first; patch on rejection.",
+                     False, True, items)
 
     # Built for a game newer than the running one: flags can't bridge that.
     if declared_tup and run_tup and declared_tup > run_tup:

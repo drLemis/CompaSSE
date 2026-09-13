@@ -680,6 +680,45 @@ def main():
     acts29 = C.fix_plugin(pn, None, None, None, runtime_version=old19, dry_run=False)
     check("T29.noop", pn.read_bytes() == before29 and not acts29, repr(acts29))
 
+    # ---------------------------------------------------------------- T30: DANGEROUS offers no fix
+    pd = tmp / "t30d.dll"
+    make_plugin(pd, 0x0, 0x0, [old19], 2023)
+    vd = G.classify(C.analyze_plugin(pd, r19, include_hooks=False), 2023, r19)
+    check("T30.red", vd["cat"] == "DANGEROUS", vd["cat"])
+    check("T30.no-fix", vd["needs_fix"] is False and vd["fix_items"] == [],
+          repr((vd["needs_fix"], vd["fix_items"])))
+
+    # ---------------------------------------------------------------- T32: revision-only mismatch
+    pr = tmp / "t32r.dll"
+    make_plugin(pr, 0x1, 0x0, [r19 | 0x1], 2023)
+    ar = C._audit_plugin(pr, r19)
+    check("T32.audit", ar["verdict"] == "MANUAL" and "revision" in ar["reason"],
+          ar["verdict"] + " | " + ar["reason"])
+    vr = G.classify(C.analyze_plugin(pr, r19, include_hooks=False), 2023, r19)
+    check("T32.gui", vr["cat"] == "MANUAL" and "revision" in vr["why"], vr["cat"])
+    check("T32.match", C.compat_match([r19], r19) == "exact"
+          and C.compat_match([r19 | 0x1], r19) == "rev"
+          and C.compat_match([old19], r19) is None
+          and C.compat_match([], r19) is None
+          and C.compat_match([r19], None) is None, "helper")
+
+    # ---------------------------------------------------------------- T31: PRO mode keeps the hatch
+    try:
+        import tkinter as tk
+        _r31 = tk.Tk()
+        _r31.withdraw()
+    except Exception as _e:
+        check("T31.gui-skip", True, f"no display ({_e})")
+        check("T31.pro-skip", True, f"no display ({_e})")
+    else:
+        _info31 = {"flag": None, "version_indep": None, "hooks": []}
+        _c31 = G.PluginCard(_r31, pr, _info31, vd, on_fix_one=lambda *a: None)
+        check("T31.plain", not _c31.fix_buttons, repr(len(_c31.fix_buttons)))
+        _p31 = G.PluginCard(_r31, pr, _info31, vd, on_fix_one=lambda *a: None,
+                            force_fix=True)
+        check("T31.pro", bool(_p31.fix_buttons), "PRO hides fix")
+        _r31.destroy()
+
     # ---------------------------------------------------------------- T26: one operation at a time
     seq26 = []
     w26 = G.BusyState()
