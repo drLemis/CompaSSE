@@ -11,7 +11,7 @@ needed - everything happens in memory when SKSE loads each plugin.
 2. [How SKSE Loads Plugins](#how-skse-loads-plugins)
 3. [The Address Library Problem](#the-address-library-problem)
 4. [Architecture](#architecture)
-5. [Hook Chain (13 hooks)](#hook-chain-13-hooks)
+5. [Hook Chain (14 hooks)](#hook-chain-14-hooks)
 6. [Address Library Formats](#address-library-formats)
 7. [Format Detection (Decoder)](#format-detection-decoder)
 8. [Serve Logic](#serve-logic)
@@ -107,7 +107,7 @@ parse, but older plugins only understand format 1 or 2.
 | ------+--------------+--------------+-------------+--------|
 |       |              |              |             |        |
 |  +----v--------------v--------------v-------------v-----+  |
-|  |           !CompaSSE.dll (13 hooks)                   |  |
+|  |           !CompaSSE.dll (14 hooks)                   |  |
 |  |                                                      |  |
 |  |  GetProcAddress hook                                 |  |
 |  |    Patches SKSEPlugin_Version flags so SKSE          |  |
@@ -158,11 +158,11 @@ parse, but older plugins only understand format 1 or 2.
 | `build_shim.bat`     | MSVC build script                                                                   |
 | `deploy.ps1`         | Build + deploy automation                                                           |
 
-## Hook Chain (13 hooks)
+## Hook Chain (14 hooks)
 
-The shim installs 13 hooks via [MinHook](https://github.com/TsudaKageyu/minhook):
+The shim installs 14 hooks via [MinHook](https://github.com/TsudaKageyu/minhook):
 
-### File API hooks (6)
+### File API hooks (7)
 
 | Hook                 | Target       | Purpose                                          |
 |----------------------|--------------|--------------------------------------------------|
@@ -170,6 +170,7 @@ The shim installs 13 hooks via [MinHook](https://github.com/TsudaKageyu/minhook)
 | `CreateFileA`        | kernel32.dll | ANSI fallback (rarely used by plugins)           |
 | `CreateFile2`        | kernel32.dll | WinRT/UWP path (defensive)                       |
 | `CreateFileMappingW` | kernel32.dll | Catches callers that map the real file handle    |
+| `OpenFileMappingW`   | kernel32.dll | Log-only: who opens the shared IDDB mapping      |
 | `NtCreateFile`       | ntdll.dll    | NT-level interception for mods that bypass Win32 |
 | `NtOpenFile`         | ntdll.dll    | NT-level interception (same as NtCreateFile)     |
 
@@ -280,9 +281,11 @@ no mmap, no std::istream) from an old fmt2-only module, so a second
 signal scans the caller's `.rdata`/`.data` for V5-only strings
 (`AddressLibraryV5`, `Address Library V5`,
 `not an Address Library V5 file`, the `AddressLibV2` fallback path).
-Pre-V5 binaries predate those strings, so any hit positively proves a V5
-branch and the caller is served the translated fmt5 temp
-(`module_supports_fmt5`, cached per module, SEH-guarded).
+The hit is logged (`dualV5=1`) but never routes: dual readers get the
+same fmt2 temp as everyone else. Serving them fmt5 sized their shared
+mapping differently from pure-V2 holders of the same name, and the
+second one to load always died with "failed to create shared mapping"
+(observed live: healthy updated mods failing next to older ones).
 
 **Why this works:** CommonLibSSE's address library reader evolved alongside
 its I/O strategy:
@@ -336,11 +339,11 @@ unmodified. SKSE itself needs the actual address library.
 ### 3. Format prefix routing
 
 **`versionlib-` prefix (most plugins):**
-- `DECODER_V5` -> pass-through (real fmt5 file)
-- `DECODER_V2` -> format 2 (transcoded temp file)
 - `DECODER_V1` -> format 1 (transcoded temp file; V1 readers check
   `format == 1` strictly, so fmt2 is rejected - never serve fmt2 to V1)
-- `DECODER_NONE` (unknown caller) -> format 2 (default, most compatible)
+- Everyone else (`DECODER_V2`, `DECODER_V5`, `DECODER_NONE`) -> format 2
+  (transcoded temp file; the one shared mapping per game version stays
+  one size)
 
 **`version-` prefix (old SE plugins):**
 - ALWAYS pass through the real file. It is already format 1, exactly what
@@ -389,11 +392,11 @@ caller reads the temp file as if it were the real address library.
 ```
 Caller requests current-version versionlib-*.bin
 +- Caller is SKSE -> pass-through (real file)
-+- Caller has V5 string markers (dual V2/V5 reader) -> fmt5 temp
-+   (translated dense bytes: native zero slots, minted missing IDs)
 +- Caller is V1 (istream only, old CommonLibSSE) -> fmt1 temp file
-+- Anyone else (V2, V5-heuristic, unresolvable) -> faithful fmt2 temp
-   (non-zero IDs + translations for missing ones).
++- Anyone else (V2, dual V2/V5, unresolvable) -> faithful fmt2 temp
+   (non-zero IDs + translations for missing ones). Dual readers parse
+   it through their V2 branch, data-identical for present IDs.
+   Everyone maps the same byte count, so no shared-mapping clash.
 ```
 
 Caller requests version-*.bin (any version)
@@ -556,7 +559,9 @@ Data/SKSE/Plugins/!CompaSSE.log
 | `install_hooks: enable ok` | All hooks enabled |
 | `GetProcAddress: patched SKSEPlugin_Version flags for module at ADDR` | Version flags patched |
 | `loadtime LoadLibraryW: patched SKSEPlugin_Version mod=...` | Flags patched at load time |
-| `serve VERSIONLIB -> format N (transcoded) for MODULE` | Temp file served |
+| `serve VERSIONLIB -> format N (transcoded, ..., ids=X, mapbytes=Y) for MODULE` | Temp file served (ids = entries, mapbytes = shared-mapping bytes) |
+| `CreateFileMappingW NAME size=N -> ok/FAILED for MODULE` | Shared IDDB mapping created per game version |
+| `OpenFileMappingW NAME -> opened/missing for MODULE` | Shared IDDB mapping opened (missing = first creator) |
 | `serve PATH -> pass-through for SKSE (MODULE)` | SKSE gets the real file |
 | `load_translations: loaded N remapped IDs from N version tables` | Translation table loaded |
 | `MessageBoxW intercepted! caption=X text=Y` | Error dialog logged |
@@ -573,13 +578,12 @@ for absent IDs. The serve log (`dualV5=`, `decoder=`) names the decision
 per caller, so a misroute is identifiable in one run.
 
 ### V5-native detection
-Callers containing V5-only strings are served the translated fmt5 temp.
-A pre-V5 binary cannot contain those strings (verified: the marker set is
-parity-tested in `test_detect.py` T20 against the exact list in
-`decoder_detect.cpp`), so false positives are not expected. If one ever
-appears (a mod serving fmt5 bytes that only parses fmt2), its
-"Unsupported address library format: 5" dialog together with the serve
-log identifies it in one step - same workflow as before.
+Callers containing V5-only strings are logged (`dualV5=1`) but served the
+same fmt2 temp as everyone else: their V2 branch parses it fine, and a
+fmt5 temp would size their shared mapping differently from pure-V2
+holders of the same name. A pre-V5 binary cannot contain those strings
+(verified: the marker set is parity-tested in `test_detect.py` T20
+against the exact list in `decoder_detect.cpp`).
 
 ### Translation table coverage
 The translation table covers known ID remappings between major game versions.
