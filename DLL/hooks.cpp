@@ -199,6 +199,7 @@ static decltype(&CreateFileW) fpCreateFileW = nullptr;
 static decltype(&CreateFileA) fpCreateFileA = nullptr;
 static decltype(&CreateFile2) fpCreateFile2 = nullptr;
 static decltype(&CreateFileMappingW) fpCreateFileMappingW = nullptr;
+static decltype(&OpenFileMappingW) fpOpenFileMappingW = nullptr;
 static pfnNtCreateFile fpNtCreateFile = nullptr;
 static pfnNtOpenFile fpNtOpenFile = nullptr;
 
@@ -235,6 +236,31 @@ static wchar_t g_tempPath5[MAX_PATH];
 static wchar_t g_tempPath1[MAX_PATH];
 static wchar_t g_tempPath0[MAX_PATH];
 static wchar_t g_currentVersion[32]; // e.g. "1-7-104" extracted from versionlib filename
+
+// Entries in a materialized temp; IDDatabase maps count * 16 bytes.
+static uint32_t temp_entry_count(int format) {
+    const std::vector<uint8_t>* buf =
+        format == 5 ? &g_fmt5_patched : format == 1 ? &g_fmt1 : &g_fmt2;
+    if (buf->size() < 28) return 0;
+    const uint8_t* d = buf->data();
+    uint32_t f = (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+                 ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+    if (f == 5) {
+        if (buf->size() < 96) return 0;
+        return (uint32_t)d[92] | ((uint32_t)d[93] << 8) |
+               ((uint32_t)d[94] << 16) | ((uint32_t)d[95] << 24);
+    }
+    if (f == 1 || f == 2) {
+        uint32_t nameLen = (uint32_t)d[20] | ((uint32_t)d[21] << 8) |
+                           ((uint32_t)d[22] << 16) | ((uint32_t)d[23] << 24);
+        if (nameLen > 256) return 0;
+        size_t off = 24 + (size_t)nameLen + 4;
+        if (off + 4 > buf->size()) return 0;
+        return (uint32_t)d[off] | ((uint32_t)d[off + 1] << 8) |
+               ((uint32_t)d[off + 2] << 16) | ((uint32_t)d[off + 3] << 24);
+    }
+    return 0;
+}
 
 #pragma comment(lib, "version.lib")
 
@@ -479,6 +505,13 @@ static bool is_versionlib_handle(HANDLE h) {
     DWORD n = GetFinalPathNameByHandleW(h, buf, MAX_PATH, 0);
     if (n == 0 || n >= MAX_PATH) return false;
     return is_versionlib_path(buf);
+}
+
+// Named shared mappings the CommonLib family creates per game version.
+static bool is_iddb_mapname(LPCWSTR name) {
+    if (!name || !name[0]) return false;
+    return wcsstr(name, L"COMMONLIB") || wcsstr(name, L"CommonLibSSE") ||
+           wcsstr(name, L"AddressLib") || wcsstr(name, L"IDDB");
 }
 
 // Same check, but also hands back the file path for version comparison.
@@ -777,21 +810,21 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     }
 
-    // Pass through by default, transcode only on format mismatch
+    // One shared mapping per game version: every caller must map the same
+    // byte count, so everyone gets the same fmt1/2 bytes. Dual V2/V5
+    // readers parse them through their V2 branch (data-identical for
+    // present IDs); a fmt5 temp would size their mapping differently
+    // from pure-V2 holders of the same name and the second one to load
+    // would die with "failed to create shared mapping".
     DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
     int format;
     bool dualV5 = caller && module_supports_fmt5(caller);
-    if (dualV5) {
-        // Dual V2/V5 reader: native dense semantics (zero slots).
-        format = 5;
-    } else if (hasVersionPrefix) {
+    if (hasVersionPrefix) {
         shim_log("serve %ls -> pass-through version- file for %ls (decoder=%d)",
                  path, modName[0] ? modName : L"(unknown)", (int)type);
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     } else if (type == DECODER_V1) format = 1;
     else format = 2;
-
-    // fmt5 temps go only to detected dual readers; rest keeps fmt1/2.
     AcquireSRWLockExclusive(&g_lock);
     ensure_buffers(path);
     if (g_loadFailed) {
@@ -806,10 +839,12 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     }
     const wchar_t* tempPath = tempFmt == 5 ? g_tempPath5 : tempFmt == 1 ? g_tempPath1 : tempFmt == 0 ? g_tempPath0 : g_tempPath2;
+    uint32_t ids = temp_entry_count(tempFmt);
     ReleaseSRWLockExclusive(&g_lock);
 
-    shim_log("serve %ls -> format %d (transcoded, decoder=%d, dualV5=%d) for %ls", path, tempFmt,
-             (int)type, dualV5 ? 1 : 0, modName[0] ? modName : L"(unknown)");
+    shim_log("serve %ls -> format %d (transcoded, decoder=%d, dualV5=%d, ids=%u, mapbytes=%llu) for %ls", path, tempFmt,
+             (int)type, dualV5 ? 1 : 0, ids, (unsigned long long)ids * 16,
+             modName[0] ? modName : L"(unknown)");
 
     return fpCreateFileW(tempPath, access, share, sa, disp, flags, tmpl);
 }
@@ -851,6 +886,18 @@ static HANDLE WINAPI Hook_CreateFile2(LPCWSTR name, DWORD access, DWORD share, D
 // Defensive: catches callers that mapped the REAL bin handle and redirects to temp file.
 static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                                              DWORD sizeHigh, DWORD sizeLow, LPCWSTR name) {
+    if ((hFile == nullptr || hFile == INVALID_HANDLE_VALUE) && is_iddb_mapname(name)) {
+        uint64_t reqSize = ((uint64_t)sizeHigh << 32) | (uint64_t)sizeLow;
+        HMODULE caller = resolve_caller_module(g_self);
+        wchar_t modName[MAX_PATH] = L"(unknown)";
+        if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
+        const wchar_t* base = wcsrchr(modName, L'\\');
+        HANDLE h = fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+        DWORD err = h ? 0 : GetLastError();
+        shim_log("CreateFileMappingW %ls size=%llu -> %s (err=%lu) for %ls", name,
+                 reqSize, h ? "ok" : "FAILED", err, base ? base + 1 : modName);
+        return h;
+    }
     if (hFile != INVALID_HANDLE_VALUE && is_versionlib_handle(hFile)) {
         HMODULE caller = resolve_caller_module(g_self);
         DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
@@ -877,6 +924,7 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
         if (versionlib_handle_path(hFile, fpath) && is_old_version_path(fpath))
             return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
     }
+    bool dualV5 = caller && module_supports_fmt5(caller);
     format = (caller && type == DECODER_V1) ? 1 : 2;
 
         wchar_t modName[MAX_PATH] = L"(unknown)";
@@ -891,14 +939,30 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                         nullptr, OPEN_EXISTING, 0, nullptr);
             if (temp != INVALID_HANDLE_VALUE) {
-                shim_log("CreateFileMappingW: redirecting versionlib handle to temp fmt%d", format);
                 HANDLE mapping = fpCreateFileMappingW(temp, sa, protect, sizeHigh, sizeLow, name);
                 CloseHandle(temp);
+                const wchar_t* base = wcsrchr(modName, L'\\');
+                shim_log("CreateFileMappingW: redirecting versionlib handle to temp fmt%d (dualV5=%d) for %ls",
+                         format, dualV5 ? 1 : 0, base ? base + 1 : modName);
                 return mapping;
             }
         }
     }
     return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+}
+
+// Log-only: who opens the shared IDDB mapping, and whether it exists yet.
+static HANDLE WINAPI Hook_OpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR name) {
+    HANDLE h = fpOpenFileMappingW(access, inherit, name);
+    if (is_iddb_mapname(name)) {
+        HMODULE caller = resolve_caller_module(g_self);
+        wchar_t modName[MAX_PATH] = L"(unknown)";
+        if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
+        const wchar_t* base = wcsrchr(modName, L'\\');
+        shim_log("OpenFileMappingW %ls -> %s for %ls", name,
+                 h ? "opened" : "missing", base ? base + 1 : modName);
+    }
+    return h;
 }
 
 // Convert NT path like "\??\C:\path\file.bin" -> "C:\path\file.bin".
@@ -1117,6 +1181,10 @@ bool install_hooks(HMODULE self_module) {
 
     st = MH_CreateHook(&CreateFileMappingW, &Hook_CreateFileMappingW, (void**)&fpCreateFileMappingW);
     shim_log("install_hooks: CreateFileMappingW %s", st == MH_OK ? "ok" : "FAILED");
+    ok = ok && st == MH_OK;
+
+    st = MH_CreateHook(&OpenFileMappingW, &Hook_OpenFileMappingW, (void**)&fpOpenFileMappingW);
+    shim_log("install_hooks: OpenFileMappingW %s", st == MH_OK ? "ok" : "FAILED");
     ok = ok && st == MH_OK;
 
     // Hook GetProcAddress to patch SKSEPlugin_Version flags at runtime
