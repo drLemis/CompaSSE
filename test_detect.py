@@ -1126,6 +1126,113 @@ def main():
     _v39c = G.classify(_info39c, 2026, r19, _old)
     check("T39.gui-crossed", _v39c["cat"] == "MANUAL", _v39c["cat"])
 
+    # ---------------------------------------------------------------- T40: MO2 instance discovery
+    # Portable instances live anywhere (another drive is the norm); the
+    # scan must find them, and must ignore instances for other games.
+    import mod_sources as _M
+    _g40 = tmp / "game40"
+    _g40.mkdir()
+    _mo40 = tmp / "mo40"
+    (_mo40 / "mods" / "OnMod" / "SKSE" / "Plugins").mkdir(parents=True)
+    (_mo40 / "mods" / "OffMod" / "SKSE" / "Plugins").mkdir(parents=True)
+    (_mo40 / "mods" / "OnMod" / "SKSE" / "Plugins" / "OnMod.dll").write_bytes(b"")
+    (_mo40 / "mods" / "OffMod" / "SKSE" / "Plugins" / "OffMod.dll").write_bytes(b"")
+    (_mo40 / "profiles" / "P").mkdir(parents=True)
+    (_mo40 / "profiles" / "P" / "modlist.txt").write_text(
+        "# comment\n\n+OnMod\n-OffMod\n", encoding="utf-8")
+    _gp40 = str(_g40).replace("\\", "\\\\")
+    (_mo40 / "ModOrganizer.ini").write_text(
+        "[General]\ngameName=Skyrim Special Edition\n"
+        f"gamePath=@ByteArray({_gp40})\n"
+        "selected_profile=@ByteArray(P)\n", encoding="utf-8")
+    _ini40 = _mo40 / "ModOrganizer.ini"
+    _parsed40 = _M.parse_instance(_ini40)
+    check("T40.parse", _parsed40 is not None and _parsed40[0] == _mo40 / "mods"
+          and _parsed40[3] == "P", str(_parsed40))
+    check("T40.names", _M.active_mod_names(_mo40 / "profiles", "P") == ["OnMod"], "")
+    _dlls40, _bins40, _lbl40 = _M.collect_mo2(_g40, _ini40)
+    check("T40.collect", [d.name for d in _dlls40] == ["OnMod.dll"], str(_dlls40))
+    _other40 = tmp / "othergame"
+    _other40.mkdir()
+    check("T40.nomatch",
+          _M.find_instances(_other40) == []
+          or all(str(i["ini"]) != str(_ini40) for i in _M.find_instances(_other40)),
+          "foreign instance leaked")
+    _dirs40 = None
+    check("T40.noproc", not hasattr(_M, "_running_mo2_dirs"),
+          "process scan must stay out (AV heuristics)")
+
+    # ---------------------------------------------------------------- T41: remembered MO2 path
+    # A closed instance in an arbitrary folder leaves no system trace;
+    # the once-picked ModOrganizer.ini must be remembered and honored.
+    _g41 = tmp / "game41"
+    (_g41 / "Data" / "SKSE" / "Plugins" / "CompaSSE").mkdir(parents=True)
+    _mo41 = tmp / "mo41"
+    (_mo41 / "mods" / "Kept" / "SKSE" / "Plugins").mkdir(parents=True)
+    (_mo41 / "mods" / "Kept" / "SKSE" / "Plugins" / "Kept.dll").write_bytes(b"")
+    (_mo41 / "profiles" / "P").mkdir(parents=True)
+    (_mo41 / "profiles" / "P" / "modlist.txt").write_text(
+        "+Kept\n", encoding="utf-8")
+    _gp41 = str(_g41).replace("\\", "\\\\")
+    (_mo41 / "ModOrganizer.ini").write_text(
+        "[General]\ngameName=Skyrim Special Edition\n"
+        f"gamePath=@ByteArray({_gp41})\n"
+        "selected_profile=@ByteArray(P)\n", encoding="utf-8")
+    # ---------------------------------------------------------------- T41: one settings file
+    # Game + MO2 paths share CompaSSE.ini next to the tool. Old split
+    # files are adopted once, then removed.
+    _app41 = tmp / "app41"
+    _app41.mkdir()
+    _g41b = tmp / "game41b"
+    (_g41b / "Data" / "SKSE" / "Plugins" / "CompaSSE").mkdir(parents=True)
+    check("T41.unsaved", C.saved_mo2_ini(_app41, _g41b) is None, "")
+    check("T41.save", C.save_mo2_ini(_app41, _mo41 / "ModOrganizer.ini") is True, "")
+    check("T41.roundtrip", C.saved_mo2_ini(_app41, _g41b) == _mo41 / "ModOrganizer.ini",
+          str(C.saved_mo2_ini(_app41, _g41b)))
+    _dlls41, _, _lbl41 = _M.collect_mo2(
+        _g41, ini_path=C.saved_mo2_ini(_app41, _g41b))
+    check("T41.collect-picked", [d.name for d in _dlls41] == ["Kept.dll"],
+          str(_dlls41))
+    (_app41 / "CompaSSE.ini").write_text(
+        "[Paths]\nmo2 = " + str(tmp / "nope" / "ModOrganizer.ini") + "\n",
+        encoding="utf-8")
+    check("T41.bogus", C.saved_mo2_ini(_app41, _g41b) is None, "")
+    C.save_mo2_ini(_app41, _mo41 / "ModOrganizer.ini")
+    C.clear_mo2_ini(_app41)
+    check("T41.clear", C.saved_mo2_ini(_app41, _g41b) is None, "path stuck")
+    _exe41 = tmp / "Elsewhere41" / "SkyrimSE.exe"
+    _exe41.parent.mkdir()
+    _exe41.write_bytes(b"")
+    (_app41 / "CompaSSE.ini").unlink(missing_ok=True)
+    (_app41 / "CompaSSE-game.ini").write_text(str(_exe41), encoding="utf-8")
+    (_g41b / "Data" / "SKSE" / "Plugins" / "CompaSSE" / "mo2.ini").write_text(
+        str(_mo41 / "ModOrganizer.ini"), encoding="utf-8")
+    _mig41 = C.load_settings(_app41, _g41b)
+    check("T41.migrate", _mig41.get("game") == _exe41
+          and _mig41.get("mo2") == _mo41 / "ModOrganizer.ini"
+          and not (_app41 / "CompaSSE-game.ini").exists()
+          and not (_g41b / "Data" / "SKSE" / "Plugins" / "CompaSSE" / "mo2.ini").exists(),
+          str(_mig41))
+
+    # ---------------------------------------------------------------- T42: remembered game exe
+    # No exe next to the tool and no memory of one: nothing. After one
+    # pick the path sticks; garbage in the file is ignored, not fatal.
+    _app42 = tmp / "app42"
+    _app42.mkdir()
+    check("T42.unsaved", C.saved_game_exe(_app42) is None, "")
+    _exe42 = tmp / "Elsewhere" / "SkyrimSE.exe"
+    _exe42.parent.mkdir()
+    _exe42.write_bytes(b"")
+    check("T42.save", C.save_game_exe(_app42, _exe42) is True, "")
+    check("T42.roundtrip", C.saved_game_exe(_app42) == _exe42,
+          str(C.saved_game_exe(_app42)))
+    (_app42 / "CompaSSE.ini").unlink(missing_ok=True)
+    (_app42 / "CompaSSE-game.ini").write_text(
+        str(tmp / "nope" / "SkyrimSE.exe"), encoding="utf-8")
+    check("T42.bogus", C.saved_game_exe(_app42) is None, "")
+    check("T42.nodir", C.saved_game_exe(None) is None
+          and C.save_game_exe(None, _exe42) is False, "")
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

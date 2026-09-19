@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import os
 import shutil
 import struct
 import sys
