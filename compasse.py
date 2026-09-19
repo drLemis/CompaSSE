@@ -305,6 +305,156 @@ def extract_version_from_filename(fn):
     if m: return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     return None
 
+SETTINGS_NAME = "CompaSSE.ini"
+
+def _settings_file(app_dir):
+    if app_dir is None:
+        return None
+    return Path(app_dir) / SETTINGS_NAME
+
+def _valid_file(text):
+    cand = Path((text or "").strip())
+    try:
+        if text and text.strip() and cand.is_file():
+            return cand
+    except OSError:
+        pass
+    return None
+
+def _read_settings(path):
+    import configparser
+    parser = configparser.RawConfigParser()
+    parser.optionxform = lambda optionstr: optionstr
+    try:
+        parser.read(path, encoding="utf-8")
+    except Exception:
+        return {}
+    if not parser.has_section("Paths"):
+        return {}
+    return {k: v for k, v in parser.items("Paths")}
+
+def load_settings(app_dir, game_dir=None):
+    """{"game": Path, "mo2": Path} for remembered locations (valid files only)."""
+    path = _settings_file(app_dir)
+    vals = _read_settings(path) if path is not None else {}
+    out = {}
+    for key in ("game", "mo2"):
+        found = _valid_file(vals.get(key, ""))
+        if found is not None:
+            out[key] = found
+    if path is not None:
+        legacy = {}
+        old_game = Path(app_dir) / "CompaSSE-game.ini"
+        try:
+            has_old_game = old_game.is_file()
+        except OSError:
+            has_old_game = False
+        if "game" not in out and has_old_game:
+            try:
+                found = _valid_file(old_game.read_text(
+                    encoding="utf-8", errors="replace"))
+            except OSError:
+                found = None
+            if found is not None:
+                legacy["game"] = str(found)
+                out["game"] = found
+        old_mo2 = None
+        if game_dir is not None:
+            old_mo2 = Path(game_dir) / "Data" / "SKSE" / "Plugins" \
+                / "CompaSSE" / "mo2.ini"
+        legacy_mo2_text = None
+        if old_mo2 is not None:
+            try:
+                if old_mo2.is_file():
+                    legacy_mo2_text = old_mo2.read_text(
+                        encoding="utf-8", errors="replace")
+            except OSError:
+                legacy_mo2_text = None
+        if "mo2" not in out and legacy_mo2_text is not None:
+            found = _valid_file(legacy_mo2_text)
+            if found is not None:
+                legacy["mo2"] = str(found)
+                out["mo2"] = found
+        if legacy:
+            vals.update(legacy)
+            try:
+                import configparser
+                parser = configparser.RawConfigParser()
+                parser.optionxform = lambda optionstr: optionstr
+                parser.add_section("Paths")
+                for k, v in vals.items():
+                    parser.set("Paths", k, v)
+                with open(path, "w", encoding="utf-8") as f:
+                    parser.write(f)
+            except OSError:
+                pass
+            else:
+                for old in (old_game, old_mo2):
+                    try:
+                        if old is not None and old.is_file():
+                            old.unlink()
+                    except OSError:
+                        pass
+    return out
+
+
+def store_setting(app_dir, key, value, game_dir=None):
+    """Remember one setting (None/"" forgets it). Returns True on success."""
+    path = _settings_file(app_dir)
+    if path is None:
+        return False
+    vals = _read_settings(path)
+    if value:
+        vals[key] = str(value)
+    else:
+        vals.pop(key, None)
+    try:
+        import configparser
+        parser = configparser.RawConfigParser()
+        parser.optionxform = lambda optionstr: optionstr
+        parser.add_section("Paths")
+        for k, v in vals.items():
+            parser.set("Paths", k, v)
+        with open(path, "w", encoding="utf-8") as f:
+            parser.write(f)
+        return True
+    except OSError:
+        return False
+
+
+def saved_game_exe(app_dir):
+    """Remembered SkyrimSE.exe location, or None."""
+    return load_settings(app_dir).get("game")
+
+
+def save_game_exe(app_dir, exe_path):
+    """Remember a SkyrimSE.exe location. Returns True on success."""
+    return store_setting(app_dir, "game", exe_path)
+
+
+def saved_mo2_ini(app_dir, game_dir=None):
+    """Remembered ModOrganizer.ini location, or None."""
+    return load_settings(app_dir, game_dir).get("mo2")
+
+
+def save_mo2_ini(app_dir, ini_path):
+    """Remember a ModOrganizer.ini location. Returns True on success."""
+    return store_setting(app_dir, "mo2", ini_path)
+
+
+def clear_mo2_ini(app_dir):
+    """Forget the ModOrganizer.ini location. Returns True on success."""
+    path = _settings_file(app_dir)
+    if path is None:
+        return False
+    if store_setting(app_dir, "mo2", None):
+        return True
+    try:
+        return not path.exists()
+    except OSError:
+        return False
+
+
 def find_versionlib(plugins_dir, version_tuple):
     """versionlib-*.bin path matching a filename version, else None.
 
@@ -323,7 +473,47 @@ def find_versionlib(plugins_dir, version_tuple):
             return b
     return None
 
-def build_translations(game_exe, plugins_dir, game_version=None):
+
+def find_versionlib_in_dirs(dirs, version_tuple):
+    """First versionlib match across several folders (game + MO2 mods)."""
+    if version_tuple is None:
+        return None
+    for d in dirs or []:
+        if d is None:
+            continue
+        match = find_versionlib(Path(d), version_tuple)
+        if match is not None:
+            return match
+    return None
+
+
+def collect_lib_bins(dirs):
+    """All versionlib/version bins across folders, deduplicated."""
+    out = []
+    seen = set()
+    for d in dirs or []:
+        if d is None:
+            continue
+        try:
+            base = Path(d)
+            if not base.is_dir():
+                continue
+            cands = sorted(base.glob("versionlib-*.bin"))
+            cands += sorted(base.glob("version-*.bin"))
+        except OSError:
+            continue
+        for b in cands:
+            try:
+                key = str(b.resolve()).lower()
+            except OSError:
+                key = str(b).lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(b)
+    return out
+
+
+def build_translations(game_exe, plugins_dir, game_version=None, extra_lib_dirs=None):
     """Build translation_table.bin from old bins + current binary.
 
     Only IDs ABSENT from the current library are emitted. IDs present in
@@ -337,9 +527,16 @@ def build_translations(game_exe, plugins_dir, game_version=None):
         raise RuntimeError(f"Cannot read PE: {game_exe}")
 
     game_ver_tuple = unpack_version(game_version)
+    search_dirs = [plugins_dir] + list(extra_lib_dirs or [])
+    lib_bins = []
+    for d in search_dirs:
+        try:
+            lib_bins.extend(sorted(Path(d).glob("versionlib-*.bin")))
+        except OSError:
+            continue
     current_lib = None
     current_ver = None
-    for p in plugins_dir.glob("versionlib-*.bin"):
+    for p in lib_bins:
         ver = extract_version_from_filename(p.name)
         if ver and ver == game_ver_tuple:
             lib = parse_library_any(str(p))
@@ -348,7 +545,7 @@ def build_translations(game_exe, plugins_dir, game_version=None):
                 current_ver = ver
                 break
     if current_lib is None:
-        for p in plugins_dir.glob("versionlib-*.bin"):
+        for p in lib_bins:
             ver = extract_version_from_filename(p.name)
             if ver:
                 lib = parse_library_any(str(p))
@@ -409,12 +606,17 @@ def build_translations(game_exe, plugins_dir, game_version=None):
             sig_to_id[cur_sig] = cur_id
 
     old_bins = {}
-    for p in plugins_dir.glob("version-*.bin"):
-        ver = extract_version_from_filename(p.name)
-        if ver and ver != exclude_ver:
-            lib = parse_library_any(str(p))
-            if lib:
-                old_bins[ver] = lib
+    for d in search_dirs:
+        try:
+            cands = sorted(Path(d).glob("version-*.bin"))
+        except OSError:
+            continue
+        for p in cands:
+            ver = extract_version_from_filename(p.name)
+            if ver and ver != exclude_ver and ver not in old_bins:
+                lib = parse_library_any(str(p))
+                if lib:
+                    old_bins[ver] = lib
 
     if not old_bins and not old_sigs:
         raise RuntimeError("No old version bins or existing translations found")
@@ -472,7 +674,7 @@ def build_translations(game_exe, plugins_dir, game_version=None):
     struct.pack_into("<I", out, ver_count_pos, ver_count)
 
     out_dir = plugins_dir / "CompaSSE"
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "translation_table.bin", "wb") as f:
         f.write(out)
     print(f"\nWrote {len(out)} bytes to {out_dir / 'translation_table.bin'} ({ver_count} versions, {total_entries} entries)")
@@ -728,10 +930,49 @@ def list_backups(plugins_dir):
     return [(Path(plugins_dir) / b.name[:-4], b)
             for b in sorted(out_dir.glob("*.bak"))]
 
+def list_backups_all(plugin_dirs, dlls=None):
+    """Backups across game + MO2 mod folders, deduplicated."""
+    pairs = []
+    seen = set()
+    for d in plugin_dirs or []:
+        if d is None:
+            continue
+        for dll_path, bak in list_backups(d):
+            try:
+                key = str(Path(bak).resolve()).lower()
+            except OSError:
+                key = str(bak).lower()
+            if key not in seen:
+                seen.add(key)
+                pairs.append((dll_path, bak))
+    for dll in dlls or []:
+        try:
+            bak = backup_path(dll)
+        except OSError:
+            bak = None
+        if bak is None:
+            continue
+        try:
+            key = str(Path(bak).resolve()).lower()
+        except OSError:
+            key = str(bak).lower()
+        if key not in seen:
+            seen.add(key)
+            pairs.append((Path(dll), bak))
+    return sorted(pairs, key=lambda p: p[0].name.lower())
+
 def restore_backups(plugins_dir):
     """Copy every stored original back. Returns the restored count."""
     done = 0
     for dll_path, _ in list_backups(plugins_dir):
+        if restore_one(dll_path):
+            done += 1
+    return done
+
+def restore_backups_all(plugin_dirs, dlls=None):
+    """Undo fixes across game + MO2 mod folders. Returns restored count."""
+    done = 0
+    for dll_path, _ in list_backups_all(plugin_dirs, dlls):
         if restore_one(dll_path):
             done += 1
     return done
@@ -1960,8 +2201,9 @@ def diagnose_run(plugins_dir, apply=False):
     """Post-launch forensics over the shim + SKSE logs.
 
     Matches startup errors to causes (stale temp, removed ID, misclassified
-    decoder, silent abort). Report-only unless apply=True, which appends
-    quarantine suggestions to quarantine.ini (backed up, deduped).
+    decoder, shared-mapping clash, silent abort). Report-only unless
+    apply=True, which appends quarantine suggestions to quarantine.ini
+    (backed up, deduped).
     """
     import re as _re
     from datetime import date as _date
@@ -1971,12 +2213,18 @@ def diagnose_run(plugins_dir, apply=False):
 
     serves = {}   # mod basename -> [(req_path, decision)]
     boxes = []    # (caption, text)
+    maps = {}     # shared mapping name -> [(size, result, mod)]
     if shim_log.exists():
         for line in shim_log.read_text(encoding="utf-8", errors="replace").splitlines():
             m = _re.search(r"serve (.*?) -> (.*?) for (.*)$", line)
             if m:
                 mod = Path(m.group(3).strip()).name
                 serves.setdefault(mod, []).append((m.group(1), m.group(2)))
+                continue
+            m = _re.search(r"CreateFileMappingW (.*?) size=(\d+) -> (\S+).*? for (.*)$", line)
+            if m:
+                maps.setdefault(m.group(1).strip(), []).append(
+                    (int(m.group(2)), m.group(3), Path(m.group(4).strip()).name))
                 continue
             m = _re.search(r"MessageBox[WA] intercepted! caption=(.*?) text=(.*)$", line)
             if m:
@@ -2082,6 +2330,52 @@ def diagnose_run(plugins_dir, apply=False):
             got = "; ".join(f"{p} => {d}" for p, d in serves.get(caption, [])[-2:])
             print(f"[!!] {caption}: cannot parse format {fmt} (got: {got or 'no serve logged'}) - "
                   f"decoder misclassified; needs a fmt temp (code fix), not quarantine.")
+            continue
+        m = _re.search(r"failed to create shared mapping", text)
+        if m:
+            # Size this mod wanted (new shim logs mapbytes=; old logs lack it).
+            want = None
+            for _, decision in serves.get(caption, []):
+                mm = _re.search(r"mapbytes=(\d+)", decision)
+                if mm:
+                    want = int(mm.group(1))
+            # Same mapping name, different sizes = clash; loser always fails.
+            clash = {}
+            for name, events in maps.items():
+                per_size = {}
+                for size, _res, mod in events:
+                    per_size.setdefault(size, set()).add(mod)
+                if len(per_size) > 1:
+                    clash[name] = {s: sorted(ms) for s, ms in per_size.items()}
+            if clash:
+                for name, per_size in clash.items():
+                    parts = "; ".join(f"{s} bytes ({', '.join(ms)})"
+                                      for s, ms in sorted(per_size.items()))
+                    print(f"[!!] {caption}: two mods fought over one shared "
+                          f"address list ({name}) and {caption} lost: {parts}. "
+                          f"Quarantine cannot fix this - it needs a program fix. "
+                          f"Please share the full !CompaSSE.log so the pair can be fixed.")
+            else:
+                served = {}
+                for mod, decisions in serves.items():
+                    for _, decision in decisions:
+                        mm = _re.search(r"mapbytes=(\d+)", decision)
+                        if mm:
+                            served.setdefault(int(mm.group(1)), set()).add(mod)
+                if len(served) > 1:
+                    parts = "; ".join(f"{s} bytes ({', '.join(sorted(ms))})"
+                                      for s, ms in sorted(served.items()))
+                    print(f"[!!] {caption}: mods got different-sized address "
+                          f"lists this run: {parts}. {caption} wanted "
+                          f"{str(want) + ' bytes' if want else 'an unknown size'}. "
+                          f"Quarantine cannot fix this - it needs a program fix. "
+                          f"Please share the full !CompaSSE.log so the pair can be fixed.")
+                else:
+                    print(f"[??] {caption}: could not set up its shared address "
+                          f"list{(f' (wanted {want} bytes)') if want else ''}, but "
+                          f"nothing else in this run explains it. Close any other "
+                          f"running game, redeploy CompaSSE, and try once more. "
+                          f"If it repeats, share the full !CompaSSE.log.")
             continue
 
     for mod in disabled:

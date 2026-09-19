@@ -104,16 +104,17 @@ def find_call_mov_rip_rax(exe_data, func_off, func_size=0x20000):
 # ---------------------------------------------------------------------------
 # Address library resolution
 # ---------------------------------------------------------------------------
-def load_current_lib(plugins_dir, game_version=None):
+def load_current_lib(plugins_dir, game_version=None, extra_dirs=None):
     """Load the versionlib matching the current game version.
 
     game_version: (major, minor, build) tuple from the game exe, or None.
     A wrong-version lib maps IDs to wrong func RVAs, poisoning every finding,
     so prefer the filename-version match and only fall back to first found.
     """
+    dirs = [plugins_dir] + list(extra_dirs or [])
     found = []
     if game_version:
-        match = _core.find_versionlib(plugins_dir, game_version)
+        match = _core.find_versionlib_in_dirs(dirs, game_version)
         if match is not None:
             with open(match, "rb") as f:
                 data = f.read()
@@ -121,7 +122,9 @@ def load_current_lib(plugins_dir, game_version=None):
                 lib = parse_format5(data)
                 if lib:
                     return lib
-    for p in sorted(plugins_dir.glob("versionlib-*.bin")):
+    for p in _core.collect_lib_bins(dirs):
+        if not p.name.startswith("versionlib-"):
+            continue
         with open(p, "rb") as f:
             data = f.read()
         if len(data) >= 4 and struct.unpack_from("<I", data, 0)[0] == 5:
@@ -187,12 +190,14 @@ def resolve_ambiguous_hook(id_val, scan_offset, candidates, pattern_blob,
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
-def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
+def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None,
+                   extra_dirs=None):
     """Analyze a plugin DLL for stale pattern scan offsets.
     If old_exe_path is provided, uses it to extract patterns from the old binary."""
     dll_data, dll_sections, code = load_code(dll_path)
     exe_data, exe_sections = load_game_sections(exe_path)
-    current_lib = load_current_lib(plugins_dir, _exe_version_tuple(exe_path))
+    current_lib = load_current_lib(plugins_dir, _exe_version_tuple(exe_path),
+                                   extra_dirs=extra_dirs)
 
     old_exe_data = None
     old_exe_sections = None
@@ -201,7 +206,8 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
         old_exe_data, old_exe_sections = load_game_sections(old_exe_path)
         try:
             old_ver = _exe_version_tuple(old_exe_path)
-            match = _core.find_versionlib(plugins_dir, old_ver) if old_ver else None
+            dirs = [plugins_dir] + list(extra_dirs or [])
+            match = _core.find_versionlib_in_dirs(dirs, old_ver) if old_ver else None
             if match is not None:
                 old_lib = _core.parse_library_any(str(match))
         except Exception:
@@ -403,14 +409,16 @@ def analyze_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None):
                             })
     try:
         lea_findings, _, _, _ = find_lea_hooks(
-            dll_path, exe_path, plugins_dir, old_exe_path)
+            dll_path, exe_path, plugins_dir, old_exe_path,
+            extra_dirs=extra_dirs)
         findings.extend(lea_findings)
     except Exception:
         pass
     return findings, dll_data, dll_sections, code
 
 
-def find_lea_hooks(dll_path, exe_path, plugins_dir, old_exe_path=None):
+def find_lea_hooks(dll_path, exe_path, plugins_dir, old_exe_path=None,
+                   extra_dirs=None):
     """compasse-core-shaped hooks (REL::ID + lea disp32) as healer findings.
 
     Same finding dicts as analyze_plugin (plus "kind": "lea" and the raw
@@ -421,7 +429,8 @@ def find_lea_hooks(dll_path, exe_path, plugins_dir, old_exe_path=None):
     """
     dll_data, dll_sections, _code = load_code(dll_path)
     exe_data, exe_sections = load_game_sections(exe_path)
-    current_lib = load_current_lib(plugins_dir, _exe_version_tuple(exe_path))
+    current_lib = load_current_lib(plugins_dir, _exe_version_tuple(exe_path),
+                                   extra_dirs=extra_dirs)
     old_exe_data = None
     old_secs = None
     old_lib = None
@@ -429,7 +438,8 @@ def find_lea_hooks(dll_path, exe_path, plugins_dir, old_exe_path=None):
         old_exe_data, old_secs = load_game_sections(old_exe_path)
         try:
             old_ver = _exe_version_tuple(old_exe_path)
-            match = _core.find_versionlib(plugins_dir, old_ver) if old_ver else None
+            dirs = [plugins_dir] + list(extra_dirs or [])
+            match = _core.find_versionlib_in_dirs(dirs, old_ver) if old_ver else None
             if match is not None:
                 old_lib = _core.parse_library_any(str(match))
         except Exception:

@@ -344,7 +344,7 @@ def describe_chunks(block):
     return ", ".join(seen)
 
 
-def find_uid_owners(uid, plugins_dir):
+def find_uid_owners(uid, plugins_dir, extra_dlls=None):
     """Installed DLLs whose executable code references the uid constant.
 
     Plugins register co-save blocks via SetUniqueID(uid), so the uid
@@ -359,14 +359,15 @@ def find_uid_owners(uid, plugins_dir):
     raw = struct.pack("<I", uid)
     owners = []
     try:
-        dlls = sorted(Path(plugins_dir).glob("*.dll"))
+        dlls = sorted(Path(plugins_dir).glob("*.dll")) if plugins_dir else []
     except OSError:
-        return owners
+        dlls = []
+    dlls = list(dlls) + list(extra_dlls or [])
     for dll in dlls:
         code = _text_bytes(dll)
         if code is not None and raw in code:
-            owners.append(dll.name)
-    return owners
+            owners.append(Path(dll).name)
+    return sorted(set(owners))
 
 
 def find_staging_dir(plugins_dir):
@@ -388,7 +389,7 @@ def find_staging_dir(plugins_dir):
     return None
 
 
-def locate_uid(uid, plugins_dir, staging_dir=None):
+def locate_uid(uid, plugins_dir, staging_dir=None, extra_dlls=None):
     """Two-tier owner lookup: {"installed": [...], "staged": [...]}.
 
     installed = referenced by a deployed DLL (mod active). staged =
@@ -396,7 +397,8 @@ def locate_uid(uid, plugins_dir, staging_dir=None):
     deployed). Neither = unknown anywhere, true orphan candidate.
     staging_dir None auto-resolves via the deployment manifest.
     """
-    installed = find_uid_owners(uid, plugins_dir) if plugins_dir else []
+    installed = find_uid_owners(uid, plugins_dir, extra_dlls=extra_dlls) \
+        if (plugins_dir or extra_dlls) else []
     staged = []
     if staging_dir is None and plugins_dir:
         staging_dir = find_staging_dir(plugins_dir)

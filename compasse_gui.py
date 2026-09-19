@@ -31,14 +31,17 @@ def _app_dir():
 HERE = _app_dir()
 sys.path.insert(0, str(HERE))
 import compasse as core
+import mod_sources as modsrc
 import skse_healer as healer
 import skse_surgeon as surgeon
 
 
 def find_game_exe():
-    """Locate SkyrimSE.exe in the same folder this tool lives in."""
+    """SkyrimSE.exe next to this tool, else the remembered location."""
     cand = HERE / "SkyrimSE.exe"
-    return cand if cand.exists() else None
+    if cand.exists():
+        return cand
+    return core.saved_game_exe(HERE)
 
 
 def plugins_dir_for(game_exe):
@@ -1104,10 +1107,12 @@ class HealerCard(tk.Frame):
 class HealerTab:
     """Tab for detecting and fixing stale pattern scan offsets in SKSE plugins."""
 
-    def __init__(self, parent, game_exe, plugins_dir_fn, work):
+    def __init__(self, parent, game_exe, plugins_dir_fn, work,
+                 extra_dirs_fn=None):
         self.parent = parent
         self.game_exe = game_exe
         self._plugins_dir_fn = plugins_dir_fn
+        self._extra_dirs_fn = extra_dirs_fn
         self.work = work
         self.cards = []
         self._exe_data = None
@@ -1213,9 +1218,13 @@ class HealerTab:
             messagebox.showerror("Error", "Place this tool in the same folder as SkyrimSE.exe.")
             return
         plugins_dir = self._plugins_dir_fn()
-        if plugins_dir is None or not plugins_dir.exists():
-            messagebox.showerror("Error", "Plugins folder not found.")
+        extra_dirs = self._extra_dirs_fn() if self._extra_dirs_fn else []
+        has_libs = (plugins_dir is not None and plugins_dir.exists()) or extra_dirs
+        if not has_libs:
+            messagebox.showerror("Error", "Could not find any mods.")
             return
+        if plugins_dir is None or not plugins_dir.exists():
+            plugins_dir = extra_dirs[0] if extra_dirs else None
 
         old_game = self.old_game_var.get().strip()
         old_game_path = Path(old_game) if old_game else None
@@ -1223,10 +1232,11 @@ class HealerTab:
             messagebox.showerror("Error", f"Old game exe not found:\n{old_game_path}")
             return
 
-        self._run(lambda: self._do_scan(plugin_path, plugins_dir, old_game_path),
+        self._run(lambda: self._do_scan(plugin_path, plugins_dir, old_game_path,
+                                        extra_dirs),
                   f"Checking {plugin_path.name}...")
 
-    def _do_scan(self, plugin_path, plugins_dir, old_game_path):
+    def _do_scan(self, plugin_path, plugins_dir, old_game_path, extra_dirs=None):
         self.root.after(0, self._clear_cards)
         try:
             self._exe_data, self._exe_sections = healer.load_game_sections(self.game_exe)
@@ -1235,7 +1245,8 @@ class HealerTab:
             if old_game_path:
                 self._old_exe_data, self._old_exe_sections = healer.load_game_sections(old_game_path)
             findings, _, _, _ = healer.analyze_plugin(
-                plugin_path, self.game_exe, plugins_dir, old_game_path)
+                plugin_path, self.game_exe, plugins_dir, old_game_path,
+                extra_dirs=extra_dirs)
         except Exception as exc:
             self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
             return
@@ -1300,18 +1311,30 @@ class HealerTab:
                 "Error", "Place this tool in the same folder as SkyrimSE.exe.")
             return
         plugins = self._plugins_dir_fn()
-        if plugins is None or not plugins.exists():
+        extra_dirs = self._extra_dirs_fn() if self._extra_dirs_fn else []
+        if plugins is None and not extra_dirs:
             messagebox.showerror(
-                "Error", f"Plugins folder not found:\n{plugins}")
+                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
             return
-        self._run(lambda: self._do_build_translations(plugins),
+        if plugins is None:
+            plugins = extra_dirs[0]
+        try:
+            plugins.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        if not plugins.exists():
+            messagebox.showerror(
+                "Error", f"Could not use folder:\n{plugins}")
+            return
+        self._run(lambda: self._do_build_translations(plugins, extra_dirs),
                   "Updating helper data...")
 
-    def _do_build_translations(self, plugins):
+    def _do_build_translations(self, plugins, extra_dirs=None):
         try:
             game_ver = core.runtime_version_from_exe(self.game_exe)
             ver_count, total = core.build_translations(
-                str(self.game_exe), plugins, game_version=game_ver)
+                str(self.game_exe), plugins, game_version=game_ver,
+                extra_lib_dirs=extra_dirs)
             self.root.after(0, lambda: messagebox.showinfo(
                 "Build Translations",
                 f"Done.\n{ver_count} version(s), {total} entries.\n\n"
@@ -1502,9 +1525,11 @@ class SurgeonCard(tk.Frame):
 class SurgeonTab:
     """Tab listing co-save plugin blocks with per-block Drop."""
 
-    def __init__(self, parent, plugins_dir_fn=None, work=None):
+    def __init__(self, parent, plugins_dir_fn=None, work=None,
+                 extra_dlls_fn=None):
         self.parent = parent
         self._plugins_dir_fn = plugins_dir_fn
+        self._extra_dlls_fn = extra_dlls_fn
         self.work = work or BusyState()
         self.cards = []
         self._save_path = None
@@ -1654,9 +1679,14 @@ class SurgeonTab:
         plugdir = None
         if self._plugins_dir_fn is not None:
             plugdir = self._plugins_dir_fn()
+        extra_dlls = self._extra_dlls_fn() if self._extra_dlls_fn else []
         any_known = False
         for b in blocks:
-            loc = surgeon.locate_uid(b["uid"], plugdir) if plugdir else None
+            if plugdir or extra_dlls:
+                loc = surgeon.locate_uid(b["uid"], plugdir,
+                                         extra_dlls=extra_dlls)
+            else:
+                loc = None
             if loc is not None and (loc["installed"] or loc["staged"]):
                 any_known = True
             self.root.after(
@@ -1755,6 +1785,86 @@ def count_stale_hooks(hooks, exe_data, exe_sections, addresslib):
     return stale
 
 
+class SettingsTab:
+    """Rightmost tab: where the game and the mod manager live."""
+
+    def __init__(self, parent, work=None, game_exe_fn=None, mo_ini_fn=None,
+                 on_pick_game=None, on_pick_mods=None, on_clear_mods=None):
+        self.parent = parent
+        self.work = work or BusyState()
+        self._game_exe_fn = game_exe_fn
+        self._mo_ini_fn = mo_ini_fn
+        self._on_pick_game = on_pick_game
+        self._on_pick_mods = on_pick_mods
+        self._on_clear_mods = on_clear_mods
+        self._build()
+        self.work.listen(self._set_working)
+        self.refresh()
+
+    def _set_working(self, working, desc=""):
+        state = "disabled" if working else "normal"
+        self.game_btn.config(state=state)
+        self.mo_btn.config(state=state)
+        self.mo_clear_btn.config(state=state)
+
+    def _build(self):
+        box = tk.Frame(self.parent, bg=BG)
+        box.pack(fill="x", padx=10, pady=(10, 0))
+
+        tk.Label(box, text="Game:",
+                 font=(FONT_FAMILY, 10, "bold"),
+                 fg=TEXT_PRIMARY, bg=BG, anchor="w").pack(fill="x")
+        grow = tk.Frame(box, bg=BG)
+        grow.pack(fill="x", pady=(0, 2))
+        self.game_var = tk.StringVar()
+        ttk.Entry(grow, textvariable=self.game_var, state="readonly",
+                  width=60).pack(side="left", fill="x", expand=True)
+        self.game_btn = ttk.Button(grow, text="Browse...",
+                                   command=self._pick_game)
+        self.game_btn.pack(side="left", padx=(6, 0))
+
+        tk.Label(box, text="Mod Organizer:",
+                 font=(FONT_FAMILY, 10, "bold"),
+                 fg=TEXT_PRIMARY, bg=BG, anchor="w").pack(fill="x", pady=(8, 0))
+        tk.Label(box, text="Where your MO2 mods live. Skip this if you "
+                           "install mods by hand.",
+                 font=(FONT_FAMILY, 9),
+                 fg=TEXT_SECONDARY, bg=BG, anchor="w").pack(fill="x")
+        mrow = tk.Frame(box, bg=BG)
+        mrow.pack(fill="x", pady=(0, 2))
+        self.mo_var = tk.StringVar()
+        ttk.Entry(mrow, textvariable=self.mo_var, state="readonly",
+                  width=60).pack(side="left", fill="x", expand=True)
+        self.mo_btn = ttk.Button(mrow, text="Browse...",
+                                 command=self._pick_mods)
+        self.mo_btn.pack(side="left", padx=(6, 0))
+        self.mo_clear_btn = ttk.Button(mrow, text="Clear",
+                                       command=self._clear_mods)
+        self.mo_clear_btn.pack(side="left", padx=(6, 0))
+
+    def _pick_game(self):
+        if self._on_pick_game:
+            self._on_pick_game()
+
+    def _pick_mods(self):
+        if self._on_pick_mods:
+            self._on_pick_mods()
+
+    def _clear_mods(self):
+        if self._on_clear_mods:
+            self._on_clear_mods()
+
+    def refresh(self):
+        game = self._game_exe_fn() if self._game_exe_fn else None
+        self.game_var.set(str(game) if game else "Not set")
+        mo = self._mo_ini_fn() if self._mo_ini_fn else None
+        self.mo_var.set(str(mo) if mo else "Not set")
+
+    @property
+    def root(self):
+        return self.parent.winfo_toplevel()
+
+
 class AutoPorterGUI:
     def __init__(self, root):
         self.root = root
@@ -1813,6 +1923,10 @@ class AutoPorterGUI:
         self.tab_surgeon = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_surgeon, text="  Surgeon  ")
 
+        # Settings stays last: every future tab is added before it.
+        self.tab_settings = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.tab_settings, text="  Settings  ")
+
         # -- Build main tab (existing UI, reparented to tab_main) --
         self._build_main_tab()
 
@@ -1822,12 +1936,25 @@ class AutoPorterGUI:
             game_exe=self.game_exe,
             plugins_dir_fn=self._plugins,
             work=self.work,
+            extra_dirs_fn=lambda: self.get_plugin_sources()[1],
         )
 
         # -- Build surgeon tab --
-        self.surgeon_tab = SurgeonTab(self.tab_surgeon,
-                                      plugins_dir_fn=self._plugins,
-                                      work=self.work)
+        self.surgeon_tab = SurgeonTab(
+            self.tab_surgeon,
+            plugins_dir_fn=self._plugins,
+            work=self.work,
+            extra_dlls_fn=lambda: self.get_plugin_sources()[0])
+
+        # -- Build settings tab --
+        self.settings_tab = SettingsTab(
+            self.tab_settings,
+            work=self.work,
+            game_exe_fn=lambda: self.game_exe,
+            mo_ini_fn=lambda: core.saved_mo2_ini(HERE, self._game_dir()),
+            on_pick_game=self.locate_game_exe,
+            on_pick_mods=self.locate_mod_manager,
+            on_clear_mods=self.clear_mod_manager)
 
     def _build_main_tab(self):
         parent = self.tab_main
@@ -1836,18 +1963,25 @@ class AutoPorterGUI:
         pf = tk.Frame(parent, bg=BG)
         pf.pack(fill="x", padx=10, pady=(10, 4))
         if self.game_exe:
-            tk.Label(pf, text=game_version_line(self.game_exe),
-                     font=(FONT_FAMILY, 10, "bold"),
-                     fg=TEXT_PRIMARY, bg=BG, anchor="w").pack(fill="x")
+            self.game_lbl = tk.Label(
+                pf, text=game_version_line(self.game_exe),
+                font=(FONT_FAMILY, 10, "bold"),
+                fg=TEXT_PRIMARY, bg=BG, anchor="w")
+            self.game_lbl.pack(fill="x")
             self.plugins_hint = tk.Label(
                 pf, text=f"Plugins: {plugins_dir_for(self.game_exe)}",
                 font=(FONT_FAMILY, 9), fg=TEXT_SECONDARY, bg=BG, anchor="w")
             self.plugins_hint.pack(fill="x", pady=(0, 2))
         else:
-            tk.Label(pf,
-                     text="Place this tool in the same folder as SkyrimSE.exe.",
-                     font=(FONT_FAMILY, 10),
-                     fg="#dc2626", bg=BG, anchor="w").pack(fill="x")
+            self.game_lbl = tk.Label(
+                pf, text="No game found. Open the Settings tab.",
+                font=(FONT_FAMILY, 10),
+                fg="#dc2626", bg=BG, anchor="w")
+            self.game_lbl.pack(fill="x")
+            self.plugins_hint = tk.Label(
+                pf, text="", font=(FONT_FAMILY, 9),
+                fg=TEXT_SECONDARY, bg=BG, anchor="w")
+            self.plugins_hint.pack(fill="x", pady=(0, 2))
 
         # -- Buttons --
         bf = tk.Frame(parent, bg=BG)
@@ -1932,6 +2066,75 @@ class AutoPorterGUI:
             return None
         return plugins_dir_for(self.game_exe)
 
+    def _game_dir(self):
+        if self.game_exe is None:
+            return None
+        try:
+            return Path(self.game_exe).resolve().parent
+        except OSError:
+            return None
+
+    def _open_settings(self):
+        try:
+            self.notebook.select(self.tab_settings)
+        except Exception:
+            pass
+
+    def get_plugin_sources(self):
+        """All DLLs to scan: game folder plus any VFS manager mods."""
+        real = self._plugins()
+        real_dlls = []
+        if real is not None:
+            try:
+                if real.exists():
+                    real_dlls = sorted(real.glob("*.dll"))
+            except OSError:
+                real_dlls = []
+        game_dir = self._game_dir()
+        mo_dlls, mo_bins, mo_label = modsrc.collect_for_game(
+            game_dir, ini_path=core.saved_mo2_ini(HERE, game_dir)) \
+            if game_dir is not None else ([], [], "")
+        dlls = list(real_dlls)
+        seen = set()
+        for d in dlls:
+            try:
+                seen.add(str(d.resolve()).lower())
+            except OSError:
+                seen.add(str(d).lower())
+        for d in mo_dlls:
+            try:
+                key = str(d.resolve()).lower()
+            except OSError:
+                key = str(d).lower()
+            if key not in seen:
+                seen.add(key)
+                dlls.append(d)
+        lib_dirs = []
+        if real is not None:
+            try:
+                if real.exists():
+                    lib_dirs.append(real)
+            except OSError:
+                pass
+        for b in mo_bins:
+            parent = b.parent
+            if parent not in lib_dirs:
+                try:
+                    if parent.exists():
+                        lib_dirs.append(parent)
+                except OSError:
+                    pass
+        for d in mo_dlls:
+            parent = d.parent
+            if parent not in lib_dirs:
+                try:
+                    if parent.exists():
+                        lib_dirs.append(parent)
+                except OSError:
+                    pass
+        label = mo_label if mo_dlls else ""
+        return sorted(dlls), lib_dirs, label
+
     # --------------------------------------------------------------
     # Threading helpers
     # --------------------------------------------------------------
@@ -1948,31 +2151,124 @@ class AutoPorterGUI:
     def scan(self):
         plugins = self._plugins()
         if plugins is None:
-            messagebox.showerror(
-                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
+            if messagebox.askyesno(
+                    "No game found",
+                    "CompaSSE does not know where your game is.\n\n"
+                    "Open Settings to point it at SkyrimSE.exe?"):
+                self._open_settings()
             return
-        if not plugins.exists():
-            messagebox.showerror(
-                "Error", f"Plugins folder not found:\n{plugins}")
+        dlls, lib_dirs, label = self.get_plugin_sources()
+        if not dlls:
+            if messagebox.askyesno(
+                    "No mods found",
+                    f"Could not find any mods.\n\nLooked in:\n{plugins}"
+                    "\nAnd your mod manager (nothing enabled found)."
+                    "\n\nIf your mods live in Mod Organizer, open "
+                    "Settings to point CompaSSE at it?"):
+                self._open_settings()
             return
         self._clear_cards()
+        if label:
+            try:
+                self.plugins_hint.config(
+                    text=f"Plugins: {plugins}  ({label})")
+            except Exception:
+                pass
         self._check_table_stamp(plugins)
-        self._check_addresslib(plugins)
+        self._check_addresslib(lib_dirs)
         self._ctx = None
         self._counts = {}
         self._scan_data = []
-        self._run(lambda: self._do_scan(plugins), "Starting scan...")
+        self._run(lambda: self._do_scan(dlls, lib_dirs), "Starting scan...")
+
+    def locate_game_exe(self):
+        """Point CompaSSE at SkyrimSE.exe once; it is remembered."""
+        path = filedialog.askopenfilename(
+            title="Select SkyrimSE.exe",
+            filetypes=[("SkyrimSE.exe", "SkyrimSE.exe"),
+                       ("Executables", "*.exe"),
+                       ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if not Path(path).is_file():
+            messagebox.showerror("Error", "That file could not be read.")
+            return
+        if not core.save_game_exe(HERE, path):
+            messagebox.showerror("Error", "Could not remember that location.")
+            return
+        self.game_exe = Path(path)
+        try:
+            self.healer_tab.game_exe = self.game_exe
+        except Exception:
+            pass
+        self.clear()
+        self._refresh_header()
+        self.list_dlls()
+
+    def clear_mod_manager(self):
+        """Forget the Mod Organizer location; refresh the quick list."""
+        core.clear_mo2_ini(HERE)
+        self._refresh_header()
+        self.list_dlls()
+
+    def _refresh_header(self):
+        if self.game_exe:
+            self.game_lbl.config(text=game_version_line(self.game_exe),
+                                 fg=TEXT_PRIMARY)
+            self.plugins_hint.config(
+                text=f"Plugins: {plugins_dir_for(self.game_exe)}")
+        else:
+            self.game_lbl.config(text="No game found. Open the Settings tab.",
+                                 fg="#dc2626")
+            self.plugins_hint.config(text="")
+        try:
+            self.settings_tab.refresh()
+        except Exception:
+            pass
+
+    def locate_mod_manager(self):
+        """Point CompaSSE at ModOrganizer.ini once; it is remembered."""
+        if not self.game_exe or self._game_dir() is None:
+            messagebox.showerror(
+                "Error", "Set the game first, then point at Mod Organizer.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select ModOrganizer.ini",
+            filetypes=[("ModOrganizer.ini", "ModOrganizer.ini"),
+                       ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if modsrc.parse_instance(path) is None:
+            messagebox.showerror(
+                "Error", "That file is not a Mod Organizer setup.")
+            return
+        if not core.save_mo2_ini(HERE, path):
+            messagebox.showerror("Error", "Could not remember that location.")
+            return
+        self._refresh_header()
+        self.list_dlls()
 
     def list_dlls(self):
         """Instant file listing: one unchecked card per DLL, no analysis."""
         plugins = self._plugins()
-        if plugins is None or not plugins.exists():
+        if plugins is None:
+            return False
+        dlls, _lib_dirs, label = self.get_plugin_sources()
+        if not dlls:
             return False
         self._clear_cards()
+        if label:
+            try:
+                self.plugins_hint.config(
+                    text=f"Plugins: {plugins}  ({label})")
+            except Exception:
+                pass
         self._ctx = None
         self._counts = {}
         self._scan_data = []
-        for dll in sorted(plugins.glob("*.dll")):
+        for dll in dlls:
             card = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
             self._place_card(card)
             self.cards.append(card)
@@ -1987,7 +2283,7 @@ class AutoPorterGUI:
         self.sf.inner.grid_columnconfigure(0, weight=1, uniform="card")
         self.sf.inner.grid_columnconfigure(1, weight=1, uniform="card")
 
-    def _ensure_ctx(self, plugins):
+    def _ensure_ctx(self, lib_dirs=None):
         """One-time exe/library load shared by full and single scans."""
         if self._ctx is None:
             runtime_version = (core.runtime_version_from_exe(self.game_exe)
@@ -1998,7 +2294,11 @@ class AutoPorterGUI:
                     exe_data, exe_secs = core.load_exe_sections(str(self.game_exe))
                     game_ver = core.unpack_version(
                         core.runtime_version_from_exe(self.game_exe))
-                    match = core.find_versionlib(plugins, game_ver) if game_ver else None
+                    if lib_dirs is None:
+                        plugins = self._plugins()
+                        lib_dirs = [plugins] if plugins is not None else []
+                    match = core.find_versionlib_in_dirs(lib_dirs, game_ver) \
+                        if game_ver else None
                     if match is not None:
                         addr_lib = core.parse_library_any(str(match))
                 except Exception:
@@ -2006,10 +2306,9 @@ class AutoPorterGUI:
             self._ctx = (runtime_version, exe_data, exe_secs, addr_lib)
         return self._ctx
 
-    def _do_scan(self, plugins):
-        runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(plugins)
+    def _do_scan(self, dlls, lib_dirs=None):
+        runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(lib_dirs)
 
-        dlls = sorted(plugins.glob("*.dll"))
         total_mods = len(dlls)
         for i, dll in enumerate(dlls):
             self.root.after(
@@ -2074,7 +2373,7 @@ class AutoPorterGUI:
         self.rebuild_btn.config(text=button, state="normal")
         self.notice_frame.pack(fill="x", padx=10, pady=(4, 0))
 
-    def _check_addresslib(self, plugins, game_ver=None):
+    def _check_addresslib(self, lib_dirs, game_ver=None):
         """Warn when no Address Library file matches the game. Returns found."""
         self.lib_frame.pack_forget()
         if game_ver is None:
@@ -2084,7 +2383,9 @@ class AutoPorterGUI:
             game_ver = core.unpack_version(packed) if packed else None
         if game_ver is None:
             return False
-        if core.find_versionlib(plugins, game_ver) is not None:
+        if isinstance(lib_dirs, (str, Path)):
+            lib_dirs = [lib_dirs]
+        if core.find_versionlib_in_dirs(lib_dirs, game_ver) is not None:
             return True
         game_str = f"{game_ver[0]}.{game_ver[1]}.{game_ver[2]}"
         self.lib_lbl.config(
@@ -2098,22 +2399,33 @@ class AutoPorterGUI:
     def rebuild_translations(self):
         plugins = self._plugins()
         if plugins is None:
-            messagebox.showerror(
-                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
+            if messagebox.askyesno(
+                    "No game found",
+                    "CompaSSE does not know where your game is.\n\n"
+                    "Open Settings to point it at SkyrimSE.exe?"):
+                self._open_settings()
             return
+        _dlls, lib_dirs, _label = self.get_plugin_sources()
+        try:
+            plugins.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         if not plugins.exists():
             messagebox.showerror(
-                "Error", f"Plugins folder not found:\n{plugins}")
+                "Error", f"Could not use folder:\n{plugins}")
             return
         if not self.work.acquire("Updating helper data..."):
             return
-        _launch(self.root, self.work, lambda: self._rebuild_worker(plugins))
+        extra = [d for d in lib_dirs if d != plugins]
+        _launch(self.root, self.work,
+                lambda: self._rebuild_worker(plugins, extra))
 
-    def _rebuild_worker(self, plugins):
+    def _rebuild_worker(self, plugins, extra_dirs=None):
         try:
             ver = core.runtime_version_from_exe(self.game_exe)
             core.build_translations(str(self.game_exe), plugins,
-                                    game_version=ver)
+                                    game_version=ver,
+                                    extra_lib_dirs=extra_dirs)
         except Exception as exc:
             msg = str(exc)
             if "No old version bins" in msg:
@@ -2147,8 +2459,8 @@ class AutoPorterGUI:
                 lambda: self._scan_single_worker(card))
 
     def _scan_single_worker(self, card):
-        plugins = self._plugins()
-        runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(plugins)
+        _dlls, lib_dirs, _label = self.get_plugin_sources()
+        runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(lib_dirs)
         try:
             info = core.analyze_plugin(card.dll_path, runtime_version,
                                        include_hooks=True)
@@ -2248,10 +2560,15 @@ class AutoPorterGUI:
     def restore(self):
         plugins = self._plugins()
         if plugins is None:
-            messagebox.showerror(
-                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
+            if messagebox.askyesno(
+                    "No game found",
+                    "CompaSSE does not know where your game is.\n\n"
+                    "Open Settings to point it at SkyrimSE.exe?"):
+                self._open_settings()
             return
-        pairs = core.list_backups(plugins)
+        dlls, lib_dirs, _label = self.get_plugin_sources()
+        plugin_dirs = ([plugins] if plugins is not None else []) + lib_dirs
+        pairs = core.list_backups_all(plugin_dirs, dlls)
         if not pairs:
             messagebox.showinfo(
                 "Nothing to undo", "No saved originals found.")
@@ -2265,11 +2582,12 @@ class AutoPorterGUI:
         if not self.work.acquire(f"Restoring {len(pairs)} file(s)..."):
             messagebox.showinfo("Please wait", "Still working - try again.")
             return
-        _launch(self.root, self.work, lambda: self._restore_worker(plugins))
+        _launch(self.root, self.work,
+                lambda: self._restore_worker(plugin_dirs, dlls))
 
-    def _restore_worker(self, plugins):
+    def _restore_worker(self, plugin_dirs, dlls=None):
         try:
-            done = core.restore_backups(plugins)
+            done = core.restore_backups_all(plugin_dirs, dlls)
         except Exception as exc:
             self.root.after(
                 0, lambda: messagebox.showerror("Error", str(exc)))
@@ -2391,10 +2709,11 @@ class AutoPorterGUI:
 def main():
     root = tk.Tk()
     app = AutoPorterGUI(root)
-    if app.game_exe and app._plugins() and app._plugins().exists():
-        app.list_dlls()
-        app._check_table_stamp(app._plugins())
-        app._check_addresslib(app._plugins())
+    if app.game_exe and app._plugins():
+        if app.list_dlls():
+            _dlls, lib_dirs, _label = app.get_plugin_sources()
+            app._check_table_stamp(app._plugins())
+            app._check_addresslib(lib_dirs)
     root.mainloop()
 
 
