@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <cwchar>
 #include <intrin.h>
 #include <map>
@@ -516,6 +517,94 @@ static bool is_iddb_mapname(LPCWSTR name) {
            wcsstr(name, L"AddressLib") || wcsstr(name, L"IDDB");
 }
 
+// File access matching a mapping protection: a read-only temp handle
+// would fail callers mapping with write/execute (Error 5).
+static DWORD temp_access_for_protect(DWORD protect) {
+    DWORD access = GENERIC_READ;
+    if (protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        access |= GENERIC_WRITE;
+    if (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        access |= GENERIC_EXECUTE;
+    return access;
+}
+
+// Shadow mappings: a section left behind by an older run, a zombie
+// process or a no-shim run can be SMALLER than this run needs, and no
+// API resizes or deletes someone else's section (oversize views die
+// with Error 5). Bypass it with a fresh full-size section instead.
+static void iddb_shadow_name(const wchar_t* orig, wchar_t* out) {
+    size_t maxOrig = MAX_PATH - 11; // room for L"!CompaSSE" + NUL
+    size_t n = wcslen(orig);
+    if (n > maxOrig) n = maxOrig;
+    wcsncpy_s(out, MAX_PATH, orig, n);
+    wcscat_s(out, MAX_PATH, L"!CompaSSE");
+}
+
+static bool section_fits(HANDLE h, uint64_t need) {
+    if (!need) return true;
+    void* v = fpMapViewOfFile(h, FILE_MAP_READ, 0, 0, (SIZE_T)need);
+    if (v) { UnmapViewOfFile(v); return true; }
+    return false;
+}
+
+static uint64_t iddb_need_bytes() {
+    AcquireSRWLockShared(&g_lock);
+    uint32_t ids = g_loaded ? temp_entry_count(2) : 0;
+    ReleaseSRWLockShared(&g_lock);
+    return (uint64_t)ids * 16;
+}
+
+static HANDLE open_iddb_mapping(DWORD access, BOOL inherit, const wchar_t* name, uint64_t need) {
+    HANDLE h = fpOpenFileMappingW(access, inherit, name);
+    if (!h || !need || section_fits(h, need)) return h;
+    CloseHandle(h);
+    wchar_t shadow[MAX_PATH];
+    iddb_shadow_name(name, shadow);
+    HANDLE hs = fpOpenFileMappingW(access, inherit, shadow);
+    if (hs) {
+        if (section_fits(hs, need)) {
+            shim_log("OpenFileMappingW %ls stale (smaller than %llu) -> shadow %ls", name, need, shadow);
+            return hs;
+        }
+        CloseHandle(hs);
+    }
+    SetLastError(ERROR_FILE_NOT_FOUND);
+    shim_log("OpenFileMappingW %ls stale (smaller than %llu), no shadow", name, need);
+    return nullptr;
+}
+
+static HANDLE create_iddb_mapping(LPSECURITY_ATTRIBUTES sa, DWORD protect,
+                                  DWORD sizeHigh, DWORD sizeLow, const wchar_t* name) {
+    uint64_t reqSize = ((uint64_t)sizeHigh << 32) | (uint64_t)sizeLow;
+    HANDLE h = fpCreateFileMappingW(INVALID_HANDLE_VALUE, sa, protect, sizeHigh, sizeLow, name);
+    DWORD err = GetLastError();
+    if (!h || err != ERROR_ALREADY_EXISTS || !reqSize) return h;
+    if (section_fits(h, reqSize)) return h;
+    CloseHandle(h);
+    wchar_t shadow[MAX_PATH];
+    iddb_shadow_name(name, shadow);
+    HANDLE hs = fpCreateFileMappingW(INVALID_HANDLE_VALUE, sa, protect, sizeHigh, sizeLow, shadow);
+    DWORD serr = GetLastError();
+    if (!hs) {
+        shim_log("CreateFileMappingW %ls stale (smaller than %llu), shadow %ls FAILED (err=%lu)",
+                 name, reqSize, shadow, serr);
+        SetLastError(serr);
+        return nullptr;
+    }
+    if (serr == ERROR_ALREADY_EXISTS && !section_fits(hs, reqSize)) {
+        CloseHandle(hs);
+        shim_log("CreateFileMappingW %ls stale, shadow %ls stale too - giving up", name, shadow);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    SetLastError(ERROR_ALREADY_EXISTS);
+    shim_log("CreateFileMappingW %ls stale (smaller than %llu) -> shadow %ls size=%llu",
+             name, reqSize, shadow, reqSize);
+    return hs;
+}
+
 // Same check, but also hands back the file path for version comparison.
 static bool versionlib_handle_path(HANDLE h, wchar_t* out) {
     DWORD n = GetFinalPathNameByHandleW(h, out, MAX_PATH, 0);
@@ -913,7 +1002,7 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
         wchar_t modName[MAX_PATH] = L"(unknown)";
         if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
         const wchar_t* base = wcsrchr(modName, L'\\');
-        HANDLE h = fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+        HANDLE h = create_iddb_mapping(sa, protect, sizeHigh, sizeLow, name);
         DWORD err = h ? 0 : GetLastError();
         shim_log("CreateFileMappingW %ls size=%llu -> %s (err=%lu) for %ls", name,
                  reqSize, h ? "ok" : "FAILED", err, base ? base + 1 : modName);
@@ -956,7 +1045,7 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
         const wchar_t* tempPath = format == 5 ? g_tempPath5 : format == 1 ? g_tempPath1 : g_tempPath2;
         ReleaseSRWLockExclusive(&g_lock);
         if (ok) {
-            HANDLE temp = fpCreateFileW(tempPath, GENERIC_READ,
+            HANDLE temp = fpCreateFileW(tempPath, temp_access_for_protect(protect),
                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                         nullptr, OPEN_EXISTING, 0, nullptr);
             if (temp != INVALID_HANDLE_VALUE) {
@@ -974,8 +1063,13 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
 
 // Log-only: who opens the shared IDDB mapping, and whether it exists yet.
 static HANDLE WINAPI Hook_OpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR name) {
-    HANDLE h = fpOpenFileMappingW(access, inherit, name);
-    if (is_iddb_mapname(name)) {
+    HANDLE h;
+    bool iddb = is_iddb_mapname(name);
+    if (iddb)
+        h = open_iddb_mapping(access, inherit, name, iddb_need_bytes());
+    else
+        h = fpOpenFileMappingW(access, inherit, name);
+    if (iddb) {
         HMODULE caller = resolve_caller_module(g_self);
         wchar_t modName[MAX_PATH] = L"(unknown)";
         if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
