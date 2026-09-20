@@ -161,10 +161,54 @@ static void log_ptr(const char* name, void* p) {
     shim_log("  [%s=%p (%s) -> %p (%s)]", name, p, modName, (void*)pointee, tgtName);
 }
 
+// ---- Legacy loader wakeup: SKSE's first message means plugin loading
+// is done. The handler only signals; a worker activates auto-detected
+// legacy plugins (Query/Load) so a faulting one can't stall SKSE.
+static HANDLE g_postLoadEvent = nullptr;
+static const SKSEInterface* g_savedSkse = nullptr;
+
+static void OnSkseMessage(void* /*msg*/) {
+    if (g_postLoadEvent) SetEvent(g_postLoadEvent);
+}
+
+static DWORD WINAPI LegacyWaiter(LPVOID) {
+    if (WaitForSingleObject(g_postLoadEvent, 60000) != WAIT_OBJECT_0) {
+        shim_log("legacy: no post-load signal in 60s, skipping activation");
+        return 0;
+    }
+    legacy_activate_all((const void*)g_savedSkse);
+    return 0;
+}
+
+struct SKSEMessagingIface {
+    uint32_t interfaceVersion;
+    bool (*RegisterListener)(uint32_t handle, const char* sender,
+                             void (*handler)(void*));
+};
+
 // ---- SKSEPlugin_Load ----
 extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse) {
     bool ok = install_hooks(g_selfModule);
     AddVectoredExceptionHandler(1, CrashVEH);
+    if (skse) {
+        g_savedSkse = skse;
+        g_postLoadEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+        auto query = skse->QueryInterface;
+        SKSEMessagingIface* msg = query
+            ? (SKSEMessagingIface*)query(5) // kMessaging
+            : nullptr;
+        HANDLE waiter = nullptr;
+        if (msg && msg->RegisterListener &&
+            msg->RegisterListener(skse->GetPluginHandle(), "SKSE",
+                                  OnSkseMessage)) {
+            shim_log("legacy: post-load listener registered");
+            waiter = CreateThread(nullptr, 0, LegacyWaiter, nullptr, 0,
+                                  nullptr);
+        } else {
+            shim_log("legacy: messaging unavailable, no legacy activation");
+        }
+        if (waiter) CloseHandle(waiter);
+    }
     return true;
 }
 

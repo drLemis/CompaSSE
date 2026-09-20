@@ -1234,6 +1234,31 @@ def main():
     check("T42.nodir", C.saved_game_exe(None) is None
           and C.save_game_exe(None, _exe42) is False, "")
 
+    # ---------------------------------------------------------------- T44: V1 + versionlib- passthrough
+    # Live incident (shim 1.5.2): healthy fmt5-native mods that read via
+    # ifstream (istream imports, no mmap) classify DECODER_V1 and were
+    # served fmt1 temps for versionlib- requests. Their format check
+    # failed, Load returned false, SKSE reported "incompatible during
+    # load" (EVLaS, NativeEditorIDFix on 1.7.104). A versionlib- opener
+    # that works without the shim parses the on-disk fmt5, so serving
+    # fmt1 is guaranteed wrong: pass the real bytes through instead.
+    _hooks44 = (HERE / "DLL" / "hooks.cpp").read_text(encoding="utf-8")
+    _flat44 = re.sub(r"\s+", " ", _hooks44)
+    check("T44.no-v1-fmt1", "type == DECODER_V1) format = 1" not in _flat44,
+          "V1 versionlib openers still routed to fmt1")
+    _serve44 = re.search(r"static HANDLE serve_versionlib\(.*?^}",
+                         _hooks44, re.S | re.M)
+    check("T44.serve-pass",
+          _serve44 is not None and "V1 versionlib" in _serve44.group(0),
+          "serve_versionlib lacks the V1 passthrough")
+    _mapa44 = re.search(r"static HANDLE WINAPI Hook_CreateFileMappingA\(.*?^}",
+                        _hooks44, re.S | re.M)
+    check("T44.mapa-parity",
+          _mapa44 is not None
+          and "versionlib_handle_path" in _mapa44.group(0)
+          and "V1 versionlib" in _mapa44.group(0),
+          "ANSI mapping hook ignores basename / V1 rule")
+
     # ---------------------------------------------------------------- T43: shim version tag
     # DLL/hooks.cpp logs COMPASSE_SHIM_VERSION on every run; it must match
     # the tool version or game logs misidentify the build.

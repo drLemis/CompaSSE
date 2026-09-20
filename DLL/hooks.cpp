@@ -17,11 +17,14 @@
 #include <utility>
 #include <vector>
 
-#define COMPASSE_SHIM_VERSION "1.5.2"
+#define COMPASSE_SHIM_VERSION "1.5.3"
 
 // ---- GetProcAddress interception (SKSE version bypass) ----
 typedef FARPROC (WINAPI* pfnGetProcAddress)(HMODULE, LPCSTR);
 static pfnGetProcAddress fpGetProcAddress = nullptr;
+
+// Minted below (needs the exe-version helpers); see fabricate_version_struct.
+static FARPROC WINAPI fabricate_version_struct(HMODULE mod);
 
 static FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
     FARPROC result = fpGetProcAddress(hModule, lpProcName);
@@ -32,6 +35,14 @@ static FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
     if (((uintptr_t)lpProcName & ~0xFFFF) == 0) return result;
     if (lpProcName[0] != 'S' || lpProcName[18] != '\0') return result;
     if (memcmp(lpProcName, "SKSEPlugin_Version", 18) != 0) return result;
+
+    if (!result) {
+        // Legacy plugin: no version export, SKSE would skip it outright.
+        // Hand it a fabricated compatible struct so it gets attempted.
+        FARPROC fake = fabricate_version_struct(hModule);
+        if (fake) return fake;
+        return result;
+    }
 
     // Patch versionIndependence flags so SKSE accepts the plugin.
     // versionIndependenceEx at +0x304: set AddressLibraryV5 (0x2)
@@ -301,6 +312,219 @@ static BOOL CALLBACK init_exe_version(PINIT_ONCE, PVOID, PVOID*) {
 static bool is_old_version_path(const wchar_t* path) {
     InitOnceExecuteOnce(&g_verOnce, init_exe_version, nullptr, nullptr);
     return g_exeVersion[0] && !wcsstr(path, g_exeVersion);
+}
+
+// Fabricated version structs for legacy plugins (Query+Load but no
+// SKSEPlugin_Version export): SKSE 2.3.1 skips those outright. Layout
+// mirrors SKSEPluginVersionData (see main.cpp); SKSE loads plugins
+// sequentially, so plain slots are enough.
+struct FakeVersionSlot {
+    HMODULE mod = nullptr;
+    bool consumed = false; // handed out: SKSE owns this module, skip our loader
+    uint8_t bytes[0x350] = {};
+};
+static FakeVersionSlot g_fakeVersions[64];
+static LONG g_fakeVersionCount = 0;
+
+static FARPROC WINAPI fabricate_version_struct(HMODULE mod) {
+    wchar_t path[MAX_PATH] = {};
+    if (!mod || !GetModuleFileNameW(mod, path, MAX_PATH))
+        return nullptr;
+    // Only actual SKSE plugins, never ourselves or system DLLs.
+    size_t len = wcslen(path);
+    if (len < 5)
+        return nullptr;
+    wchar_t low[MAX_PATH] = {};
+    for (size_t i = 0; i < len && i < MAX_PATH - 1; ++i)
+        low[i] = (wchar_t)towlower(path[i]);
+    if (!wcsstr(low, L"skse\\plugins"))
+        return nullptr;
+    if (!fpGetProcAddress(mod, "SKSEPlugin_Query") ||
+        !fpGetProcAddress(mod, "SKSEPlugin_Load"))
+        return nullptr;
+    for (LONG i = 0; i < g_fakeVersionCount && i < 64; ++i) {
+        if (g_fakeVersions[i].mod == mod) {
+            g_fakeVersions[i].consumed = true;
+            return (FARPROC)(void*)g_fakeVersions[i].bytes;
+        }
+    }
+    LONG idx = InterlockedIncrement(&g_fakeVersionCount) - 1;
+    if (idx < 0 || idx >= 64)
+        return nullptr;
+    FakeVersionSlot& slot = g_fakeVersions[idx];
+    slot.mod = mod;
+    uint8_t* b = slot.bytes;
+    *(uint32_t*)(b + 0x000) = 1; // dataVersion
+    *(uint32_t*)(b + 0x004) = 0x00010000; // pluginVersion 1.0.0.0
+    const wchar_t* base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    char name[256] = {};
+    for (int i = 0; i < 255 && base[i] && base[i] != L'.'; ++i)
+        name[i] = (char)(base[i] < 128 ? base[i] : '?');
+    memcpy(b + 0x008, name, sizeof(name)); // pluginName
+    memcpy(b + 0x108, "CompaSSE", 9); // author
+    *(uint32_t*)(b + 0x304) = 0x2; // versionIndependenceEx: AddressLibraryV5
+    *(uint32_t*)(b + 0x308) = 0x5; // versionIndependence: AddressLibrary|Structs
+    unsigned a = 0, bb = 0, c = 0; // compatibleVersions[0] = running game
+    InitOnceExecuteOnce(&g_verOnce, init_exe_version, nullptr, nullptr);
+    if (swscanf_s(g_exeVersion, L"%u-%u-%u", &a, &bb, &c) == 3)
+        *(uint32_t*)(b + 0x30C) =
+            ((a & 0xFF) << 24) | ((bb & 0xFF) << 16) |
+            ((c & 0xFFF) << 4);
+    shim_log("GPA hook: fabricated SKSEPlugin_Version for legacy %hs", name);
+    slot.consumed = true;
+    return (FARPROC)b;
+}
+
+// Legacy loader: plugins with Query+Load but no version struct are
+// skipped by SKSE outright (it never maps them - no load event to
+// catch), so at activation we scan Data/SKSE/Plugins/*.dll and map
+// what SKSE left unowned ourselves, then invoke Query/Load with
+// SKSE's own interface. No ini, no list. Best effort: Query may
+// decline, Load may fail, init may fault (SEH-isolated per plugin
+// below).
+// call_query/call_load stay POD-only: __try must not share scope with
+// C++ objects (C2712). A faulting legacy init must never take the game.
+typedef bool (*LegacyQueryFn)(const void* skse, void* info);
+typedef bool (*LegacyLoadFn)(const void* skse);
+struct LegacyPluginInfo {
+    uint32_t infoVersion = 1;
+    const char* name = nullptr;
+    uint32_t version = 1;
+};
+
+static bool call_legacy_query(LegacyQueryFn fn, const void* skse,
+                              LegacyPluginInfo* info, bool& crashed) {
+    crashed = false;
+    __try {
+        return fn(skse, info);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        crashed = true;
+        return false;
+    }
+}
+
+static bool call_legacy_load(LegacyLoadFn fn, const void* skse,
+                             bool& crashed) {
+    crashed = false;
+    __try {
+        return fn(skse);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        crashed = true;
+        return false;
+    }
+}
+
+static HMODULE map_legacy_module(const wchar_t* full, bool& crashed) {
+    crashed = false;
+    __try {
+        return LoadLibraryW(full);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        crashed = true;
+        return nullptr;
+    }
+}
+
+void legacy_activate_all(const void* skse) {
+    if (!skse) {
+        shim_log("legacy: no SKSE interface, skipping activation");
+        return;
+    }
+    if (!g_self)
+        return;
+    wchar_t plugdir[MAX_PATH];
+    if (!GetModuleFileNameW(g_self, plugdir, MAX_PATH))
+        return;
+    wchar_t* bs = wcsrchr(plugdir, L'\\');
+    if (!bs)
+        return;
+    *bs = 0; // ...\Data\SKSE\Plugins: our DLL lives right in it
+    wchar_t selfPath[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, selfPath, MAX_PATH);
+    const wchar_t* selfBase = wcsrchr(selfPath, L'\\');
+    selfBase = selfBase ? selfBase + 1 : selfPath;
+    wchar_t pattern[MAX_PATH];
+    wcscpy_s(pattern, plugdir);
+    wcscat_s(pattern, L"\\*.dll");
+    WIN32_FIND_DATAW fd;
+    HANDLE fh = FindFirstFileW(pattern, &fd);
+    if (fh == INVALID_HANDLE_VALUE) {
+        shim_log("legacy: auto-scan found no DLLs (%lu)", GetLastError());
+        return;
+    }
+    int done = 0;
+    do {
+        if (done >= 64)
+            break;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        if (_wcsicmp(fd.cFileName, selfBase) == 0)
+            continue;
+        if (GetModuleHandleW(fd.cFileName))
+            continue; // SKSE already owns it
+        wchar_t full[MAX_PATH];
+        wcscpy_s(full, plugdir);
+        wcscat_s(full, L"\\");
+        wcscat_s(full, fd.cFileName);
+        if (GetModuleHandleW(full))
+            continue;
+        char nm[MAX_PATH] = {};
+        for (int i = 0; i < MAX_PATH - 1 && fd.cFileName[i]; ++i)
+            nm[i] = (char)(fd.cFileName[i] < 128 ? fd.cFileName[i] : '?');
+        HMODULE mod = nullptr;
+        bool mapCrashed = false;
+        mod = map_legacy_module(full, mapCrashed);
+        if (mapCrashed) {
+            shim_log("legacy: %s CRASHED while mapping, skipped", nm);
+            continue;
+        }
+        if (!mod) {
+            shim_log("legacy: %s map failed (%lu), skipping", nm,
+                     GetLastError());
+            continue;
+        }
+        if (fpGetProcAddress(mod, "SKSEPlugin_Version")) {
+            FreeLibrary(mod); // modern plugin, SKSE owns it
+            continue;
+        }
+        bool owned = false;
+        for (LONG q = 0; q < g_fakeVersionCount && q < 64; ++q) {
+            if (g_fakeVersions[q].mod == mod && g_fakeVersions[q].consumed) {
+                owned = true;
+                break;
+            }
+        }
+        if (owned) {
+            FreeLibrary(mod); // already owned by SKSE, drop our reference
+            continue;
+        }
+        auto qfn = (LegacyQueryFn)fpGetProcAddress(mod, "SKSEPlugin_Query");
+        auto lfn = (LegacyLoadFn)fpGetProcAddress(mod, "SKSEPlugin_Load");
+        if (!qfn || !lfn) {
+            FreeLibrary(mod); // support lib, not a plugin
+            continue;
+        }
+        shim_log("legacy: attempting load of %s", nm);
+        LegacyPluginInfo info;
+        info.name = nm;
+        bool crashed = false;
+        if (!call_legacy_query(qfn, skse, &info, crashed)) {
+            shim_log("legacy: %s %s", nm,
+                     crashed ? "CRASHED in Query, skipped"
+                             : "declined Query, skipped");
+            continue;
+        }
+        if (!call_legacy_load(lfn, skse, crashed)) {
+            shim_log("legacy: %s %s", nm,
+                     crashed ? "CRASHED in Load, skipped"
+                             : "Load returned false, skipped");
+            continue;
+        }
+        ++done;
+        shim_log("legacy: %s loaded ok", nm);
+    } while (FindNextFileW(fh, &fd));
+    FindClose(fh);
+    shim_log("legacy: auto-scan done (%d legacy loaded)", done);
 }
 
 // Quarantine list from CompaSSE\quarantine.ini (one decimal/hex ID per
@@ -745,6 +969,69 @@ static void ensure_buffers(const wchar_t* binPath) {
         int added = apply_translations(have);
         if (added > 0)
             shim_log("ensure_buffers: translations added %d missing ID(s)", added);
+        // Fold in the sibling version- file (same game version): it can
+        // carry IDs this dense file lacks, and version- readers get this
+        // merged temp now - so every ID either file has must be in it.
+        // Absent slots only, never overwrites; capped to the slot range.
+        {
+            wchar_t vlib[MAX_PATH];
+            wcscpy_s(vlib, binPath);
+            if (!wcsstr(vlib, L"versionlib-")) {
+                // Caller asked for version- itself; normalize to the
+                // versionlib- form first (same running version either way).
+                wchar_t* vp0 = wcsstr(vlib, L"version-");
+                if (vp0) {
+                    wmemmove(vp0 + 11, vp0 + 8, wcslen(vp0 + 8) + 1);
+                    wmemcpy(vp0, L"versionlib-", 11);
+                }
+            }
+            wchar_t* vp = wcsstr(vlib, L"versionlib-");
+            if (vp) {
+                wchar_t sib[MAX_PATH];
+                wcscpy_s(sib, vlib);
+                wchar_t* sp = wcsstr(sib, L"versionlib-");
+                wmemmove(sp + 8, sp + 11, wcslen(sp + 11) + 1);
+                wmemcpy(sp, L"version-", 8);
+                HANDLE h = fpCreateFileW(sib, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    LARGE_INTEGER sz;
+                    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 &&
+                        sz.QuadPart <= (LONGLONG)(1 << 28)) {
+                        std::vector<uint8_t> sbuf((size_t)sz.QuadPart);
+                        DWORD rd = 0, got = 0;
+                        while (got < sbuf.size()) {
+                            if (!ReadFile(h, sbuf.data() + got,
+                                          (DWORD)(sbuf.size() - got), &rd, nullptr) || !rd)
+                                break;
+                            got += rd;
+                        }
+                        if (got == sbuf.size()) {
+                            std::vector<std::pair<uint64_t, uint64_t>> se;
+                            uint32_t sv[4];
+                            std::string sn;
+                            uint32_t sp = 0;
+                            if (parse_format2(sbuf.data(), sbuf.size(), se, sv, sn, sp)) {
+                                int filled = 0;
+                                for (auto& e : se) {
+                                    if (e.first < entries.size() &&
+                                        have.find(e.first) == have.end()) {
+                                        have[e.first] = e.second;
+                                        ++filled;
+                                    }
+                                }
+                                if (filled > 0)
+                                    shim_log("ensure_buffers: version- sibling filled %d missing ID(s)", filled);
+                            } else {
+                                shim_log("ensure_buffers: version- sibling unreadable, skipping");
+                            }
+                        }
+                    }
+                    CloseHandle(h);
+                }
+            }
+        }
         std::vector<std::pair<uint64_t, uint64_t>> merged(have.begin(), have.end());
         std::sort(merged.begin(), merged.end());
         size_t srcCount = entries.size();
@@ -898,14 +1185,18 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
     wchar_t modName[MAX_PATH] = {};
     if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
 
-    // Determine prefix: "version-" (old SE) vs "versionlib-" (AE/NG)
+    // Readers come for fmt1 when they open a version- file by name;
+    // that expectation is strict, independent of decoder detection
+    // (observed live: a V5-classified reader rejecting a fmt2 temp
+    // with "Unsupported address library format: 2").
     const wchar_t* bs = wcsrchr(path, L'\\');
     const wchar_t* fs = wcsrchr(path, L'/');
     const wchar_t* base = (bs && fs) ? (bs > fs ? bs + 1 : fs + 1)
                         : bs ? bs + 1
                         : fs ? fs + 1
                         : path;
-    bool hasVersionPrefix = (_wcsnicmp(base, L"version-", 8) == 0 && _wcsnicmp(base, L"versionlib-", 11) != 0);
+    bool isVersionFile = (_wcsnicmp(base, L"version-", 8) == 0 &&
+                          _wcsnicmp(base, L"versionlib-", 11) != 0);
 
     // SKSE itself (skse64*.dll) always needs the real file - pass through
     if (caller) {
@@ -924,19 +1215,24 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
     }
 
     // One shared mapping per game version: every caller must map the same
-    // byte count, so everyone gets the same fmt1/2 bytes. Dual V2/V5
-    // readers parse them through their V2 branch (data-identical for
-    // present IDs); a fmt5 temp would size their mapping differently
-    // from pure-V2 holders of the same name and the second one to load
-    // would die with "failed to create shared mapping".
+    // byte count, so everyone gets the same fmt1/2 bytes - including
+    // "version-" readers (their sparse file is a strict subset of the
+    // dense one, so the transcoded temp answers every lookup they have).
+    // Dual V2/V5 readers parse them through their V2 branch
+    // (data-identical for present IDs); a fmt5 temp would size their
+    // mapping differently from pure-V2 holders of the same name and the
+    // second one to load would die with "failed to create shared mapping".
     DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
     int format;
     bool dualV5 = caller && module_supports_fmt5(caller);
-    if (hasVersionPrefix) {
-        shim_log("serve %ls -> pass-through version- file for %ls (decoder=%d)",
-                 path, modName[0] ? modName : L"(unknown)", (int)type);
+    // versionlib- openers parse the on-disk fmt5 (or its V2 branch); a V1
+    // temp fails them, so V1-classified ones keep the real file untouched.
+    if (!isVersionFile && caller && type == DECODER_V1) {
+        shim_log("serve %ls -> pass-through V1 versionlib reader for %ls", path,
+                 modName[0] ? modName : L"(unknown)");
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
-    } else if (type == DECODER_V1) format = 1;
+    }
+    if (isVersionFile) format = 1;
     else format = 2;
     AcquireSRWLockExclusive(&g_lock);
     ensure_buffers(path);
@@ -1015,30 +1311,27 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
         HMODULE caller = resolve_caller_module(g_self);
         DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
 
-        // Determine prefix (name may be NULL for unnamed mappings)
-        bool hasVersionPrefix = false;
-        if (name) {
-            const wchar_t* bs = wcsrchr(name, L'\\');
-            const wchar_t* fs = wcsrchr(name, L'/');
-            const wchar_t* base = (bs && fs) ? (bs > fs ? bs + 1 : fs + 1)
-                                : bs ? bs + 1
-                                : fs ? fs + 1
-                                : name;
-            hasVersionPrefix = (_wcsnicmp(base, L"version-", 8) == 0 &&
-                                _wcsnicmp(base, L"versionlib-", 11) != 0);
-        }
-
     int format;
-    if (hasVersionPrefix) {
-        return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
-    }
     {
         wchar_t fpath[MAX_PATH];
         if (versionlib_handle_path(hFile, fpath) && is_old_version_path(fpath))
             return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+        // File-backed readers of a version- file expect fmt1 bytes,
+        // same as stream readers (see serve_versionlib).
+        const wchar_t* bs = wcsrchr(fpath, L'\\');
+        const wchar_t* fs = wcsrchr(fpath, L'/');
+        const wchar_t* base = (bs && fs) ? (bs > fs ? bs + 1 : fs + 1)
+                            : bs ? bs + 1
+                            : fs ? fs + 1
+                            : fpath;
+        bool versionDash = (_wcsnicmp(base, L"version-", 8) == 0 &&
+            _wcsnicmp(base, L"versionlib-", 11) != 0);
+        // V1 versionlib readers keep the real bytes (see serve_versionlib).
+        if (!versionDash && caller && type == DECODER_V1)
+            return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+        format = versionDash ? 1 : 2;
     }
     bool dualV5 = caller && module_supports_fmt5(caller);
-    format = (caller && type == DECODER_V1) ? 1 : 2;
 
         wchar_t modName[MAX_PATH] = L"(unknown)";
         if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
@@ -1105,7 +1398,25 @@ static HANDLE WINAPI Hook_CreateFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES
         HMODULE caller = resolve_caller_module(g_self);
         DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
         bool dualV5 = caller && module_supports_fmt5(caller);
-        int format = (caller && type == DECODER_V1) ? 1 : 2;
+        // Same basename rule as the W twin (see serve_versionlib).
+        wchar_t fpath[MAX_PATH] = {};
+        bool versionDash = false;
+        if (versionlib_handle_path(hFile, fpath)) {
+            if (is_old_version_path(fpath))
+                return fpCreateFileMappingA(hFile, sa, protect, sizeHigh, sizeLow, name);
+            const wchar_t* bs = wcsrchr(fpath, L'\\');
+            const wchar_t* fs = wcsrchr(fpath, L'/');
+            const wchar_t* base = (bs && fs) ? (bs > fs ? bs + 1 : fs + 1)
+                                : bs ? bs + 1
+                                : fs ? fs + 1
+                                : fpath;
+            versionDash = (_wcsnicmp(base, L"version-", 8) == 0 &&
+                _wcsnicmp(base, L"versionlib-", 11) != 0);
+        }
+        // V1 versionlib readers keep the real bytes (see serve_versionlib).
+        if (!versionDash && caller && type == DECODER_V1)
+            return fpCreateFileMappingA(hFile, sa, protect, sizeHigh, sizeLow, name);
+        int format = versionDash ? 1 : 2;
 
         wchar_t modName[MAX_PATH] = L"(unknown)";
         if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);

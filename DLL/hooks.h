@@ -9,3 +9,7 @@ void uninstall_hooks();
 void set_self(HMODULE module);
 // Append a timestamped line to <dll dir>\<dll name>.log. Never crashes.
 void shim_log(const char* fmt, ...);
+// Attempt SKSEPlugin_Query/Load for auto-detected legacy plugins (no
+// version struct). Called once SKSE signals post-load; safe to call
+// any number of times, at most one activation runs.
+void legacy_activate_all(const void* skse);

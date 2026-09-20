@@ -11,17 +11,18 @@ needed - everything happens in memory when SKSE loads each plugin.
 2. [How SKSE Loads Plugins](#how-skse-loads-plugins)
 3. [The Address Library Problem](#the-address-library-problem)
 4. [Architecture](#architecture)
-5. [Hook Chain (14 hooks)](#hook-chain-14-hooks)
+5. [Hook Chain (17 hooks)](#hook-chain-17-hooks)
 6. [Address Library Formats](#address-library-formats)
 7. [Format Detection (Decoder)](#format-detection-decoder)
 8. [Serve Logic](#serve-logic)
 9. [Translation](#translation)
 10. [GetProcAddress + LoadLibrary Hooks](#getprocaddress--loadlibrary-hooks)
-11. [MessageBox Interception](#messagebox-interception)
-12. [Crash VEH](#crash-veh)
-13. [Deployment](#deployment)
-14. [Log File Reference](#log-file-reference)
-15. [Known Limitations](#known-limitations)
+11. [Legacy Loader](#legacy-loader)
+12. [MessageBox Interception](#messagebox-interception)
+13. [Crash VEH](#crash-veh)
+14. [Deployment](#deployment)
+15. [Log File Reference](#log-file-reference)
+16. [Known Limitations](#known-limitations)
 
 ---
 
@@ -107,18 +108,20 @@ parse, but older plugins only understand format 1 or 2.
 | ------+--------------+--------------+-------------+--------|
 |       |              |              |             |        |
 |  +----v--------------v--------------v-------------v-----+  |
-|  |           !CompaSSE.dll (14 hooks)                   |  |
+|  |           !CompaSSE.dll (17 hooks)                   |  |
 |  |                                                      |  |
 |  |  GetProcAddress hook                                 |  |
 |  |    Patches SKSEPlugin_Version flags so SKSE          |  |
-|  |    accepts old plugins                               |  |
+|  |    accepts old plugins; fabricates the struct        |  |
+|  |    for legacy plugins that lack it                   |  |
 |  |                                                      |  |
 |  |  LoadLibraryW/A/ExW + LdrLoadDll hooks               |  |
 |  |    Catch plugins SKSE inspects directly from         |  |
 |  |    the export table (bypassing GetProcAddress)       |  |
 |  |                                                      |  |
 |  |  CreateFileW / CreateFileA / CreateFile2             |  |
-|  |  CreateFileMappingW / NtCreateFile / NtOpenFile      |  |
+|  |  CreateFileMappingW/A / OpenFileMappingW/A /         |  |
+|  |  MapViewOfFile / NtCreateFile / NtOpenFile           |  |
 |  |    Intercept address library file opens              |  |
 |  |    Determine caller's format capability              |  |
 |  |    Serve compatible temp file                        |  |
@@ -158,9 +161,9 @@ parse, but older plugins only understand format 1 or 2.
 | `build_shim.bat`     | MSVC build script                                                                   |
 | `deploy.ps1`         | Build + deploy automation                                                           |
 
-## Hook Chain (14 hooks)
+## Hook Chain (17 hooks)
 
-The shim installs 14 hooks via [MinHook](https://github.com/TsudaKageyu/minhook):
+The shim installs 17 hooks via [MinHook](https://github.com/TsudaKageyu/minhook):
 
 ### File API hooks (7)
 
@@ -339,19 +342,33 @@ unmodified. SKSE itself needs the actual address library.
 ### 3. Format prefix routing
 
 **`versionlib-` prefix (most plugins):**
-- `DECODER_V1` -> format 1 (transcoded temp file; V1 readers check
-  `format == 1` strictly, so fmt2 is rejected - never serve fmt2 to V1)
+- `DECODER_V1` -> pass-through (real file). These readers open a fmt5
+  file by name yet carry istream-only imports: they parse fmt5 natively
+  via ifstream (healthy 1.7.99+ mods), so any transcoded temp fails
+  their format check (observed live: EVLaS/NativeEditorIDFix
+  "incompatible during load" on fmt1 temps). Never serve fmt1 here.
 - Everyone else (`DECODER_V2`, `DECODER_V5`, `DECODER_NONE`) -> format 2
   (transcoded temp file; the one shared mapping per game version stays
   one size)
 
 **`version-` prefix (old SE plugins):**
-- ALWAYS pass through the real file. It is already format 1, exactly what
-  old CommonLibSSE readers check for (`format == 1` strictly). Never
-  substitute versionlib-derived data: the two files have different ID
-  coverage, so a merged file drops IDs healthy mods need (observed live:
-  ActorLimitFix "Identifier not found, 41450" when served a
-  versionlib-derived temp instead of its real version- file).
+- ALWAYS fmt1 temp, regardless of decoder detection. Opening a file
+  named `version-` means the reader expects `format == 1` strictly -
+  decoder heuristics can misclassify such readers as V5 (observed live:
+  PayloadInterpreter "Unsupported address library format: 2" on a fmt2
+  temp). The sparse file is verified to be a strict subset of the dense
+  one (all 395,946 entries of `version-1-7-104-0.bin` present in
+  `versionlib-1-7-104-0.bin` with identical offsets), and
+  `ensure_buffers` additionally folds any sibling-only IDs into the
+  merge - so the temp answers every lookup the real file would. This
+  keeps one shared-mapping size per game version even when a plugin
+  reads `version-` but maps the common name (observed live:
+  PayloadInterpreter "Failed to find the id 523660" from a short
+  395,946-entry span over the shared board).
+- Previously passed through for the ActorLimitFix "Identifier not found,
+  41450" incident (a merged temp once dropped IDs the real file had).
+  That class is closed by the subset guarantee plus the sibling fold
+  above; the `kKeepIds` backstop stays regardless.
 
 The current runtime is detected by extracting the version string from the
 bin filename and storing it in `g_currentVersion`.
@@ -392,15 +409,21 @@ caller reads the temp file as if it were the real address library.
 ```
 Caller requests current-version versionlib-*.bin
 +- Caller is SKSE -> pass-through (real file)
-+- Caller is V1 (istream only, old CommonLibSSE) -> fmt1 temp file
++- Caller is V1 (istream only) -> pass-through (real file: it parses
+   the on-disk fmt5 natively; a temp of any other format fails it)
 +- Anyone else (V2, dual V2/V5, unresolvable) -> faithful fmt2 temp
    (non-zero IDs + translations for missing ones). Dual readers parse
    it through their V2 branch, data-identical for present IDs.
    Everyone maps the same byte count, so no shared-mapping clash.
 ```
 
-Caller requests version-*.bin (any version)
-+- ALWAYS pass-through (real file is already fmt1)
+Caller requests version-*.bin (current game version)
++- ALWAYS fmt1 temp, regardless of decoder detection (a `version-`
+   opener expects `format == 1` strictly; see section 3 above).
+
+Caller requests version-*.bin (older game version)
++- ALWAYS pass-through (real file is already fmt1, and the temp would
+   carry another version's data)
 
 Caller requests an old-version versionlib-*.bin
 +- ALWAYS pass-through (it is another mod's fallback chain; the shim's
@@ -492,6 +515,26 @@ The four hooks cover all DLL load paths:
 **Performance:** All version-check hooks are lightweight - they only activate
 for `SKSEPlugin_Version` lookups (GetProcAddress) or once per module load
 (LoadLibrary/LdrLoadDll).
+
+## Legacy Loader
+
+Plugins with `SKSEPlugin_Query`/`SKSEPlugin_Load` but no
+`SKSEPlugin_Version` export are skipped by SKSE outright (`no version
+data`, handle 0) - SKSE resolves the export itself, so no API hook can
+interpose. The shim loads them instead:
+
+- On SKSE's first post-load message, a worker scans `Data/SKSE/Plugins/*.dll`
+  (top level only) and maps each file SKSE left unowned. In-memory exports
+  decide: version struct or consumed fabrication means SKSE owns it
+  (released again), missing Query/Load means support lib (released again).
+  No ini, no list. Most files are SKSE-owned and never mapped at all.
+- The worker calls Query then Load on the keepers with SKSE's own interface,
+  holding the reference SKSE never took.
+- Each call runs under SEH isolation: a faulting legacy init is logged
+  and skipped instead of taking down the game.
+- The GetProcAddress fabrication path covers the same modules if SKSE
+  ever probes them first; a consumed fabrication means SKSE owns the
+  module and the loader stands down (no double init).
 
 ## MessageBox Interception
 
