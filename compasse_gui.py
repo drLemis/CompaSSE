@@ -524,6 +524,37 @@ class ScrollFrame(tk.Frame):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
+# Max cards on one page. Embedded widgets past 32767px stop rendering.
+# https://www.tcl-lang.org/man/tcl8.6/TkLib/CanvTkwin.htm
+# Who the hell uses SHORT for the canvas size?!
+PAGE_SIZE = 50
+
+class PagerBar(tk.Frame):
+    """Prev/Next controls for long card lists. Hidden while 1 page."""
+
+    def __init__(self, parent, on_prev, on_next, **kw):
+        bg = kw.pop("bg", BG)
+        super().__init__(parent, bg=bg, **kw)
+        self.prev_btn = ttk.Button(self, text="< Prev", command=on_prev)
+        self.prev_btn.pack(side="left")
+        self.info_lbl = tk.Label(self, text="", font=(FONT_FAMILY, 9),
+                                 fg=TEXT_SECONDARY, bg=bg)
+        self.info_lbl.pack(side="left", expand=True)
+        self.next_btn = ttk.Button(self, text="Next >", command=on_next)
+        self.next_btn.pack(side="right")
+
+    def set(self, page, pages, total):
+        if pages <= 1:
+            self.pack_forget()
+            return
+        self.pack(fill="x", padx=10, pady=(0, 4))
+        self.info_lbl.config(
+            text=f"Page {page + 1} of {pages} - {total} items")
+        self.prev_btn.config(state="disabled" if page <= 0 else "normal")
+        self.next_btn.config(
+            state="disabled" if page + 1 >= pages else "normal")
+
+
 # ===================================================================
 # Plugin card
 # ===================================================================
@@ -1886,6 +1917,7 @@ class AutoPorterGUI:
         self._ctx = None
         self._counts = {}
         self._scan_data = []
+        self.page = 0
 
         self._build()
         self.work.listen(self._set_working)
@@ -2056,6 +2088,9 @@ class AutoPorterGUI:
         self.sf = ScrollFrame(parent)
         self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
 
+        # -- Pager (hidden while 1 page) --
+        self.pager = PagerBar(parent, self._page_prev, self._page_next)
+
     # --------------------------------------------------------------
     # Browse handlers
     # --------------------------------------------------------------
@@ -2179,6 +2214,7 @@ class AutoPorterGUI:
         self._ctx = None
         self._counts = {}
         self._scan_data = []
+        self.page = 0
         self._run(lambda: self._do_scan(dlls, lib_dirs), "Starting scan...")
 
     def locate_game_exe(self):
@@ -2270,15 +2306,41 @@ class AutoPorterGUI:
         self._scan_data = []
         for dll in dlls:
             card = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
-            self._place_card(card)
             self.cards.append(card)
-        self._update_summary()
+        self.page = 0
+        self.render_page()
         return True
 
-    def _place_card(self, card):
+    def _page_count(self):
+        return max(1, (len(self.cards) + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    def render_page(self):
+        """Grid only the current page; the rest stay built but hidden."""
+        pages = self._page_count()
+        self.page = min(self.page, pages - 1)
+        lo = self.page * PAGE_SIZE
+        for i, card in enumerate(self.cards):
+            if lo <= i < lo + PAGE_SIZE:
+                self._place_card(card, i - lo)
+            else:
+                card.grid_forget()
+        self.sf.canvas.yview_moveto(0)
+        self._update_summary()
+
+    def _page_prev(self):
+        if self.page > 0:
+            self.page -= 1
+            self.render_page()
+
+    def _page_next(self):
+        if self.page + 1 < self._page_count():
+            self.page += 1
+            self.render_page()
+
+    def _place_card(self, card, idx):
         ncol = 2
-        row = len(self.cards) // ncol
-        col = len(self.cards) % ncol
+        row = idx // ncol
+        col = idx % ncol
         card.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
         self.sf.inner.grid_columnconfigure(0, weight=1, uniform="card")
         self.sf.inner.grid_columnconfigure(1, weight=1, uniform="card")
@@ -2446,8 +2508,11 @@ class AutoPorterGUI:
                           on_fix_one=self._fix_single,
                           on_restore_one=self._restore_single,
                           force_fix=self.pro_mode.get())
-        self._place_card(card)
         self.cards.append(card)
+        pos = len(self.cards) - 1
+        lo = self.page * PAGE_SIZE
+        if lo <= pos < lo + PAGE_SIZE:
+            self._place_card(card, pos - lo)
         if self.work.busy:
             card.set_working(True)
         self._update_summary()
@@ -2480,19 +2545,6 @@ class AutoPorterGUI:
         self.root.after(0, lambda: self._finish_single(card, dll, info, v))
 
     def _finish_single(self, card, dll, info, v):
-        try:
-            idx = self.cards.index(card)
-        except ValueError:
-            return
-        card.destroy()
-        new = PluginCard(self.sf.inner, dll, info, v,
-                         on_fix_one=self._fix_single,
-                         on_restore_one=self._restore_single,
-                         force_fix=self.pro_mode.get())
-        ncol = 2
-        new.grid(row=idx // ncol, column=idx % ncol, sticky="nsew",
-                 padx=4, pady=4)
-        self.cards[idx] = new
         for i, (d, _, _) in enumerate(self._scan_data):
             if d == dll:
                 self._scan_data[i] = (dll, info, v)
@@ -2500,6 +2552,21 @@ class AutoPorterGUI:
         else:
             self._scan_data.append((dll, info, v))
         self._counts[v["cat"]] = self._counts.get(v["cat"], 0) + 1
+        try:
+            idx = self.cards.index(card)
+        except ValueError:
+            self._update_summary()
+            return
+        card.destroy()
+        new = PluginCard(self.sf.inner, dll, info, v,
+                         on_fix_one=self._fix_single,
+                         on_restore_one=self._restore_single,
+                         force_fix=self.pro_mode.get())
+        ncol = 2
+        pos = idx - self.page * PAGE_SIZE
+        new.grid(row=pos // ncol, column=pos % ncol, sticky="nsew",
+                 padx=4, pady=4)
+        self.cards[idx] = new
         self._update_summary()
 
     def _update_summary(self):
@@ -2520,6 +2587,7 @@ class AutoPorterGUI:
         if pending:
             parts.append(f"{pending} not checked yet")
         self.c_other.config(text="  \u2022  ".join(parts))
+        self.pager.set(self.page, self._page_count(), total)
 
     def _on_pro_toggle(self):
         # Rebuild cards so every scanned one shows fix buttons when
@@ -2532,24 +2600,23 @@ class AutoPorterGUI:
         self.cards.clear()
         for dll in pending:
             card = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
-            self._place_card(card)
             self.cards.append(card)
         for dll, info, v in scanned:
             card = PluginCard(self.sf.inner, dll, info, v,
                               on_fix_one=self._fix_single,
                               on_restore_one=self._restore_single,
                               force_fix=self.pro_mode.get())
-            self._place_card(card)
             self.cards.append(card)
         if self.work.busy:
             for c in self.cards:
                 c.set_working(True)
-        self._update_summary()
+        self.render_page()
 
     def _clear_cards(self):
         for c in self.cards:
             c.destroy()
         self.cards.clear()
+        self.pager.set(0, 1, 0)
         self.notice_frame.pack_forget()
         self.lib_frame.pack_forget()
 
@@ -2624,17 +2691,22 @@ class AutoPorterGUI:
             messagebox.showinfo(
                 "Nothing to undo", f"No saved original for {dll.name}.")
             return
+        self._scan_data = [(d, i, v) for d, i, v in self._scan_data
+                           if d != dll]
         try:
             idx = self.cards.index(card)
         except ValueError:
+            self._update_summary()
             return
         card.destroy()
         new = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
         ncol = 2
-        new.grid(row=idx // ncol, column=idx % ncol, sticky="nsew",
+        pos = idx - self.page * PAGE_SIZE
+        new.grid(row=pos // ncol, column=pos % ncol, sticky="nsew",
                  padx=4, pady=4)
         self.cards[idx] = new
-        self._scan_data = [(d, i, v) for d, i, v in self._scan_data if d != dll]
+        self._scan_data = [(d, i, v) for d, i, v in self._scan_data
+                           if d != dll]
         self._update_summary()
 
     # --------------------------------------------------------------
