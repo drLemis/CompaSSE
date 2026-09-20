@@ -203,6 +203,9 @@ static decltype(&CreateFileA) fpCreateFileA = nullptr;
 static decltype(&CreateFile2) fpCreateFile2 = nullptr;
 static decltype(&CreateFileMappingW) fpCreateFileMappingW = nullptr;
 static decltype(&OpenFileMappingW) fpOpenFileMappingW = nullptr;
+static decltype(&CreateFileMappingA) fpCreateFileMappingA = nullptr;
+static decltype(&OpenFileMappingA) fpOpenFileMappingA = nullptr;
+static decltype(&MapViewOfFile) fpMapViewOfFile = nullptr;
 static pfnNtCreateFile fpNtCreateFile = nullptr;
 static pfnNtOpenFile fpNtOpenFile = nullptr;
 
@@ -1080,6 +1083,92 @@ static HANDLE WINAPI Hook_OpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR n
     return h;
 }
 
+// ANSI twins: some libs (commonlib-shared via REX) map through A calls,
+// which never reach the W hooks above.
+static HANDLE WINAPI Hook_CreateFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES sa, DWORD protect,
+                                             DWORD sizeHigh, DWORD sizeLow, LPCSTR name) {
+    wchar_t wname[MAX_PATH] = {};
+    if (name) MultiByteToWideChar(CP_ACP, 0, name, -1, wname, MAX_PATH);
+    if ((hFile == nullptr || hFile == INVALID_HANDLE_VALUE) && is_iddb_mapname(wname)) {
+        uint64_t reqSize = ((uint64_t)sizeHigh << 32) | (uint64_t)sizeLow;
+        HMODULE caller = resolve_caller_module(g_self);
+        wchar_t modName[MAX_PATH] = L"(unknown)";
+        if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
+        const wchar_t* base = wcsrchr(modName, L'\\');
+        HANDLE h = create_iddb_mapping(sa, protect, sizeHigh, sizeLow, wname);
+        DWORD err = h ? 0 : GetLastError();
+        shim_log("CreateFileMappingA %s size=%llu -> %s (err=%lu) for %ls", name ? name : "(null)",
+                 reqSize, h ? "ok" : "FAILED", err, base ? base + 1 : modName);
+        return h;
+    }
+    if (hFile != INVALID_HANDLE_VALUE && is_versionlib_handle(hFile)) {
+        HMODULE caller = resolve_caller_module(g_self);
+        DecoderType type = caller ? decoder_for_module(caller, g_self) : DECODER_NONE;
+        bool dualV5 = caller && module_supports_fmt5(caller);
+        int format = (caller && type == DECODER_V1) ? 1 : 2;
+
+        wchar_t modName[MAX_PATH] = L"(unknown)";
+        if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
+
+        AcquireSRWLockExclusive(&g_lock);
+        bool ok = g_loaded && ensure_temp_file(format);
+        const wchar_t* tempPath = format == 5 ? g_tempPath5 : format == 1 ? g_tempPath1 : g_tempPath2;
+        ReleaseSRWLockExclusive(&g_lock);
+        if (ok) {
+            HANDLE temp = fpCreateFileW(tempPath, temp_access_for_protect(protect),
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr, OPEN_EXISTING, 0, nullptr);
+            if (temp != INVALID_HANDLE_VALUE) {
+                HANDLE mapping = fpCreateFileMappingA(temp, sa, protect, sizeHigh, sizeLow, name);
+                DWORD err = mapping ? 0 : GetLastError();
+                CloseHandle(temp);
+                const wchar_t* base = wcsrchr(modName, L'\\');
+                shim_log("CreateFileMappingA: redirecting versionlib handle to temp fmt%d (dualV5=%d) -> %s (err=%lu) for %ls",
+                         format, dualV5 ? 1 : 0, mapping ? "ok" : "FAILED", err, base ? base + 1 : modName);
+                return mapping;
+            }
+        }
+    }
+    return fpCreateFileMappingA(hFile, sa, protect, sizeHigh, sizeLow, name);
+}
+
+static HANDLE WINAPI Hook_OpenFileMappingA(DWORD access, BOOL inherit, LPCSTR name) {
+    wchar_t wname[MAX_PATH] = {};
+    if (name) MultiByteToWideChar(CP_ACP, 0, name, -1, wname, MAX_PATH);
+    bool iddb = is_iddb_mapname(wname);
+    HANDLE h;
+    if (iddb)
+        h = open_iddb_mapping(access, inherit, wname, iddb_need_bytes());
+    else
+        h = fpOpenFileMappingA(access, inherit, name);
+    if (iddb) {
+        HMODULE caller = resolve_caller_module(g_self);
+        wchar_t modName[MAX_PATH] = L"(unknown)";
+        if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
+        const wchar_t* base = wcsrchr(modName, L'\\');
+        shim_log("OpenFileMappingA %s -> %s for %ls", name ? name : "(null)",
+                 h ? "opened" : "missing", base ? base + 1 : modName);
+    }
+    return h;
+}
+
+// Failure-only: a failed view is the actual "failed to create mapping"
+// moment, whatever the API path. Successes are too frequent to log.
+static LPVOID WINAPI Hook_MapViewOfFile(HANDLE hMap, DWORD access, DWORD offHigh,
+                                        DWORD offLow, SIZE_T bytes) {
+    LPVOID v = fpMapViewOfFile(hMap, access, offHigh, offLow, bytes);
+    if (!v) {
+        DWORD err = GetLastError();
+        HMODULE caller = resolve_caller_module(g_self);
+        wchar_t modName[MAX_PATH] = L"(unknown)";
+        if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
+        const wchar_t* base = wcsrchr(modName, L'\\');
+        shim_log("MapViewOfFile bytes=%llu access=0x%lx -> FAILED (err=%lu) for %ls",
+                 (unsigned long long)bytes, access, err, base ? base + 1 : modName);
+    }
+    return v;
+}
+
 // Convert NT path like "\??\C:\path\file.bin" -> "C:\path\file.bin".
 static bool nt_path_to_win32(const wchar_t* nt, wchar_t* out, size_t outLen) {
     if (wcslen(nt) > 4 && nt[0] == L'\\' && nt[1] == L'?' && nt[2] == L'?' && nt[3] == L'\\') {
@@ -1302,6 +1391,18 @@ bool install_hooks(HMODULE self_module) {
 
     st = MH_CreateHook(&OpenFileMappingW, &Hook_OpenFileMappingW, (void**)&fpOpenFileMappingW);
     shim_log("install_hooks: OpenFileMappingW %s", st == MH_OK ? "ok" : "FAILED");
+    ok = ok && st == MH_OK;
+
+    st = MH_CreateHook(&CreateFileMappingA, &Hook_CreateFileMappingA, (void**)&fpCreateFileMappingA);
+    shim_log("install_hooks: CreateFileMappingA %s", st == MH_OK ? "ok" : "FAILED");
+    ok = ok && st == MH_OK;
+
+    st = MH_CreateHook(&OpenFileMappingA, &Hook_OpenFileMappingA, (void**)&fpOpenFileMappingA);
+    shim_log("install_hooks: OpenFileMappingA %s", st == MH_OK ? "ok" : "FAILED");
+    ok = ok && st == MH_OK;
+
+    st = MH_CreateHook(&MapViewOfFile, &Hook_MapViewOfFile, (void**)&fpMapViewOfFile);
+    shim_log("install_hooks: MapViewOfFile %s", st == MH_OK ? "ok" : "FAILED");
     ok = ok && st == MH_OK;
 
     // Hook GetProcAddress to patch SKSEPlugin_Version flags at runtime
