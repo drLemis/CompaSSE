@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#define COMPASSE_SHIM_VERSION "1.5.1"
+#define COMPASSE_SHIM_VERSION "1.5.2"
 
 // ---- GetProcAddress interception (SKSE version bypass) ----
 typedef FARPROC (WINAPI* pfnGetProcAddress)(HMODULE, LPCSTR);
@@ -1359,12 +1359,12 @@ static bool g_hooksInstalled = false;
 bool install_hooks(HMODULE self_module) {
     g_self = self_module;
 
-    shim_log("!CompaSSE shim version %s", COMPASSE_SHIM_VERSION);
-
     if (g_hooksInstalled) {
         shim_log("install_hooks: already installed, skipping");
         return true;
     }
+
+    shim_log("!CompaSSE shim version %s", COMPASSE_SHIM_VERSION);
 
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK) {
