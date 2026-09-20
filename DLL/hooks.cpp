@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#define COMPASSE_SHIM_VERSION "1.5.1"
+
 // ---- GetProcAddress interception (SKSE version bypass) ----
 typedef FARPROC (WINAPI* pfnGetProcAddress)(HMODULE, LPCSTR);
 static pfnGetProcAddress fpGetProcAddress = nullptr;
@@ -653,6 +655,25 @@ static void ensure_buffers(const wchar_t* binPath) {
             shim_log("ensure_buffers: translations added %d missing ID(s)", added);
         std::vector<std::pair<uint64_t, uint64_t>> merged(have.begin(), have.end());
         std::sort(merged.begin(), merged.end());
+        size_t srcCount = entries.size();
+        size_t dropped = 0;
+        if (merged.size() > srcCount) {
+            auto it = std::remove_if(merged.begin(), merged.end(),
+                [srcCount](const auto& e) { return e.first >= srcCount; });
+            dropped = (size_t)(merged.end() - it);
+            merged.erase(it, merged.end());
+        }
+        size_t padded = 0;
+        if (merged.size() < srcCount) {
+            merged.reserve(srcCount);
+            for (uint64_t i = (uint64_t)merged.size(); i < (uint64_t)srcCount; ++i) {
+                merged.emplace_back(0xFFFFFFFFFFFFFFFFULL - i, 0);
+                ++padded;
+            }
+        }
+        if (dropped || padded)
+            shim_log("ensure_buffers: count unified to %zu (dropped %zu, padded %zu)",
+                     srcCount, dropped, padded);
         if (!encode_format2(g_fmt2, version, name, mergedPtr, merged)) {
             g_loadFailed = true;
             g_loading = false;
@@ -1154,6 +1175,8 @@ static bool g_hooksInstalled = false;
 
 bool install_hooks(HMODULE self_module) {
     g_self = self_module;
+
+    shim_log("!CompaSSE shim version %s", COMPASSE_SHIM_VERSION);
 
     if (g_hooksInstalled) {
         shim_log("install_hooks: already installed, skipping");

@@ -14,6 +14,7 @@ Builds minimal fake PE64 files in tmp (no game, no mods needed) and asserts:
 Run: python test_detect.py
 """
 import struct
+import re
 import sys
 from pathlib import Path
 
@@ -1232,6 +1233,16 @@ def main():
     check("T42.bogus", C.saved_game_exe(_app42) is None, "")
     check("T42.nodir", C.saved_game_exe(None) is None
           and C.save_game_exe(None, _exe42) is False, "")
+
+    # ---------------------------------------------------------------- T43: shim version tag
+    # DLL/hooks.cpp logs COMPASSE_SHIM_VERSION on every run; it must match
+    # the tool version or game logs misidentify the build.
+    _hooks43 = (Path(__file__).parent / "DLL" / "hooks.cpp").read_text(
+        encoding="utf-8", errors="replace")
+    _m43 = re.search(r'#define\s+COMPASSE_SHIM_VERSION\s+"([^"]+)"', _hooks43)
+    check("T43.present", _m43 is not None, "shim version tag missing")
+    check("T43.match", _m43 is not None and _m43.group(1) == C.VERSION,
+          _m43.group(1) if _m43 else "")
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)

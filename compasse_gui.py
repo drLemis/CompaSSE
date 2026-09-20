@@ -259,7 +259,7 @@ def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None)
     # Not an SKSE plugin at all
     if flag is None and vi is None:
         return _base("NOT_SKSE", "NOT SKSE", "NOT_SKSE",
-                     "No SKSEPlugin_Version export found. This is not an SKSE plugin.")
+                     "No SKSEPlugin_Version export found. This is probably not an SKSE plugin.")
 
     old = build_year is not None and build_year < 2025
     recent = build_year is not None and build_year >= 2025
