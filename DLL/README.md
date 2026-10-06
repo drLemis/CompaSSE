@@ -58,7 +58,7 @@ We only look at filenames that start with `versionlib-` or `version-`. Anything 
 
 For `versionlib-`, the common case:
 
-* V1-only reader, V5 strings found, or a versioned mod with no legacy strings gets the real file. These parse fmt5 themselves, and a temp would only break them.
+* V1-only reader, V5 strings found, or a versioned mod with no legacy strings gets the real file. These parse fmt5 themselves, and a temp would only break them. Exception: a versioned mod with neither stream nor mapping imports reads by hand and predates fmt5, so it gets the fmt2 temp like before.
 * Proven legacy reader or a versionless mod gets the fmt2 temp. No consent needed for this part: the transcoded bytes match the real file for present IDs, so it can only help or leave things as broken as without the shim. Unknown callers keep the real file, because a temp fails fmt5-only format checks. Consent still gates flag patches, translations, and legacy loading. Versionless mods only run through the legacy loader anyway, so they are old by definition.
 
 For `version-`, always the fmt1 temp.

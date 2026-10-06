@@ -1,6 +1,6 @@
 [project]
 name = "compasse"
-version = "2.0.0"
+version = "2.0.1"
 description = "CompaSSE: SKSE plugin compatibility scanner and fixer"
 requires-python = ">=3.9"
 

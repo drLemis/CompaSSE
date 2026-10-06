@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#define COMPASSE_SHIM_VERSION "2.0.0"
+#define COMPASSE_SHIM_VERSION "2.0.1"
 
 // ---- GetProcAddress interception (SKSE version bypass) ----
 typedef FARPROC (WINAPI* pfnGetProcAddress)(HMODULE, LPCSTR);
@@ -275,12 +275,17 @@ static CallerCaps caller_caps(HMODULE caller) {
 // Healthy fmt5-native readers parse the real file; a transcoded temp
 // fails their format check. Custom fmt5 readers (own minimal loader,
 // no CommonLib strings at all) carry neither marker set, so versioned
-// callers without legacy strings keep the real bytes too. Only proven
-// legacy readers and versionless (legacy-loaded) callers get the temp:
-// both predate fmt5 and cannot parse it. Anything else keeps the real
-// bytes: same as no shim, never worse.
+// callers without legacy strings keep the real bytes too - unless the
+// caller shows neither stream nor mapping imports (V2 default): those
+// read the file by hand and predate fmt5, so they take the temp like
+// 1.5.x gave them. Only proven legacy readers and versionless
+// (legacy-loaded) callers get the temp: both predate fmt5 and cannot
+// parse it. Anything else keeps the real bytes: same as no shim,
+// never worse.
 static bool keep_real_bytes(const CallerCaps& c) {
-    return c.type == DECODER_V1 || c.dualV5 || (c.hasVer && !c.legacy);
+    if (c.type == DECODER_V1 || c.dualV5) return true;
+    if (!c.hasVer || c.legacy) return false;
+    return c.type != DECODER_V2;
 }
 
 // ---- lazy state (guarded by g_lock) ----
