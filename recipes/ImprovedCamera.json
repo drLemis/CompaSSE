@@ -1,0 +1,30 @@
+{
+  "format": 1,
+  "variants": {
+    "0cb367fb5e040b550b236c3fb8ad7f3b8adeef16a5cd690f234aaa99201b7035": {
+      "game": "1.7.104",
+      "label": "ImprovedCamera (SVAL): runtime_family_classifier",
+      "items": [
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 277425,
+          "width": 1,
+          "old": 149,
+          "new": 146,
+          "insn_check": false,
+          "label": "SETNE -> SETB"
+        }
+      ],
+      "notes": [
+        "Imported from SVAL pack file ImprovedCamera-tested.json.",
+        "Structurally related to the DiagonalSprint runtime-family classifier defect.",
+        "Exact-binary recipe. Do not carry this offset into other Improved Camera builds."
+      ],
+      "provenance": {
+        "pack": "ImprovedCamera-tested.json",
+        "target_runtime": "1.7.104.0"
+      }
+    }
+  }
+}

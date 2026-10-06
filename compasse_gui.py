@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""CompaSSE UI: per-mod cards for scan/fix."""
+"""CompaSSE GUI. Per-mod cards for scan and fix."""
 import sys
-import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -27,14 +26,69 @@ def _app_dir():
     # Plain source run.
     return Path(__file__).resolve().parent
 
-
 HERE = _app_dir()
 sys.path.insert(0, str(HERE))
-import compasse as core
+import core
+import therapist
 import mod_sources as modsrc
-import skse_healer as healer
-import skse_surgeon as surgeon
+import surgeon.tab as surgeon_tab
+import healer
+import healer.tab as healer_tab
+import porter.tab as porter_tab
+from gui_kit import (BG, BusyState, CARD_BG, FONT_FAMILY,
+                     FONT_MONO, NAME_FONT_SPEC,
+                     ScrollFrame, TEXT_PRIMARY, TEXT_SECONDARY,
+                     _ellipsize, _HoverTip, _launch, _name_label)
 
+# ---------------------------------------------------------------------------
+# Core API shims: prefer the public names, fall back to the private ones
+# while the parallel core lane lands. Each helper below keeps working
+# whichever side of the rename this checkout is on.
+# ---------------------------------------------------------------------------
+try:
+    from core import unpack_version as _unpack_version
+except ImportError:  # pragma: no cover - old core without the public name
+    _unpack_version = None
+
+try:
+    from core import v5_enforced as _v5_enforced_pub
+except ImportError:  # pragma: no cover - old core without the public name
+    _v5_enforced_pub = None
+
+try:
+    from core import built_before_1_7_99 as _built_before_pub
+except ImportError:  # pragma: no cover - old core without the public name
+    _built_before_pub = None
+
+def _ver_str(packed):
+    """'M.m.b.r' string for a packed version, via public unpack_version."""
+    if _unpack_version is not None:
+        tup = _unpack_version(packed)
+        if tup is None:
+            return None
+        return f"{tup[0]}.{tup[1]}.{tup[2]}.{packed & 0xF}"
+    return core._packed_to_ver(packed)
+
+def _v5_here(running):
+    """Whether the running game enforces the V5 flag scheme."""
+    if _v5_enforced_pub is not None:
+        return _v5_enforced_pub(running)
+    return core._v5_enforced(running)
+
+def _built_before_patch(dll_path):
+    """Whether a DLL predates the 1.7.99 game update."""
+    if _built_before_pub is not None:
+        return _built_before_pub(dll_path)
+    return core._built_before_1_7_99(dll_path)
+
+def _set_btn_state(buttons, working):
+    """Shared _set_working body: flip a button row disabled/normal."""
+    state = "disabled" if working else "normal"
+    for btn in buttons:
+        try:
+            btn.config(state=state)
+        except Exception:
+            pass
 
 def find_game_exe():
     """SkyrimSE.exe next to this tool, else the remembered location."""
@@ -43,12 +97,10 @@ def find_game_exe():
         return cand
     return core.saved_game_exe(HERE)
 
-
 def plugins_dir_for(game_exe):
     """Derive the SKSE plugins folder from the game executable path."""
     game_dir = Path(game_exe).resolve().parent
     return game_dir / "Data" / "SKSE" / "Plugins"
-
 
 def game_version_line(game_exe):
     """'Game: SkyrimSE.exe (1.7.104)'; version omitted when unreadable."""
@@ -61,12 +113,6 @@ def game_version_line(game_exe):
 # ---------------------------------------------------------------------------
 # Theme constants
 # ---------------------------------------------------------------------------
-FONT_FAMILY = "Segoe UI"
-FONT_MONO = "Consolas"
-BG = "#f0f2f5"
-CARD_BG = "#ffffff"
-TEXT_PRIMARY = "#1f2937"
-TEXT_SECONDARY = "#6b7280"
 BADGE_COLORS = {
     "NEEDS_FIX": {"bar": "#eab308"},  # yellow = fixable
     "OK":        {"bar": "#22c55e"},  # green = fine
@@ -75,153 +121,39 @@ BADGE_COLORS = {
     "NOT_SKSE":  {"bar": "#9ca3af"},
 }
 
-
 # ===================================================================
 # Concurrency: one operation at a time, UI thread only
 # ===================================================================
 
-NAME_PX = 300
-NAME_FONT_SPEC = (FONT_FAMILY, 11, "bold")
+def find_recipe_hits(dlls, game_ver, recipes):
+    """[(dll, recipe, pending)] for mods with applicable recipe steps.
 
-def _ellipsize(font, text, max_px=NAME_PX):
-    """Shorten text to max_px with ..., returning (short, was_cut)."""
-    if font.measure(text) <= max_px:
-        return text, False
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if font.measure(text[:mid] + "...") <= max_px:
-            lo = mid + 1
-        else:
-            hi = mid
-    return text[:max(lo - 1, 0)] + "...", True
-
-
-class _HoverTip:
-    """Full text on hover, for ellipsized labels."""
-
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.win = None
-        widget.bind("<Enter>", self._show, add="+")
-        widget.bind("<Leave>", self._hide, add="+")
-
-    def _show(self, _event=None):
-        if self.win is not None or not self.text:
-            return
+    Pure header reads, no disassembly: safe to run at startup.
+    """
+    hits = []
+    for dll in dlls or []:
         try:
-            x = self.widget.winfo_rootx() + 12
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            rec = healer.match_recipe(str(dll), game_ver, recipes)
+            if rec is None:
+                continue
+            pend = sum(1 for _, s in healer.recipe_status(str(dll), rec)
+                       if s == "pending")
+            if pend:
+                hits.append((dll, rec, pend))
         except Exception:
-            return
-        self.win = tk.Toplevel(self.widget)
-        self.win.wm_overrideredirect(True)
-        self.win.wm_geometry(f"+{x}+{y}")
-        tk.Label(self.win, text=self.text, font=(FONT_MONO, 8),
-                 bg="#1f2937", fg="#f9fafb", relief="solid", bd=1,
-                 padx=6, pady=3).pack()
-
-    def _hide(self, _event=None):
-        if self.win is not None:
-            try:
-                self.win.destroy()
-            except Exception:
-                pass
-            self.win = None
-
-
-def _name_label(parent, text):
-    """Bold name label, ellipsized with hover for long names."""
-    short, cut = _ellipsize(tkfont.Font(font=NAME_FONT_SPEC), text)
-    lbl = tk.Label(parent, text=short, font=NAME_FONT_SPEC,
-                   fg=TEXT_PRIMARY, bg=CARD_BG)
-    if cut:
-        _HoverTip(lbl, text)
-    return lbl
-
-
-class BusyState:
-    """Global work lock across all tabs. acquire() disables every
-
-    action button via listeners; refusals must show "please wait"."""
-
-    def __init__(self):
-        self._busy = False
-        self._desc = ""
-        self._listeners = []
-
-    def listen(self, fn):
-        self._listeners.append(fn)
-
-    @property
-    def busy(self):
-        return self._busy
-
-    def acquire(self, desc="Working..."):
-        if self._busy:
-            return False
-        self._busy = True
-        self._desc = desc
-        for fn in self._listeners:
-            try:
-                fn(True, desc)
-            except Exception:
-                pass
-        return True
-
-    def set_desc(self, desc):
-        self._desc = desc
-        if self._busy:
-            for fn in self._listeners:
-                try:
-                    fn(True, desc)
-                except Exception:
-                    pass
-
-    def release(self):
-        self._busy = False
-        self._desc = ""
-        for fn in self._listeners:
-            try:
-                fn(False, "")
-            except Exception:
-                pass
-
-def _launch(root, work, fn):
-    """Run fn in a worker; work.release() back on the UI thread."""
-    def _worker():
-        try:
-            fn()
-        except Exception as exc:
-            root.after(0, lambda: messagebox.showerror("Error", str(exc)))
-        finally:
-            root.after(0, work.release)
-    threading.Thread(target=_worker, daemon=True).start()
-
+            continue
+    return hits
 
 # ===================================================================
 # Classification helper
 # ===================================================================
 
-def _get_build_dt(dll_path):
-    """PE build timestamp as datetime (UTC), or None. Single impl in core."""
-    return core.pe_build_dt(dll_path)
-
-
-def _get_build_year(dll_path):
-    """Build year, or None."""
-    dt = _get_build_dt(dll_path)
-    return dt.year if dt else None
-
-
-def _get_build_date_str(dll_path):
-    """Full build date string like '2022 July 04'."""
-    dt = _get_build_dt(dll_path)
+def _get_build_info(dll_path):
+    """(build_year, date_str) from one PE stamp read; (None, None) if unreadable."""
+    dt = core.pe_build_dt(dll_path)
     if dt is None:
-        return None
-    return dt.strftime("%Y %B %d").replace(" 0", " ")
-
+        return (None, None)
+    return (dt.year, dt.strftime("%Y %B %d").replace(" 0", " "))
 
 def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None):
     """Turn analyze_plugin output + build year into a verdict dict.
@@ -235,12 +167,12 @@ def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None)
     flag = info.get("flag")
     vi = info.get("version_indep")
     rv = (vi or {}).get("runtime_ver")
-    version = core._packed_to_ver(rv) if rv else None
+    version = _ver_str(rv) if rv else None
     compat = (vi or {}).get("compat") or []
     _match = core.compat_match(compat, runtime_version)
     declares_running = _match == "exact"
     rev_match = _match == "rev"
-    run_str = core._packed_to_ver(runtime_version) if runtime_version else None
+    run_str = _ver_str(runtime_version) if runtime_version else None
     declared_tup = core.unpack_version(rv) if rv else None
     run_tup = core.unpack_version(runtime_version) if runtime_version else None
     crossed = core.crossed_cutoffs(declared_tup, run_tup)
@@ -268,7 +200,7 @@ def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None)
     addrlib = bool(vi and (vi.get("has_addr", False)
                            or vi.get("has_sigs", False)))
     # Ex=0 is inert where V5 is unenforced (pre-1.7): don't flag or fix it.
-    v5_here = core._v5_enforced(run_tup)
+    v5_here = _v5_here(run_tup)
     flag_patch = flag is not None and flag.get("needs_patch", False) \
         and v5_here
     indep_patch = vi is not None and vi.get("needs_indep", False)
@@ -357,7 +289,7 @@ def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None)
         if old and not addrlib:
             xref = None
             if dll_path is not None and id_set:
-                xref = core.count_xref_ids(dll_path, id_set)
+                xref = therapist.count_xref_ids(dll_path, id_set)
             if xref:
                 return _base("MANUAL", "MANUAL CHECK", "MANUAL",
                              (f"Built {build_year} (old). Flags say no Address "
@@ -442,7 +374,7 @@ def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None)
     if (run_tup is not None and tuple(run_tup[:3]) >= (1, 7, 99)
             and declared_tup is None and has_addr_only and not any_patch
             and dll_path is not None
-            and core._built_before_1_7_99(dll_path)):
+            and _built_before_patch(dll_path)):
         return _base("MANUAL", "MANUAL CHECK", "MANUAL",
                      "Made before the latest game update. It loads but may "
                      "still crash. Turn it off to play, then ask the author "
@@ -460,69 +392,9 @@ def classify(info, build_year, runtime_version=None, dll_path=None, id_set=None)
                    "recompiled', patch the flags.")
     return _base("OK", "OK", "OK", ok_why)
 
-
 # ===================================================================
 # Scrollable frame (Canvas + inner Frame)
 # ===================================================================
-
-class ScrollFrame(tk.Frame):
-    """A scrollable container built from a Canvas with an inner Frame."""
-
-    def __init__(self, parent, **kw):
-        bg = kw.pop("bg", BG)
-        super().__init__(parent, bg=bg, **kw)
-
-        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.vbar = ttk.Scrollbar(self, orient="vertical",
-                                  command=self.canvas.yview)
-        self.inner = tk.Frame(self.canvas, bg=bg)
-
-        self.inner.bind("<Configure>",
-                        lambda _e: self.canvas.configure(
-                            scrollregion=self.canvas.bbox("all")))
-        self._win = self.canvas.create_window((0, 0), window=self.inner,
-                                              anchor="nw")
-        self.canvas.configure(yscrollcommand=self.vbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.vbar.pack(side="right", fill="y")
-
-        self.canvas.bind("<Configure>", self._on_canvas_resize)
-
-        # Mousewheel: bind when pointer enters this widget
-        self.bind("<Enter>", self._enter)
-        self.bind("<Leave>", self._leave)
-        # Also bind to the canvas itself
-        self.canvas.bind("<Enter>", self._enter)
-        self.canvas.bind("<Leave>", self._leave)
-
-    def _on_canvas_resize(self, event):
-        self.canvas.itemconfig(self._win, width=event.width)
-
-    def _enter(self, _event):
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _leave(self, _event):
-        # Defer unbinding: the pointer may have moved to a child widget.
-        self.after(80, self._maybe_unbind)
-
-    def _maybe_unbind(self):
-        x, y = self.winfo_pointerxy()
-        widget = self.winfo_containing(x, y)
-        if widget is None:
-            self.canvas.unbind_all("<MouseWheel>")
-            return
-        # Walk up the widget tree to see if we're still inside this
-        # ScrollFrame.
-        w = widget
-        while w is not None:
-            if w is self or w is self.canvas or w is self.inner:
-                return  # still inside, keep binding
-            w = w.master
-        self.canvas.unbind_all("<MouseWheel>")
-
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
 
 # Max cards on one page. Embedded widgets past 32767px stop rendering.
 # https://www.tcl-lang.org/man/tcl8.6/TkLib/CanvTkwin.htm
@@ -554,18 +426,20 @@ class PagerBar(tk.Frame):
         self.next_btn.config(
             state="disabled" if page + 1 >= pages else "normal")
 
-
 # ===================================================================
 # Plugin card
 # ===================================================================
 
 class PendingCard(tk.Frame):
-    """A listed-but-unchecked DLL. One Scan button, no analysis yet."""
+    """A listed-but-unchecked DLL. Scan button, plus fix when known."""
 
-    def __init__(self, parent, dll_path, on_scan, **kw):
+    def __init__(self, parent, dll_path, on_scan, on_recipe=None,
+                 recipe=None, **kw):
         super().__init__(parent, bg=CARD_BG, relief="solid", bd=1, **kw)
         self.dll_path = dll_path
         self.on_scan = on_scan
+        self.on_recipe = on_recipe
+        self.recipe = recipe
 
         self.bar = tk.Frame(self, bg="#9ca3af", width=4)
         self.bar.pack(side="left", fill="y")
@@ -581,6 +455,17 @@ class PendingCard(tk.Frame):
             activebackground="#c7d2fe", activeforeground="#1e1b4b",
             cursor="hand2", command=self._on_scan_click)
         self.scan_btn.pack(side="right")
+
+        self.fix_btn = None
+        if recipe is not None and on_recipe is not None:
+            self.fix_btn = tk.Button(
+                body, text="fix",
+                font=(FONT_FAMILY, 9, "bold"),
+                relief="raised", bd=1, padx=12, pady=2,
+                bg="#bbf7d0", fg="#14532d",
+                activebackground="#86efac", activeforeground="#052e16",
+                cursor="hand2", command=self._on_fix_click)
+            self.fix_btn.pack(side="right", padx=(0, 6))
 
         self._font = tkfont.Font(font=NAME_FONT_SPEC)
         self._full_name = dll_path.name
@@ -610,6 +495,16 @@ class PendingCard(tk.Frame):
             if self._tip is None:
                 self._tip = _HoverTip(self.name_lbl, self._full_name)
 
+    def _on_fix_click(self):
+        if self.on_recipe is None:
+            return
+        try:
+            if self.fix_btn is not None:
+                self.fix_btn.config(state="disabled")
+        except Exception:
+            pass
+        self.on_recipe(self)
+
     def _on_scan_click(self):
         self.on_scan(self)
 
@@ -618,22 +513,34 @@ class PendingCard(tk.Frame):
             self.scan_btn.config(state="disabled" if working else "normal")
         except Exception:
             pass
-
+        try:
+            if self.fix_btn is not None:
+                self.fix_btn.config(state="disabled" if working else "normal")
+        except Exception:
+            pass
 
 class PluginCard(tk.Frame):
     """A card representing one scanned plugin with status + controls."""
 
     def __init__(self, parent, dll_path, info, verdict, on_fix_one,
-                 on_restore_one=None, force_fix=False, **kw):
+                 on_restore_one=None, force_fix=False, on_healer=None,
+                 recipe=None, recipe_pending=0, on_recipe=None,
+                 skip_state=None, on_skip_toggle=None, **kw):
         super().__init__(parent, bg=CARD_BG, relief="solid", bd=1, **kw)
         self.dll_path = dll_path
         self.info = info
         self.verdict = verdict
         self.on_fix_one = on_fix_one
         self.on_restore_one = on_restore_one
+        self.on_healer = on_healer
+        self.on_skip_toggle = on_skip_toggle
         self.force_fix = force_fix
+        self.recipe = recipe
+        self.on_recipe = on_recipe
         self.fixed = False
         self.fix_buttons = []
+        self.kind_buttons = {}
+        self._done_kinds = set()
         self.undo_btn = None
 
         colors = BADGE_COLORS[verdict["key"]]
@@ -758,10 +665,13 @@ class PluginCard(tk.Frame):
                         bg="#fef08a", fg="#713f12",
                         activebackground="#fde047", activeforeground="#422006",
                         cursor="hand2",
-                        command=lambda k=it["kind"]: self._on_fix_kind(k),
+                        command=lambda: None,
                     )
+                    b.config(command=lambda k=it["kind"], btn=b:
+                             self._on_fix_kind(k, btn))
                     b.pack(fill="x", pady=2)
                     self.fix_buttons.append(b)
+                    self.kind_buttons[it["kind"]] = b
 
                 if len(fix_items) > 1:
                     fab = tk.Button(
@@ -793,6 +703,41 @@ class PluginCard(tk.Frame):
             # Ribbon-only treatment: no extra text for healthy mods.
             self.fix_btn = None
 
+        # -- Known fix (no scan needed; recipe carries its own checks) --
+        self.recipe_btn = None
+        if recipe is not None and (recipe_pending or 0) > 0 \
+                and on_recipe is not None:
+            rw = tk.Frame(body, bg=CARD_BG)
+            rw.pack(fill="x", pady=(6, 0))
+            tk.Label(rw, text="Known fix for your game - one press.",
+                     font=(FONT_FAMILY, 9),
+                     fg="#14532d", bg=CARD_BG,
+                     anchor="w").pack(fill="x", pady=(0, 2))
+            self.recipe_btn = tk.Button(
+                rw, text="Apply known fix",
+                font=(FONT_FAMILY, 9, "bold"),
+                relief="raised", bd=1, padx=12, pady=4,
+                bg="#bbf7d0", fg="#14532d",
+                activebackground="#86efac", activeforeground="#052e16",
+                cursor="hand2",
+                command=self._on_recipe_click,
+            )
+            self.recipe_btn.pack(fill="x", pady=2)
+            self.fix_buttons.append(self.recipe_btn)
+
+        # -- Deep check (sends the mod to the Healer tab) --
+        if self.on_healer is not None:
+            self.healer_btn = tk.Button(
+                body, text="Check in Healer",
+                font=(FONT_FAMILY, 9),
+                relief="raised", bd=1, padx=12, pady=2,
+                bg="#e0e7ff", fg="#3730a3",
+                activebackground="#c7d2fe", activeforeground="#1e1b4b",
+                cursor="hand2", command=self._on_healer_click)
+            self.healer_btn.pack(fill="x", pady=(4, 0))
+        else:
+            self.healer_btn = None
+
         # -- Undo fix (only when a stored original exists) --
         if self.on_restore_one is not None \
                 and core.backup_path(dll_path) is not None:
@@ -805,7 +750,32 @@ class PluginCard(tk.Frame):
                 cursor="hand2", command=self._on_undo_click)
             self.undo_btn.pack(fill="x", pady=(4, 0))
 
+        # -- Skip auto-load (only for plugins SKSE itself skips: no
+        # version data, so CompaSSE would try them at startup instead.
+        # Checked = leave it alone, exactly like no CompaSSE at all.)
+        self.skip_var = None
+        self.skip_box = None
+        if skip_state is not None and self.on_skip_toggle is not None:
+            self.skip_var = tk.BooleanVar(value=bool(skip_state))
+            self.skip_box = tk.Checkbutton(
+                body, text="Don't auto-load this plugin",
+                variable=self.skip_var,
+                font=(FONT_FAMILY, 9),
+                fg=TEXT_SECONDARY, bg=CARD_BG, activebackground=CARD_BG,
+                anchor="w", command=self._on_skip_toggle)
+            self.skip_box.pack(fill="x", pady=(4, 0))
+
     # -- Card actions ----------------------------------------------
+
+    def _on_skip_toggle(self):
+        if self.on_skip_toggle is not None and self.skip_var is not None:
+            self.on_skip_toggle(self, bool(self.skip_var.get()))
+
+    # -- Card actions ----------------------------------------------
+
+    def _on_healer_click(self):
+        if self.on_healer is not None:
+            self.on_healer(self)
 
     def _on_undo_click(self):
         if self.undo_btn is not None:
@@ -816,10 +786,20 @@ class PluginCard(tk.Frame):
         if self.on_restore_one is not None:
             self.on_restore_one(self)
 
-    def _on_fix_kind(self, kind):
-        self._disable_all_fix()
+    def _on_fix_kind(self, kind, btn=None):
+        try:
+            if btn is not None:
+                btn.config(state="disabled")
+        except Exception:
+            pass
         self.status_lbl.config(text=f"Fixing {kind}\u2026")
         self.on_fix_one(self, kind=kind)
+
+    def _on_recipe_click(self):
+        if self.on_recipe is None:
+            return
+        self._disable_all_fix()
+        self.on_recipe(self)
 
     def _on_fix_click(self):
         self._disable_all_fix()
@@ -859,12 +839,31 @@ class PluginCard(tk.Frame):
                 self.undo_btn.config(state="disabled" if working else "normal")
             except Exception:
                 pass
+        if self.skip_box is not None:
+            try:
+                self.skip_box.config(state="disabled" if working else "normal")
+            except Exception:
+                pass
         if not self.fix_buttons:
             return
         if working:
             self._disable_all_fix()
         else:
             self.mark_idle()
+
+    def mark_one_done(self, kind, message):
+        """One fix landed; siblings stay usable, no rescan needed."""
+        try:
+            self._done_kinds.add(kind)
+        except Exception:
+            pass
+        try:
+            btn = self.kind_buttons.get(kind)
+            if btn is not None:
+                btn.config(state="disabled")
+        except Exception:
+            pass
+        self.status_lbl.config(text=f"Fixed \u2713 {message}", fg="#16a34a")
 
     def mark_idle(self):
         if not self.fixed:
@@ -877,922 +876,19 @@ class PluginCard(tk.Frame):
                     b.config(state="normal")
                 except Exception:
                     pass
+            try:
+                for kind in self._done_kinds:
+                    btn = self.kind_buttons.get(kind)
+                    if btn is not None:
+                        btn.config(state="disabled")
+            except Exception:
+                pass
             self.status_lbl.config(text="")
-
-    def included(self):
-        """Return whether the plugin should be fixed."""
-        if self.fixed:
-            return False
-        return self.force_fix or self.verdict["safe"]
-
-
-# ===================================================================
-# Healer card (for stale pattern scan offsets)
-# ===================================================================
-
-HEALER_BADGE_COLORS = {
-    "AUTO_FIXABLE": {"bar": "#22c55e"},
-    "MANUAL_NEEDED": {"bar": "#f97316"},
-    "FUNCTION_REWRITTEN": {"bar": "#ef4444"},
-}
-
-
-class HealerCard(tk.Frame):
-    """A card representing one stale offset finding."""
-
-    def __init__(self, parent, finding, exe_data, exe_sections, on_heal,
-                 old_exe_data=None, old_exe_sections=None, **kw):
-        super().__init__(parent, bg=CARD_BG, relief="solid", bd=1, **kw)
-        self.finding = finding
-        self.exe_data = exe_data
-        self.exe_sections = exe_sections
-        self.old_exe_data = old_exe_data
-        self.old_exe_sections = old_exe_sections
-        self.on_heal = on_heal
-        self.fixed = False
-        self._note = False
-        self.selected_offset = finding.get("new_offset")
-
-        auto_fix = finding.get("auto_fixable", False)
-        has_reason = "reason" in finding
-        has_candidates = "candidates" in finding
-        if auto_fix:
-            badge_key = "AUTO_FIXABLE"
-        elif has_reason:
-            badge_key = "FUNCTION_REWRITTEN"
-        else:
-            badge_key = "MANUAL_NEEDED"
-        colors = HEALER_BADGE_COLORS[badge_key]
-
-        # Left accent bar
-        self.bar = tk.Frame(self, bg=colors["bar"], width=4)
-        self.bar.pack(side="left", fill="y")
-
-        # Content area
-        body = tk.Frame(self, bg=CARD_BG)
-        body.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=10)
-
-        # Header: plugin name
-        dll_path = finding["dll_path"]
-        _name_label(body, dll_path.name).pack(anchor="w")
-
-        # ID + offset info
-        id_val = finding["id_val"]
-        func_rva = finding["func_rva"]
-        old_off = finding["old_offset"]
-        new_off = finding.get("new_offset")
-        info_line = f"REL::ID {id_val}  (func RVA 0x{func_rva:X})"
-        tk.Label(body, text=info_line,
-                 font=(FONT_FAMILY, 9),
-                 fg=TEXT_SECONDARY, bg=CARD_BG,
-                 anchor="w").pack(fill="x")
-
-        # Bytes at stale offset
-        func_off = healer.rva_to_offset(func_rva, exe_sections)
-        if func_off is not None:
-            stale_bytes = healer.extract_bytes_at(exe_data, func_off + old_off, 16)
-            if stale_bytes:
-                stale_hex = stale_bytes.hex(" ")
-                tk.Label(body, text=f"New binary at 0x{old_off:X}: {stale_hex}",
-                         font=(FONT_MONO, 8),
-                         fg=TEXT_SECONDARY, bg=CARD_BG,
-                         anchor="w").pack(fill="x")
-
-        # Old binary bytes (if available)
-        if old_exe_data and old_exe_sections:
-            old_func_off = healer.rva_to_offset(func_rva, old_exe_sections)
-            if old_func_off is not None:
-                old_bytes = healer.extract_bytes_at(old_exe_data, old_func_off + old_off, 16)
-                if old_bytes:
-                    old_hex = old_bytes.hex(" ")
-                    tk.Label(body, text=f"Old binary at 0x{old_off:X}: {old_hex}",
-                             font=(FONT_MONO, 8),
-                             fg="#6366f1", bg=CARD_BG,
-                             anchor="w").pack(fill="x")
-
-        # Offset details
-        if new_off is not None:
-            detail = f"Offset: 0x{old_off:X} -> 0x{new_off:X}"
-        else:
-            detail = f"Offset: 0x{old_off:X} -> ?"
-        tk.Label(body, text=detail,
-                 font=(FONT_MONO, 9),
-                 fg=TEXT_PRIMARY, bg=CARD_BG,
-                 anchor="w").pack(fill="x")
-
-        # Status / reason
-        if "reason" in finding:
-            status_text = finding["reason"]
-        elif auto_fix and new_off is not None:
-            status_text = "Auto-fixable"
-        elif has_candidates:
-            n = len(finding["candidates"])
-            status_text = f"{n} candidates - select one below"
-        else:
-            status_text = "Needs manual investigation"
-        tk.Label(body, text=status_text,
-                 font=(FONT_FAMILY, 9),
-                 fg=TEXT_SECONDARY, bg=CARD_BG,
-                 anchor="w", wraplength=380).pack(fill="x", pady=(2, 4))
-
-        # Candidate selection (when multiple CALL+MOV patterns found)
-        self.candidate_var = tk.IntVar(value=-1)
-        self.candidate_buttons = []
-        if has_candidates and not auto_fix:
-            candidates = finding["candidates"]
-            closest = finding.get("closest_candidate")
-            tk.Label(body, text="Candidate offsets:",
-                     font=(FONT_FAMILY, 9, "bold"),
-                     fg=TEXT_PRIMARY, bg=CARD_BG,
-                     anchor="w").pack(fill="x", pady=(4, 2))
-
-            cand_frame = tk.Frame(body, bg=CARD_BG)
-            cand_frame.pack(fill="x")
-
-            for idx, (coff, call_tgt) in enumerate(candidates):
-                if func_off is not None:
-                    cand_bytes = healer.extract_bytes_at(exe_data, func_off + coff, 8)
-                    cand_hex = cand_bytes.hex(" ") if cand_bytes else "??"
-                else:
-                    cand_hex = "??"
-                dist = coff - old_off
-                label = f"0x{coff:X} ({dist:+d})  [{cand_hex}]"
-                is_closest = (closest == coff)
-                if is_closest:
-                    label += "  <-- closest"
-
-                rb = tk.Radiobutton(
-                    cand_frame, text=label,
-                    variable=self.candidate_var, value=coff,
-                    font=(FONT_MONO, 8),
-                    fg=TEXT_PRIMARY, bg=CARD_BG,
-                    selectcolor=CARD_BG,
-                    activebackground=CARD_BG,
-                    anchor="w",
-                    command=self._on_candidate_select,
-                )
-                rb.pack(fill="x", anchor="w")
-                self.candidate_buttons.append(rb)
-
-        # Action row
-        btn_frame = tk.Frame(body, bg=CARD_BG)
-        btn_frame.pack(fill="x", pady=(4, 0))
-
-        if auto_fix and new_off is not None:
-            # Direct heal button
-            self.heal_btn = tk.Button(
-                btn_frame,
-                text="Heal",
-                font=(FONT_FAMILY, 9, "bold"),
-                relief="raised", bd=1,
-                padx=12, pady=4,
-                bg="#fef08a", fg="#713f12",
-                activebackground="#fde047", activeforeground="#422006",
-                cursor="hand2",
-                command=self._on_heal_click,
-            )
-            self.heal_btn.pack(side="left")
-        elif has_candidates:
-            # Heal with selected candidate
-            self.heal_btn = tk.Button(
-                btn_frame,
-                text="Heal with selected",
-                font=(FONT_FAMILY, 9, "bold"),
-                relief="raised", bd=1,
-                padx=12, pady=4,
-                bg="#e0e0e0", fg="#404040",
-                activebackground="#d0d0d0", activeforeground="#202020",
-                cursor="hand2",
-                state="disabled",
-                command=self._on_heal_click,
-            )
-            self.heal_btn.pack(side="left")
-        else:
-            self.heal_btn = None
-
-        # Status label
-        self.status_lbl = tk.Label(body, text="",
-                                   font=(FONT_FAMILY, 9),
-                                   fg=TEXT_SECONDARY, bg=CARD_BG)
-        self.status_lbl.pack(anchor="w")
-
-    def _on_candidate_select(self):
-        sel = self.candidate_var.get()
-        if sel >= 0 and self.heal_btn:
-            self.heal_btn.config(state="normal", bg="#fef08a", fg="#713f12")
-
-    def _on_heal_click(self):
-        sel = self.candidate_var.get()
-        if sel >= 0:
-            self.selected_offset = sel
-        if self.selected_offset is None:
-            return
-        patched = dict(self.finding)
-        patched["new_offset"] = self.selected_offset
-        self.on_heal(self, patched)
-
-    def mark_busy(self):
-        if self.heal_btn:
-            self.heal_btn.config(state="disabled")
-        self.status_lbl.config(text="Patching...")
-
-    def note(self, text):
-        self._note = True
-        self.status_lbl.config(text=text, fg=TEXT_SECONDARY)
-
-    def mark_fixed(self, success, message):
-        self.fixed = True
-        if self.heal_btn:
-            self.heal_btn.config(state="disabled")
-        self.status_lbl.config(
-            text="Fixed \u2713" if success else ("Failed: " + message),
-            fg="#16a34a" if success else "#dc2626",
-        )
-
-    def set_working(self, working):
-        if working:
-            self._snap = [(w, w.cget("state"))
-                          for w in [self.heal_btn, *self.candidate_buttons]
-                          if w is not None]
-            for w, _ in self._snap:
-                try:
-                    w.config(state="disabled")
-                except Exception:
-                    pass
-        elif not self.fixed:
-            for w, st in getattr(self, "_snap", []):
-                try:
-                    w.config(state=st)
-                except Exception:
-                    pass
-            self._snap = []
-            if getattr(self, "_note", False):
-                self.status_lbl.config(text="")
-                self._note = False
-
-
-# ===================================================================
-# Healer Tab
-# ===================================================================
-
-class HealerTab:
-    """Tab for detecting and fixing stale pattern scan offsets in SKSE plugins."""
-
-    def __init__(self, parent, game_exe, plugins_dir_fn, work,
-                 extra_dirs_fn=None):
-        self.parent = parent
-        self.game_exe = game_exe
-        self._plugins_dir_fn = plugins_dir_fn
-        self._extra_dirs_fn = extra_dirs_fn
-        self.work = work
-        self.cards = []
-        self._exe_data = None
-        self._exe_sections = None
-
-        self._build()
-        self.work.listen(self._set_working)
-
-    def _set_working(self, working, desc=""):
-        state = "disabled" if working else "normal"
-        self.scan_btn.config(state=state)
-        self.clear_btn.config(state=state)
-        self.trans_btn.config(state=state)
-        self.browse_plugin_btn.config(state=state)
-        self.browse_old_btn.config(state=state)
-        for c in self.cards:
-            c.set_working(working)
-
-    def _build(self):
-        # Top controls
-        ctrl = tk.Frame(self.parent, bg=BG)
-        ctrl.pack(fill="x", padx=10, pady=(10, 4))
-
-        # Plugin selector
-        tk.Label(ctrl, text="Plugin:",
-                 font=(FONT_FAMILY, 10), fg=TEXT_PRIMARY, bg=BG
-                 ).pack(side="left")
-        self.plugin_var = tk.StringVar()
-        self.plugin_entry = ttk.Entry(ctrl, textvariable=self.plugin_var, width=40)
-        self.plugin_entry.pack(side="left", padx=(6, 4))
-        self.browse_plugin_btn = ttk.Button(
-            ctrl, text="Browse...", command=self._browse_plugin)
-        self.browse_plugin_btn.pack(side="left", padx=(0, 12))
-
-        # Old game exe selector (optional)
-        tk.Label(ctrl, text="Old game (optional):",
-                 font=(FONT_FAMILY, 10), fg=TEXT_PRIMARY, bg=BG
-                 ).pack(side="left")
-        self.old_game_var = tk.StringVar()
-        self.old_game_entry = ttk.Entry(ctrl, textvariable=self.old_game_var, width=40)
-        self.old_game_entry.pack(side="left", padx=(6, 4))
-        self.browse_old_btn = ttk.Button(
-            ctrl, text="Browse...", command=self._browse_old_game)
-        self.browse_old_btn.pack(side="left")
-
-        # Buttons row
-        btn_frame = tk.Frame(self.parent, bg=BG)
-        btn_frame.pack(fill="x", padx=10, pady=(4, 4))
-
-        self.scan_btn = ttk.Button(btn_frame, text="Scan", command=self.scan)
-        self.scan_btn.pack(side="left", padx=(0, 6))
-
-        self.clear_btn = ttk.Button(btn_frame, text="Clear",
-                                    command=self._clear_cards)
-        self.clear_btn.pack(side="left")
-
-        self.trans_btn = ttk.Button(btn_frame, text="Build Translations",
-                                    command=self.build_translations)
-        self.trans_btn.pack(side="left", padx=(12, 0))
-
-        # Summary
-        self.summary_lbl = tk.Label(btn_frame, text="",
-                                    font=(FONT_FAMILY, 10, "bold"),
-                                    fg=TEXT_PRIMARY, bg=BG)
-        self.summary_lbl.pack(side="left", padx=(16, 0))
-
-        # Scrollable card area
-        self.sf = ScrollFrame(self.parent)
-        self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
-
-    # -- Browse --
-
-    def _browse_plugin(self):
-        path = filedialog.askopenfilename(
-            title="Select Plugin DLL",
-            filetypes=[("DLL files", "*.dll"), ("All files", "*.*")],
-            initialdir=str(self._plugins_dir_fn() or ""),
-        )
-        if path:
-            self.plugin_var.set(path)
-            self.scan()
-
-    def _browse_old_game(self):
-        path = filedialog.askopenfilename(
-            title="Select Old SkyrimSE.exe (optional)",
-            filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
-        )
-        if path:
-            self.old_game_var.set(path)
-
-    # -- Scan --
-
-    def scan(self):
-        plugin_path = self.plugin_var.get().strip()
-        if not plugin_path:
-            messagebox.showerror("Error", "Select a plugin DLL first.")
-            return
-        plugin_path = Path(plugin_path)
-        if not plugin_path.exists():
-            messagebox.showerror("Error", f"Plugin not found:\n{plugin_path}")
-            return
-        if self.game_exe is None:
-            messagebox.showerror("Error", "Place this tool in the same folder as SkyrimSE.exe.")
-            return
-        plugins_dir = self._plugins_dir_fn()
-        extra_dirs = self._extra_dirs_fn() if self._extra_dirs_fn else []
-        has_libs = (plugins_dir is not None and plugins_dir.exists()) or extra_dirs
-        if not has_libs:
-            messagebox.showerror("Error", "Could not find any mods.")
-            return
-        if plugins_dir is None or not plugins_dir.exists():
-            plugins_dir = extra_dirs[0] if extra_dirs else None
-
-        old_game = self.old_game_var.get().strip()
-        old_game_path = Path(old_game) if old_game else None
-        if old_game_path and not old_game_path.exists():
-            messagebox.showerror("Error", f"Old game exe not found:\n{old_game_path}")
-            return
-
-        self._run(lambda: self._do_scan(plugin_path, plugins_dir, old_game_path,
-                                        extra_dirs),
-                  f"Checking {plugin_path.name}...")
-
-    def _do_scan(self, plugin_path, plugins_dir, old_game_path, extra_dirs=None):
-        self.root.after(0, self._clear_cards)
-        try:
-            self._exe_data, self._exe_sections = healer.load_game_sections(self.game_exe)
-            self._old_exe_data = None
-            self._old_exe_sections = None
-            if old_game_path:
-                self._old_exe_data, self._old_exe_sections = healer.load_game_sections(old_game_path)
-            findings, _, _, _ = healer.analyze_plugin(
-                plugin_path, self.game_exe, plugins_dir, old_game_path,
-                extra_dirs=extra_dirs)
-        except Exception as exc:
-            self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
-            return
-
-        for f in findings:
-            self.root.after(
-                0,
-                lambda finding=f: self._add_card(finding),
-            )
-
-        n = len(findings)
-        auto = sum(1 for f in findings if f.get("auto_fixable"))
-        manual = n - auto
-        if n == 0:
-            self.root.after(0, lambda: self.summary_lbl.config(
-                text="No stale offsets found"))
-        else:
-            parts = []
-            if auto:
-                parts.append(f"{auto} auto-fixable")
-            if manual:
-                parts.append(f"{manual} manual")
-            self.root.after(0, lambda t=", ".join(parts): self.summary_lbl.config(
-                text=f"{n} stale offset(s): {t}"))
-
-    def _add_card(self, finding):
-        card = HealerCard(self.sf.inner, finding,
-                          self._exe_data, self._exe_sections,
-                          on_heal=self._heal_one,
-                          old_exe_data=self._old_exe_data,
-                          old_exe_sections=self._old_exe_sections)
-        card.pack(fill="x", padx=4, pady=4)
-        self.cards.append(card)
-        if self.work.busy:
-            card.set_working(True)
-
-    # -- Heal --
-
-    def _heal_one(self, card, patched_finding=None):
-        if not self.work.acquire(f"Patching {card.finding['dll_path'].name}..."):
-            card.note("Please wait - still working...")
-            return
-        card.mark_busy()
-        _launch(self.root, self.work,
-                lambda: self._heal_worker(card, patched_finding))
-
-    def _heal_worker(self, card, patched_finding=None):
-        finding = patched_finding or card.finding
-        dll_path = finding["dll_path"]
-        try:
-            ok = healer.heal_plugin(dll_path, finding, backup=True)
-            msg = f"0x{finding['old_offset']:X} -> 0x{finding['new_offset']:X}" if ok else "patch failed"
-            self.root.after(0, lambda: card.mark_fixed(ok, msg))
-        except Exception as exc:
-            self.root.after(0, lambda: card.mark_fixed(False, str(exc)))
-
-    # -- Build Translations (global runtime data, slow) --
-
-    def build_translations(self):
-        if self.game_exe is None:
-            messagebox.showerror(
-                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
-            return
-        plugins = self._plugins_dir_fn()
-        extra_dirs = self._extra_dirs_fn() if self._extra_dirs_fn else []
-        if plugins is None and not extra_dirs:
-            messagebox.showerror(
-                "Error", "Place this tool in the same folder as SkyrimSE.exe.")
-            return
-        if plugins is None:
-            plugins = extra_dirs[0]
-        try:
-            plugins.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        if not plugins.exists():
-            messagebox.showerror(
-                "Error", f"Could not use folder:\n{plugins}")
-            return
-        self._run(lambda: self._do_build_translations(plugins, extra_dirs),
-                  "Updating helper data...")
-
-    def _do_build_translations(self, plugins, extra_dirs=None):
-        try:
-            game_ver = core.runtime_version_from_exe(self.game_exe)
-            ver_count, total = core.build_translations(
-                str(self.game_exe), plugins, game_version=game_ver,
-                extra_lib_dirs=extra_dirs)
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Build Translations",
-                f"Done.\n{ver_count} version(s), {total} entries.\n\n"
-                f"Written to:\n{plugins / 'CompaSSE' / 'translation_table.bin'}"))
-        except Exception as exc:
-            self.root.after(
-                0, lambda: messagebox.showerror("Error", str(exc)))
-
-    # -- Helpers --
-
-    def _run(self, fn, desc="Working..."):
-        if self.work.acquire(desc):
-            _launch(self.root, self.work, fn)
-
-    def _clear_cards(self):
-        for c in self.cards:
-            c.destroy()
-        self.cards.clear()
-        self.summary_lbl.config(text="")
-
-    @property
-    def root(self):
-        return self.parent.winfo_toplevel()
-
-
-# ===================================================================
-# Main GUI
-# ===================================================================
 
 def _window_icon():
     base = getattr(sys, "_MEIPASS", None) or str(Path(__file__).parent)
     ico = Path(base) / "compasse.ico"
     return str(ico) if ico.exists() else ""
-
-
-SURGEON_BADGE_COLORS = {
-    "core": {"bar": "#9ca3af"},
-    "mod": {"bar": "#eab308"},
-}
-
-
-def _default_saves_dir():
-    """Usual Saves folder, or None when it does not exist."""
-    cand = (Path.home() / "Documents" / "My Games" / "Skyrim Special Edition"
-            / "Saves")
-    return cand if cand.exists() else None
-
-
-class SurgeonCard(tk.Frame):
-    """A card for one co-save plugin block with a Drop button."""
-
-    def __init__(self, parent, save_path, block, loc, fsize, on_drop, **kw):
-        super().__init__(parent, bg=CARD_BG, relief="solid", bd=1, **kw)
-        self.save_path = save_path
-        self.block = block
-        self.loc = loc or {"installed": [], "staged": []}
-        self.fsize = fsize
-        self.on_drop = on_drop
-        self.dropped = False
-        self._note = False
-        uid = block["uid"]
-        is_core = uid == 0
-
-        colors = SURGEON_BADGE_COLORS["core" if is_core else "mod"]
-        self.bar = tk.Frame(self, bg=colors["bar"], width=4)
-        self.bar.pack(side="left", fill="y")
-
-        body = tk.Frame(self, bg=CARD_BG)
-        body.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=10)
-
-        title = f"{surgeon.uid_name(uid)} [0x{uid:08x}]"
-        _name_label(body, title).pack(anchor="w")
-
-        if not is_core:
-            inst = self.loc["installed"]
-            staged = self.loc["staged"]
-            if inst:
-                tk.Label(body, text="owned by installed: " + ", ".join(inst),
-                         font=(FONT_FAMILY, 9),
-                         fg=TEXT_SECONDARY, bg=CARD_BG,
-                         anchor="w").pack(fill="x")
-            elif staged:
-                tk.Label(body, text="known mod, not deployed: "
-                                    + ", ".join(s[:60] for s in staged[:2]),
-                         font=(FONT_FAMILY, 9),
-                         fg=TEXT_SECONDARY, bg=CARD_BG,
-                         anchor="w", wraplength=380).pack(fill="x")
-            else:
-                tk.Label(body, text="unknown anywhere - true orphan, safe to drop",
-                         font=(FONT_FAMILY, 9, "bold"),
-                         fg="#b45309", bg=CARD_BG,
-                         anchor="w", wraplength=380).pack(fill="x")
-
-        total = sum(c["length"] for c in block["chunks"])
-        share = f" ({100 * total // self.fsize}% of file)" if self.fsize else ""
-        tk.Label(body, text=f"{len(block['chunks'])} chunk(s), {total} data bytes{share}",
-                 font=(FONT_FAMILY, 9),
-                 fg=TEXT_SECONDARY, bg=CARD_BG,
-                 anchor="w").pack(fill="x")
-
-        kinds = []
-        for c in block["chunks"][:10]:
-            t = surgeon.fcc(c["type"])
-            kinds.append(t if t.isprintable() else f"0x{c['type']:08x}")
-        if kinds:
-            more = f" +{len(block['chunks']) - 10} more" if len(block["chunks"]) > 10 else ""
-            tk.Label(body, text=" ".join(kinds) + more,
-                     font=(FONT_MONO, 8),
-                     fg=TEXT_SECONDARY, bg=CARD_BG,
-                     anchor="w").pack(fill="x")
-
-        desc = surgeon.describe_chunks(block)
-        if desc:
-            tk.Label(body, text="Holds: " + desc,
-                     font=(FONT_FAMILY, 9),
-                     fg=TEXT_SECONDARY, bg=CARD_BG,
-                     anchor="w", wraplength=380).pack(fill="x")
-
-        if is_core:
-            tk.Label(body, text="SKSE core data - not droppable.",
-                     font=(FONT_FAMILY, 9),
-                     fg=TEXT_SECONDARY, bg=CARD_BG,
-                     anchor="w").pack(fill="x", pady=(4, 0))
-            self.drop_btn = None
-        else:
-            btn_frame = tk.Frame(body, bg=CARD_BG)
-            btn_frame.pack(fill="x", pady=(4, 0))
-            self.drop_btn = tk.Button(
-                btn_frame,
-                text="Drop block",
-                font=(FONT_FAMILY, 9, "bold"),
-                relief="raised", bd=1,
-                padx=12, pady=4,
-                bg="#fef08a", fg="#713f12",
-                activebackground="#fde047", activeforeground="#422006",
-                cursor="hand2",
-                command=self._on_drop_click,
-            )
-            self.drop_btn.pack(side="left")
-
-        self.status_lbl = tk.Label(body, text="",
-                                   font=(FONT_FAMILY, 9),
-                                   fg=TEXT_SECONDARY, bg=CARD_BG)
-        self.status_lbl.pack(anchor="w")
-
-    def _on_drop_click(self):
-        self.on_drop(self)
-
-    def mark_busy(self):
-        if self.drop_btn:
-            self.drop_btn.config(state="disabled")
-        self.status_lbl.config(text="Dropping...")
-
-    def note(self, text):
-        self._note = True
-        self.status_lbl.config(text=text, fg=TEXT_SECONDARY)
-
-    def mark_dropped(self, success, message):
-        self.dropped = True
-        if self.drop_btn:
-            self.drop_btn.config(state="disabled")
-        self.status_lbl.config(
-            text="Dropped \u2713" if success else ("Failed: " + message),
-            fg="#16a34a" if success else "#dc2626",
-        )
-
-    def set_working(self, working):
-        if working:
-            self._snap = [(self.drop_btn, self.drop_btn.cget("state"))] \
-                if self.drop_btn else []
-            for w, _ in self._snap:
-                try:
-                    w.config(state="disabled")
-                except Exception:
-                    pass
-        elif not self.dropped:
-            for w, st in getattr(self, "_snap", []):
-                try:
-                    w.config(state=st)
-                except Exception:
-                    pass
-            self._snap = []
-            if getattr(self, "_note", False):
-                self.status_lbl.config(text="")
-                self._note = False
-
-
-class SurgeonTab:
-    """Tab listing co-save plugin blocks with per-block Drop."""
-
-    def __init__(self, parent, plugins_dir_fn=None, work=None,
-                 extra_dlls_fn=None):
-        self.parent = parent
-        self._plugins_dir_fn = plugins_dir_fn
-        self._extra_dlls_fn = extra_dlls_fn
-        self.work = work or BusyState()
-        self.cards = []
-        self._save_path = None
-        self._preview_img = None
-        self._build()
-        self.work.listen(self._set_working)
-
-    def _set_working(self, working, desc=""):
-        state = "disabled" if working else "normal"
-        self.list_btn.config(state=state)
-        self.clear_btn.config(state=state)
-        self.browse_btn.config(state=state)
-        self.backup_btn.config(state=state)
-        for c in self.cards:
-            c.set_working(working)
-
-    def _build(self):
-        top = tk.Frame(self.parent, bg=BG)
-        top.pack(fill="x", padx=10, pady=(10, 0))
-
-        left = tk.Frame(top, bg=BG)
-        left.pack(side="left", fill="both", expand=True)
-
-        ctrl = tk.Frame(left, bg=BG)
-        ctrl.pack(fill="x", pady=(0, 2))
-
-        tk.Label(ctrl, text="Save (.skse):",
-                 font=(FONT_FAMILY, 10), fg=TEXT_PRIMARY, bg=BG
-                 ).pack(side="left")
-        self.save_var = tk.StringVar()
-        self.save_entry = ttk.Entry(ctrl, textvariable=self.save_var, width=40)
-        self.save_entry.pack(side="left", padx=(6, 4))
-        self.browse_btn = ttk.Button(ctrl, text="Browse...",
-                                     command=self._browse_save)
-        self.browse_btn.pack(side="left", padx=(0, 12))
-
-        btn_frame = tk.Frame(left, bg=BG)
-        btn_frame.pack(fill="x", pady=(2, 2))
-
-        self.list_btn = ttk.Button(btn_frame, text="List blocks", command=self.list_blocks)
-        self.list_btn.pack(side="left", padx=(0, 6))
-
-        self.clear_btn = ttk.Button(btn_frame, text="Clear",
-                                    command=self._clear_cards)
-        self.clear_btn.pack(side="left")
-
-        self.backup_var = tk.BooleanVar(value=True)
-        self.backup_btn = tk.Checkbutton(
-            btn_frame, text="Backup",
-            variable=self.backup_var,
-            font=(FONT_FAMILY, 9),
-            fg=TEXT_PRIMARY, bg=BG, activebackground=BG,
-            selectcolor=BG, cursor="hand2")
-        self.backup_btn.pack(side="left", padx=(12, 0))
-
-        info_frame = tk.Frame(left, bg=BG)
-        info_frame.pack(fill="x", pady=(2, 0))
-        self.info_head = tk.Label(info_frame, text="",
-                                  font=(FONT_FAMILY, 10, "bold"),
-                                  fg=TEXT_PRIMARY, bg=BG,
-                                  anchor="w", justify="left")
-        self.info_head.pack(fill="x")
-        self.info_sub = tk.Label(info_frame, text="",
-                                 font=(FONT_FAMILY, 9),
-                                 fg=TEXT_SECONDARY, bg=BG,
-                                 anchor="w", justify="left",
-                                 wraplength=700)
-        self.info_sub.pack(fill="x")
-
-        self.preview_lbl = tk.Label(top, bg=BG)
-        self.preview_lbl.pack(side="right", padx=(8, 0), anchor="n")
-
-        self.sf = ScrollFrame(self.parent)
-        self.sf.pack(fill="both", expand=True, padx=10, pady=(2, 4))
-
-    def _browse_save(self):
-        initial = _default_saves_dir()
-        path = filedialog.askopenfilename(
-            title="Select co-save (.skse)",
-            filetypes=[("SKSE co-save", "*.skse"), ("All files", "*.*")],
-            initialdir=str(initial) if initial else "",
-        )
-        if path:
-            self.save_var.set(path)
-            self.list_blocks()
-
-    def _set_preview(self, ppm):
-        if ppm is None:
-            self.preview_lbl.config(image="", text="(no screenshot)",
-                                    font=(FONT_FAMILY, 8),
-                                    fg=TEXT_SECONDARY, bg=CARD_BG)
-            self.preview_lbl.pack(side="right", padx=(8, 0), anchor="n")
-            return
-        try:
-            self._preview_img = tk.PhotoImage(data=ppm)
-        except tk.TclError:
-            self.preview_lbl.config(image="", text="(preview unreadable)",
-                                    font=(FONT_FAMILY, 8),
-                                    fg=TEXT_SECONDARY, bg=CARD_BG)
-            self.preview_lbl.pack(side="right", padx=(8, 0), anchor="n")
-            return
-        self.preview_lbl.config(image=self._preview_img, text="")
-        self.preview_lbl.pack(side="right", padx=(8, 0), anchor="n")
-
-    def list_blocks(self):
-        save_path = self.save_var.get().strip()
-        if not save_path:
-            messagebox.showerror("Error", "Select a .skse co-save first.")
-            return
-        save_path = Path(save_path)
-        if not save_path.exists():
-            messagebox.showerror("Error", f"Save not found:\n{save_path}")
-            return
-        self._save_path = save_path
-        self._run(lambda: self._do_list(save_path), "Reading save file...")
-
-    def _do_list(self, save_path):
-        self.root.after(0, self._clear_cards)
-        try:
-            header, blocks, trailing = surgeon.parse_cosave(save_path)
-        except ValueError as exc:
-            self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
-            return
-        # Phase 1 (fast): identity + preview now, block scan after.
-        ver = header["runtimeVersion"]
-        game = f"{ver >> 24}.{(ver >> 16) & 0xFF}.{((ver >> 4) & 0xFFF)}"
-        pretty = surgeon.parse_save_filename(save_path.name)
-        ess_info = surgeon.read_ess_info(save_path.with_suffix(".ess"))
-        ppm = None
-        if ess_info and ess_info.get("shot"):
-            ppm = surgeon.ess_thumbnail(ess_info["shot"])
-        self.root.after(0, lambda p=ppm: self._set_preview(p))
-        if pretty:
-            head = (f"{pretty['character']} - {pretty['label']}, "
-                    f"{pretty['location']}, level {pretty['level']} - "
-                    f"{pretty['date']}")
-            if ess_info and ess_info.get("day") is not None:
-                head += f" - Day {ess_info['day']}, {ess_info['time']}"
-        else:
-            head = save_path.name
-        self.root.after(0, lambda h=head: self.info_head.config(text=h))
-        self.root.after(0, lambda n=len(blocks): self.info_sub.config(
-            text=f"game {game}, {n} block(s) - resolving owners..."))
-
-        # Phase 2 (slow): per-block owner scans, cards, mod diff.
-        fsize = save_path.stat().st_size
-        plugdir = None
-        if self._plugins_dir_fn is not None:
-            plugdir = self._plugins_dir_fn()
-        extra_dlls = self._extra_dlls_fn() if self._extra_dlls_fn else []
-        any_known = False
-        for b in blocks:
-            if plugdir or extra_dlls:
-                loc = surgeon.locate_uid(b["uid"], plugdir,
-                                         extra_dlls=extra_dlls)
-            else:
-                loc = None
-            if loc is not None and (loc["installed"] or loc["staged"]):
-                any_known = True
-            self.root.after(
-                0,
-                lambda block=b, lc=loc: self._add_card(block, lc, fsize),
-            )
-        sub = f"game {game}, {len(blocks)} block(s)"
-        if plugdir is not None:
-            plist = None
-            for b in blocks:
-                plist = surgeon.plugin_list_chunk(b, save_path)
-                if plist is not None:
-                    break
-            if plist is not None:
-                missing = surgeon.missing_mods(plist, plugdir.parent.parent)
-                if missing:
-                    sub += (f" - {len(missing)} save mod(s) missing now: "
-                            + ", ".join(missing[:6]))
-                    if len(missing) > 6:
-                        sub += f" +{len(missing) - 6} more"
-        if plugdir is not None and blocks and not any_known:
-            sub += " - no blocks match known mods (different setup?)"
-        if trailing:
-            sub += f", {trailing} trailing bytes (left untouched)"
-        self.root.after(0, lambda h=head: self.info_head.config(text=h))
-        self.root.after(0, lambda t=sub: self.info_sub.config(text=t))
-
-    def _add_card(self, block, loc, fsize):
-        card = SurgeonCard(self.sf.inner, self._save_path, block, loc, fsize,
-                           on_drop=self._drop_one)
-        card.pack(fill="x", padx=4, pady=4)
-        self.cards.append(card)
-        if self.work.busy:
-            card.set_working(True)
-
-    def _drop_one(self, card):
-        if not self.work.acquire("Updating save file..."):
-            card.note("Please wait - still working...")
-            return
-        card.mark_busy()
-        backup = self.backup_var.get()
-        _launch(self.root, self.work,
-                lambda: self._drop_worker(card, backup))
-
-    def _drop_worker(self, card, backup):
-        try:
-            removed, left = surgeon.drop_plugin(card.save_path,
-                                                card.block["uid"],
-                                                backup=backup)
-            msg = f"{removed} bytes removed, {left} left"
-            if not backup:
-                msg += " (NO BACKUP)"
-            self.root.after(0, lambda: card.mark_dropped(True, msg))
-            self.root.after(150, self.list_blocks)
-        except ValueError as exc:
-            self.root.after(0, lambda: card.mark_dropped(False, str(exc)))
-
-    def _run(self, fn, desc="Working..."):
-        if self.work.acquire(desc):
-            _launch(self.root, self.work, fn)
-
-    def _clear_cards(self):
-        for c in self.cards:
-            c.destroy()
-        self.cards.clear()
-        self.info_head.config(text="")
-        self.info_sub.config(text="")
-        self.preview_lbl.config(image="", text="")
-        self.preview_lbl.pack_forget()
-        self._preview_img = None
-
-    @property
-    def root(self):
-        return self.parent.winfo_toplevel()
-
 
 def count_stale_hooks(hooks, exe_data, exe_sections, addresslib):
     """How many detected hooks no longer match at their recorded offset.
@@ -1807,14 +903,13 @@ def count_stale_hooks(hooks, exe_data, exe_sections, addresslib):
             base = (addresslib or {}).get(hook.get("rel_id"))
             if base is None:
                 continue
-            if not core.pattern_matches_at(
+            if not therapist.pattern_matches_at(
                     exe_data, exe_sections, base,
                     hook.get("offset"), hook.get("pattern")):
                 stale += 1
         except Exception:
             continue
     return stale
-
 
 class SettingsTab:
     """Rightmost tab: where the game and the mod manager live."""
@@ -1833,10 +928,8 @@ class SettingsTab:
         self.refresh()
 
     def _set_working(self, working, desc=""):
-        state = "disabled" if working else "normal"
-        self.game_btn.config(state=state)
-        self.mo_btn.config(state=state)
-        self.mo_clear_btn.config(state=state)
+        _set_btn_state(
+            (self.game_btn, self.mo_btn, self.mo_clear_btn), working)
 
     def _build(self):
         box = tk.Frame(self.parent, bg=BG)
@@ -1895,7 +988,6 @@ class SettingsTab:
     def root(self):
         return self.parent.winfo_toplevel()
 
-
 class AutoPorterGUI:
     def __init__(self, root):
         self.root = root
@@ -1923,12 +1015,9 @@ class AutoPorterGUI:
         self.work.listen(self._set_working)
 
     def _set_working(self, working, desc=""):
-        state = "disabled" if working else "normal"
-        self.scan_btn.config(state=state)
-        self.clear_btn.config(state=state)
-        self.restore_btn.config(state=state)
-        self.pro_btn.config(state=state)
-        self.rebuild_btn.config(state=state)
+        _set_btn_state(
+            (self.scan_btn, self.clear_btn, self.restore_btn,
+             self.pro_btn, self.rebuild_btn), working)
         for c in self.cards:
             c.set_working(working)
         self.root.title(f"CompaSSE v{core.VERSION} - {desc}" if working
@@ -1943,17 +1032,85 @@ class AutoPorterGUI:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=6, pady=(6, 0))
 
+        try:
+            from tools import TOOLS, ToolContext
+        except Exception:
+            try:
+                from core.tools import (TOOLS, ToolContext,
+                                        register_tool)
+                from therapist.tab import TherapistTab
+            except Exception:
+                self._build_legacy_tabs()
+                return
+            register_tool("therapist", "  Therapist  ",
+                          lambda parent, ctx: TherapistTab(parent, ctx=ctx))
+            register_tool("healer", "  Healer  ",
+                          lambda parent, ctx: healer_tab.HealerTab(parent, ctx=ctx))
+            register_tool("surgeon", "  Surgeon  ",
+                          lambda parent, ctx: surgeon_tab.SurgeonTab(parent, ctx=ctx))
+            register_tool("porter", "  Porter  ",
+                          lambda parent, ctx: porter_tab.PorterTab(parent, ctx=ctx))
+
+        ctx = ToolContext(
+            game_exe=self.game_exe,
+            plugins_dir_fn=self._plugins,
+            work=self.work,
+            extra_sources_fn=self.get_plugin_sources,
+            game_dir_fn=self._game_dir)
+        self._tool_ctx = ctx
+
+        # -- Build every registered tool tab; Settings stays last --
+        self._tool_frames = {}
+        self._tool_tabs = {}
+        for spec in list(TOOLS):
+            frame = tk.Frame(self.notebook, bg=BG)
+            self.notebook.add(frame, text=spec.title)
+            self._tool_frames[spec.name] = frame
+            self._tool_tabs[spec.name] = spec.factory(frame, ctx)
+
+        self.tab_main = self._tool_frames["therapist"]
+        self.tab_healer = self._tool_frames["healer"]
+        self.tab_surgeon = self._tool_frames["surgeon"]
+        self.tab_porter = self._tool_frames["porter"]
+        self.therapist_tab = self._tool_tabs["therapist"]
+        self.healer_tab = self._tool_tabs["healer"]
+        self.surgeon_tab = self._tool_tabs["surgeon"]
+        self.porter_tab = self._tool_tabs["porter"]
+
+        self.tab_settings = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.tab_settings, text="  Settings  ")
+
+        # -- Build main tab (existing UI, reparented to tab_main) --
+        self._build_main_tab()
+
+        # -- Build settings tab --
+        self.settings_tab = SettingsTab(
+            self.tab_settings,
+            work=self.work,
+            game_exe_fn=lambda: self.game_exe,
+            mo_ini_fn=lambda: core.saved_mo2_ini(HERE, self._game_dir()),
+            on_pick_game=self.locate_game_exe,
+            on_pick_mods=self.locate_mod_manager,
+            on_clear_mods=self.clear_mod_manager)
+
+    def _build_legacy_tabs(self):
+        # Fallback when core.tools is unavailable: the previous explicit
+        # wiring, kept so old checkouts still launch.
         # Tab 1: Therapist (flags and versions)
         self.tab_main = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_main, text="  Therapist  ")
 
-        # Tab 2: Healer
+        # Tab 2: Healer (one-mod check-up and fix)
         self.tab_healer = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_healer, text="  Healer  ")
 
         # Tab 3: Surgeon (co-save blocks)
         self.tab_surgeon = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_surgeon, text="  Surgeon  ")
+
+        # Tab 4: Porter (hardcoded game addresses, scan + fix)
+        self.tab_porter = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.tab_porter, text="  Porter  ")
 
         # Settings stays last: every future tab is added before it.
         self.tab_settings = tk.Frame(self.notebook, bg=BG)
@@ -1962,21 +1119,27 @@ class AutoPorterGUI:
         # -- Build main tab (existing UI, reparented to tab_main) --
         self._build_main_tab()
 
-        # -- Build healer tab --
-        self.healer_tab = HealerTab(
-            self.tab_healer,
-            game_exe=self.game_exe,
-            plugins_dir_fn=self._plugins,
-            work=self.work,
-            extra_dirs_fn=lambda: self.get_plugin_sources()[1],
-        )
-
         # -- Build surgeon tab --
-        self.surgeon_tab = SurgeonTab(
+        self.surgeon_tab = surgeon_tab.SurgeonTab(
             self.tab_surgeon,
             plugins_dir_fn=self._plugins,
             work=self.work,
             extra_dlls_fn=lambda: self.get_plugin_sources()[0])
+
+        # -- Build Healer tab --
+        self.healer_tab = healer_tab.HealerTab(
+            self.tab_healer,
+            game_exe=self.game_exe,
+            plugins_dir_fn=self._plugins,
+            work=self.work,
+            extra_dirs_fn=lambda: self.get_plugin_sources()[1])
+
+        # -- Build Porter tab --
+        self.porter_tab = porter_tab.PorterTab(
+            self.tab_porter,
+            game_exe=self.game_exe,
+            plugins_dir_fn=self._plugins,
+            work=self.work)
 
         # -- Build settings tab --
         self.settings_tab = SettingsTab(
@@ -2022,7 +1185,7 @@ class AutoPorterGUI:
         self.scan_btn = ttk.Button(bf, text="Scan all", command=self.scan)
         self.scan_btn.pack(side="left", padx=(0, 6))
 
-        self.clear_btn = ttk.Button(bf, text="Clear", command=self.clear)
+        self.clear_btn = ttk.Button(bf, text="Refresh", command=self.refresh)
         self.clear_btn.pack(side="left")
 
         self.restore_btn = ttk.Button(bf, text="Undo fixes", command=self.restore)
@@ -2215,7 +1378,9 @@ class AutoPorterGUI:
         self._counts = {}
         self._scan_data = []
         self.page = 0
-        self._run(lambda: self._do_scan(dlls, lib_dirs), "Starting scan...")
+        fast = self._recipe_fast_ok()
+        self._run(lambda: self._do_scan(dlls, lib_dirs, fast),
+                  "Starting scan...")
 
     def locate_game_exe(self):
         """Point CompaSSE at SkyrimSE.exe once; it is remembered."""
@@ -2238,7 +1403,10 @@ class AutoPorterGUI:
             self.healer_tab.game_exe = self.game_exe
         except Exception:
             pass
-        self.clear()
+        try:
+            self.porter_tab.game_exe = self.game_exe
+        except Exception:
+            pass
         self._refresh_header()
         self.list_dlls()
 
@@ -2286,6 +1454,15 @@ class AutoPorterGUI:
         self._refresh_header()
         self.list_dlls()
 
+    def _pending_card(self, dll, rec=None, pend=0):
+        """Unchecked card, with a fix button when a recipe applies."""
+        if rec is not None and pend:
+            return PendingCard(self.sf.inner, dll,
+                               on_scan=self._scan_single,
+                               on_recipe=self._apply_recipe_single,
+                               recipe=rec)
+        return PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
+
     def list_dlls(self):
         """Instant file listing: one unchecked card per DLL, no analysis."""
         plugins = self._plugins()
@@ -2304,8 +1481,17 @@ class AutoPorterGUI:
         self._ctx = None
         self._counts = {}
         self._scan_data = []
+        game_ver, recipes = self._recipe_ctx()
+        hits = {}
+        if game_ver and recipes:
+            for d, rec, pend in find_recipe_hits(dlls, game_ver, recipes):
+                hits[str(d).lower()] = (rec, pend)
         for dll in dlls:
-            card = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
+            try:
+                rec, pend = hits.get(str(dll).lower(), (None, 0))
+            except Exception:
+                rec, pend = None, 0
+            card = self._pending_card(dll, rec, pend)
             self.cards.append(card)
         self.page = 0
         self.render_page()
@@ -2368,30 +1554,96 @@ class AutoPorterGUI:
             self._ctx = (runtime_version, exe_data, exe_secs, addr_lib)
         return self._ctx
 
-    def _do_scan(self, dlls, lib_dirs=None):
+    def _recipe_ctx(self):
+        """(game_ver, recipes) once per scan; per-mod match is header reads."""
+        try:
+            ver = healer.game_ver_str(str(self.game_exe)) \
+                if self.game_exe else None
+            plug = self._plugins()
+            return ver, healer.load_recipes(healer.recipes_dirs(plug))
+        except Exception:
+            return None, []
+
+    def _recipe_for(self, dll, game_ver, recipes):
+        """(recipe, pending_count) for one mod, or (None, 0)."""
+        if not game_ver or not recipes:
+            return None, 0
+        try:
+            rec = healer.match_recipe(str(dll), game_ver, recipes)
+            if rec is None:
+                return None, 0
+            pend = sum(1 for _, s in healer.recipe_status(str(dll), rec)
+                       if s == "pending")
+            return rec, pend
+        except Exception:
+            return None, 0
+
+    def _recipe_fast_ok(self):
+        """Recipe-first scanning: everything except pro mode.
+
+        Call on the UI thread; the flag must not be read from workers.
+        """
+        try:
+            return not bool(self.pro_mode.get())
+        except Exception:
+            return False
+
+    def _quick_verdict(self, dll, runtime_version, addr_lib, rec, pend):
+        """Light verdict for a recipe hit: no hook disassembly.
+
+        Returns (info, v) with the recipe attached and the card marked
+        as needing attention, or (None, None) when unreadable.
+        """
+        try:
+            info = therapist.analyze_plugin(dll, runtime_version,
+                                       include_hooks=False)
+        except OSError:
+            return None, None
+        build_year, build_date = _get_build_info(dll)
+        v = classify(info, build_year, runtime_version, dll,
+                     set(addr_lib) if addr_lib else None)
+        v["build_date"] = build_date
+        v["recipe"] = rec
+        v["recipe_pending"] = pend
+        v["cat"] = "NEEDS_FIX"
+        why = v.get("why", "")
+        add = "Known fix available - no deep scan needed."
+        v["why"] = (why + " " + add).strip() if why else add
+        return info, v
+
+    def _do_scan(self, dlls, lib_dirs=None, recipe_first=False):
         runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(lib_dirs)
+        game_ver, recipes = self._recipe_ctx()
 
         total_mods = len(dlls)
         for i, dll in enumerate(dlls):
             self.root.after(
                 0, lambda i=i, d=dll: self.work.set_desc(
                     f"Checking {d.name} ({i + 1}/{total_mods})"))
-            try:
-                info = core.analyze_plugin(dll, runtime_version, include_hooks=True)
-            except OSError:
-                continue
-            build_year = _get_build_year(dll)
-            build_date = _get_build_date_str(dll)
-            v = classify(info, build_year, runtime_version, dll,
-                         set(addr_lib) if addr_lib else None)
-            v["build_date"] = build_date
-            if exe_data is not None and addr_lib is not None:
-                stale = count_stale_hooks(info.get("hooks"), exe_data,
-                                          exe_secs, addr_lib)
-                if stale:
-                    v["hook_note"] = (f"{stale} stale hook offset(s) - go to the "
-                                      "Healer tab to fix (or CLI --fix with old game files).")
-            v["build_date"] = build_date
+            rec, pend = self._recipe_for(dll, game_ver, recipes)
+            if recipe_first and rec is not None and pend:
+                info, v = self._quick_verdict(
+                    dll, runtime_version, addr_lib, rec, pend)
+                if info is None:
+                    continue
+            else:
+                try:
+                    info = therapist.analyze_plugin(dll, runtime_version,
+                                               include_hooks=True)
+                except OSError:
+                    continue
+                build_year, build_date = _get_build_info(dll)
+                v = classify(info, build_year, runtime_version, dll,
+                             set(addr_lib) if addr_lib else None)
+                v["build_date"] = build_date
+                if exe_data is not None and addr_lib is not None:
+                    stale = count_stale_hooks(info.get("hooks"), exe_data,
+                                              exe_secs, addr_lib)
+                    if stale:
+                        v["hook_note"] = (f"{stale} stale hook offset(s) - go to the "
+                                          "Healer tab to fix (or CLI --fix with old game files).")
+                v["recipe"] = rec
+                v["recipe_pending"] = pend
             self._scan_data.append((dll, info, v))
             self._counts[v["cat"]] = self._counts.get(v["cat"], 0) + 1
             self.root.after(
@@ -2503,11 +1755,22 @@ class AutoPorterGUI:
                 "Done", "Helper data is up to date for your game."))
         self.root.after(0, lambda: self.notice_frame.pack_forget())
 
-    def _add_scanned_card(self, dll, info, v):
-        card = PluginCard(self.sf.inner, dll, info, v,
+    def _make_card(self, dll, info, v, rec=None, pend=0):
+        """One per-mod card with every tab action wired."""
+        return PluginCard(self.sf.inner, dll, info, v,
                           on_fix_one=self._fix_single,
                           on_restore_one=self._restore_single,
-                          force_fix=self.pro_mode.get())
+                          on_healer=self._send_to_healer,
+                          force_fix=self.pro_mode.get(),
+                          recipe=rec, recipe_pending=pend,
+                          on_recipe=self._apply_recipe_single,
+                          skip_state=self._skip_state_for(dll),
+                          on_skip_toggle=self._toggle_skip)
+
+    def _add_scanned_card(self, dll, info, v):
+        card = self._make_card(dll, info, v,
+                               rec=v.get("recipe"),
+                               pend=v.get("recipe_pending", 0))
         self.cards.append(card)
         pos = len(self.cards) - 1
         lo = self.page * PAGE_SIZE
@@ -2520,29 +1783,55 @@ class AutoPorterGUI:
     def _scan_single(self, card):
         if not self.work.acquire(f"Checking {card.dll_path.name}..."):
             return
+        fast = self._recipe_fast_ok()
         _launch(self.root, self.work,
-                lambda: self._scan_single_worker(card))
+                lambda: self._scan_single_worker(card, fast))
 
-    def _scan_single_worker(self, card):
+    def _scan_single_worker(self, card, recipe_first=False):
         _dlls, lib_dirs, _label = self.get_plugin_sources()
         runtime_version, exe_data, exe_secs, addr_lib = self._ensure_ctx(lib_dirs)
+        game_ver, recipes = self._recipe_ctx()
+        rec, pend = self._recipe_for(card.dll_path, game_ver, recipes)
+        if recipe_first and rec is not None and pend:
+            info, v = self._quick_verdict(
+                card.dll_path, runtime_version, addr_lib, rec, pend)
+            if info is None:
+                return
+            dll = card.dll_path
+            self.root.after(0, lambda: self._finish_single(card, dll, info, v))
+            return
         try:
-            info = core.analyze_plugin(card.dll_path, runtime_version,
+            info = therapist.analyze_plugin(card.dll_path, runtime_version,
                                        include_hooks=True)
         except OSError:
             return
-        build_year = _get_build_year(card.dll_path)
+        build_year, build_date = _get_build_info(card.dll_path)
         v = classify(info, build_year, runtime_version, card.dll_path,
                      set(addr_lib) if addr_lib else None)
-        v["build_date"] = _get_build_date_str(card.dll_path)
+        v["build_date"] = build_date
         if exe_data is not None and addr_lib is not None:
             stale = count_stale_hooks(info.get("hooks"), exe_data,
                                       exe_secs, addr_lib)
             if stale:
                 v["hook_note"] = (f"{stale} stale hook offset(s) - go to the "
-                                  "Healer tab to fix (or CLI --fix with old game files).")
+                                  "Healer tab to fix.")
         dll, info = card.dll_path, info
         self.root.after(0, lambda: self._finish_single(card, dll, info, v))
+
+    def _send_to_healer(self, card):
+        """Reroute a mod to the Healer tab, prefilled, scan started."""
+        try:
+            self.notebook.select(self.tab_healer)
+        except Exception:
+            pass
+        try:
+            self.healer_tab.dll_var.set(str(card.dll_path))
+        except Exception:
+            return
+        try:
+            self.healer_tab.scan()
+        except Exception:
+            pass
 
     def _finish_single(self, card, dll, info, v):
         for i, (d, _, _) in enumerate(self._scan_data):
@@ -2558,10 +1847,11 @@ class AutoPorterGUI:
             self._update_summary()
             return
         card.destroy()
-        new = PluginCard(self.sf.inner, dll, info, v,
-                         on_fix_one=self._fix_single,
-                         on_restore_one=self._restore_single,
-                         force_fix=self.pro_mode.get())
+        game_ver, recipes = self._recipe_ctx()
+        rec, pend = self._recipe_for(dll, game_ver, recipes)
+        v["recipe"] = rec
+        v["recipe_pending"] = pend
+        new = self._make_card(dll, info, v, rec=rec, pend=pend)
         ncol = 2
         pos = idx - self.page * PAGE_SIZE
         new.grid(row=pos // ncol, column=pos % ncol, sticky="nsew",
@@ -2598,14 +1888,23 @@ class AutoPorterGUI:
         for c in self.cards:
             c.destroy()
         self.cards.clear()
+        game_ver, recipes = self._recipe_ctx()
+        hits = {}
+        if game_ver and recipes:
+            for d, rec, pend in find_recipe_hits(pending, game_ver,
+                                                 recipes):
+                hits[str(d).lower()] = (rec, pend)
         for dll in pending:
-            card = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
+            try:
+                rec, pend = hits.get(str(dll).lower(), (None, 0))
+            except Exception:
+                rec, pend = None, 0
+            card = self._pending_card(dll, rec, pend)
             self.cards.append(card)
         for dll, info, v in scanned:
-            card = PluginCard(self.sf.inner, dll, info, v,
-                              on_fix_one=self._fix_single,
-                              on_restore_one=self._restore_single,
-                              force_fix=self.pro_mode.get())
+            card = self._make_card(dll, info, v,
+                                   rec=v.get("recipe"),
+                                   pend=v.get("recipe_pending", 0))
             self.cards.append(card)
         if self.work.busy:
             for c in self.cards:
@@ -2619,6 +1918,64 @@ class AutoPorterGUI:
         self.pager.set(0, 1, 0)
         self.notice_frame.pack_forget()
         self.lib_frame.pack_forget()
+
+    # --------------------------------------------------------------
+    # Legacy skip-list (Therapist per-card checkbox)
+    # --------------------------------------------------------------
+
+    def _skip_state_for(self, dll):
+        """True/False when the card gets a skip checkbox, else None.
+
+        Only versionless plugins qualify: SKSE skips them, so CompaSSE
+        would try them at startup instead. Needs the plugins folder.
+        """
+        try:
+            plugins = self._plugins()
+        except Exception:
+            return None
+        if plugins is None:
+            return None
+        try:
+            if not core.is_versionless_plugin(dll):
+                return None
+        except Exception:
+            return None
+        try:
+            year = core.pe_build_year(dll)
+        except Exception:
+            year = None
+        try:
+            return bool(core.is_legacy_skipped(plugins, dll.name, year))
+        except Exception:
+            return False
+
+    def _toggle_skip(self, card, skipped):
+        plugins = self._plugins()
+        if plugins is None:
+            messagebox.showinfo(
+                "No game found", "CompaSSE does not know where your game is.")
+            try:
+                card.skip_var.set(not skipped)
+            except Exception:
+                pass
+            return
+        try:
+            year = core.pe_build_year(card.dll_path)
+        except Exception:
+            year = None
+        try:
+            if skipped:
+                core.add_legacy_skip(
+                    plugins, card.dll_path.name, year,
+                    "added from Therapist, no version data")
+            else:
+                core.remove_legacy_skip(plugins, card.dll_path.name, year)
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+            try:
+                card.skip_var.set(not skipped)
+            except Exception:
+                pass
 
     # --------------------------------------------------------------
     # Restore originals (undo fixes)
@@ -2655,6 +2012,14 @@ class AutoPorterGUI:
     def _restore_worker(self, plugin_dirs, dlls=None):
         try:
             done = core.restore_backups_all(plugin_dirs, dlls)
+            try:
+                for dll_path, _ in core.list_backups_all(plugin_dirs, dlls):
+                    try:
+                        core.remove_touched(Path(dll_path).parent, dll_path)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception as exc:
             self.root.after(
                 0, lambda: messagebox.showerror("Error", str(exc)))
@@ -2679,6 +2044,12 @@ class AutoPorterGUI:
     def _restore_single_worker(self, card):
         try:
             ok = core.restore_one(card.dll_path)
+            if ok:
+                try:
+                    core.remove_touched(Path(card.dll_path).parent,
+                                        card.dll_path)
+                except Exception:
+                    pass
         except Exception as exc:
             self.root.after(
                 0, lambda: messagebox.showerror("Error", str(exc)))
@@ -2699,7 +2070,9 @@ class AutoPorterGUI:
             self._update_summary()
             return
         card.destroy()
-        new = PendingCard(self.sf.inner, dll, on_scan=self._scan_single)
+        game_ver, recipes = self._recipe_ctx()
+        rec, pend = self._recipe_for(dll, game_ver, recipes)
+        new = self._pending_card(dll, rec, pend)
         ncol = 2
         pos = idx - self.page * PAGE_SIZE
         new.grid(row=pos // ncol, column=pos % ncol, sticky="nsew",
@@ -2729,8 +2102,48 @@ class AutoPorterGUI:
         _launch(self.root, self.work,
                 lambda: self._fix_single_worker(card, kind))
 
+    def _mark_card(self, card, ok, text):
+        """Report a single-card fix; pending cards lack mark methods."""
+        try:
+            if ok:
+                card.mark_fixed(ok, text)
+            else:
+                card.mark_noop(text)
+        except Exception:
+            pass
+
     def _fix_single_worker(self, card, kind):
         self._apply_fix(card, kind)
+
+    def _apply_recipe_single(self, card):
+        rec = getattr(card, "recipe", None)
+        if rec is None:
+            return
+        if not self.work.acquire(
+                f"Applying known fix to {card.dll_path.name}..."):
+            self._mark_card(card, False, "Please wait - still working...")
+            return
+
+        def _do():
+            try:
+                try:
+                    plug = self._plugins()
+                except Exception:
+                    plug = None
+                game = str(self.game_exe) if self.game_exe else None
+                msgs, _info = healer.apply_recipe(
+                    card.dll_path, rec, plug, game, None, None)
+            except Exception as exc:
+                msg = str(exc)
+                self.root.after(
+                    0, lambda m=msg: self._mark_card(card, False, m))
+                return
+            ok = any("fixed" in m for m in msgs)
+            text = "; ".join(msgs) if msgs else "nothing to do"
+            self.root.after(0, lambda: self._mark_card(card, ok, text))
+            self.root.after(0, lambda: self._scan_single(card))
+
+        _launch(self.root, self.work, _do)
 
     # --------------------------------------------------------------
     # Fix engine helpers
@@ -2747,21 +2160,25 @@ class AutoPorterGUI:
             changed = []
             if kind in ("all", "flag"):
                 if force:
-                    ok = core.patch_flag_force(card.dll_path)
+                    ok = therapist.patch_flag_force(card.dll_path)
                 else:
-                    ok = core.patch_flag(card.dll_path)
+                    ok = therapist.patch_flag(card.dll_path)
                 if ok:
                     changed.append("flag -> 2" if force else "flag 0 -> 2")
             if kind in ("all", "addrlib"):
                 if force:
-                    ok = core.patch_version_independence_force(card.dll_path)
+                    ok = therapist.patch_version_independence_force(card.dll_path)
                 else:
-                    ok = core.patch_version_independence(card.dll_path)
+                    ok = therapist.patch_version_independence(card.dll_path)
                 if ok:
                     changed.append("address lib flags")
             if changed:
                 msg = "; ".join(changed)
-                self.root.after(0, lambda: card.mark_fixed(True, msg))
+                if kind == "all":
+                    self.root.after(0, lambda: card.mark_fixed(True, msg))
+                else:
+                    self.root.after(
+                        0, lambda: card.mark_one_done(kind, msg))
             else:
                 # Nothing actually changed - report honestly, keep buttons usable.
                 already = "already up to date"
@@ -2771,8 +2188,19 @@ class AutoPorterGUI:
         except Exception as exc:
             self.root.after(0, lambda: card.mark_fixed(False, str(exc)))
 
-    def clear(self):
-        self._clear_cards()
+    def refresh(self):
+        """Re-list mods: the same fast surface scan as on opening."""
+        if self._plugins() is None:
+            if messagebox.askyesno(
+                    "No game found",
+                    "CompaSSE does not know where your game is.\n\n"
+                    "Open Settings to point it at SkyrimSE.exe?"):
+                self._open_settings()
+            return
+        if not self.list_dlls():
+            messagebox.showinfo(
+                "No mods found",
+                "No mod DLLs found in the plugins folder.")
 
 # ===================================================================
 # Entry point
@@ -2787,7 +2215,6 @@ def main():
             app._check_table_stamp(app._plugins())
             app._check_addresslib(lib_dirs)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

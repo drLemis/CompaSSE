@@ -1,0 +1,31 @@
+#include <windows.h>
+
+// Fallback stamp for standalone builds. deploy.ps1 regenerates
+// build\jig_version.rc from SkyrimSE.exe every deploy so the isolated
+// host reports the running game version to version-hungry mods.
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,7,104,0
+ PRODUCTVERSION 1,7,104,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "CompaSSE isolated check host"
+            VALUE "FileVersion", "1.7.104.0"
+            VALUE "InternalName", "jig_host"
+            VALUE "ProductVersion", "1.7.104.0"
+            VALUE "OriginalFilename", "jig_host.exe"
+            VALUE "ProductName", "CompaSSE"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -67,8 +67,7 @@ $ProjectRoot = Split-Path -Parent $ScriptDir
 $BuildBat = Join-Path $ScriptDir 'build_shim.bat'
 $BuildOutput = Join-Path $ScriptDir 'build\!CompaSSE.dll'
 
-# Locate the SKSE plugins folder: explicit arg, env var, then Steam
-# libraries from the registry + libraryfolders.vdf. No hardcoded paths.
+# Locate the SKSE plugins folder, hope it's Steam version!
 function Find-SkyrimPluginsDir {
     if ($env:COMPASSE_PLUGINS_DIR -and (Test-Path -LiteralPath $env:COMPASSE_PLUGINS_DIR)) {
         return $env:COMPASSE_PLUGINS_DIR
@@ -128,6 +127,33 @@ function Invoke-Dry($desc, $scriptblock) {
     & $scriptblock
 }
 
+function Invoke-BuildStep($Display, $WorkDir, $Command, $FailMessage) {
+    Write-Host "   Running: $Display" -ForegroundColor Gray
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Push-Location $WorkDir
+    & $Command 2>&1 | ForEach-Object { Write-Host "   $_" }
+    $rc = $LASTEXITCODE
+    Pop-Location
+    $ErrorActionPreference = $prev
+    if ($rc -ne 0) {
+        Write-Fail "$FailMessage (exit code $rc)"
+        exit 1
+    }
+}
+
+# Writes a default CompaSSE/*.ini once; user edits are never overwritten.
+function Ensure-DefaultIni($FileName, $Lines) {
+    $target = Join-Path $CompaSSEDir $FileName
+    if (-not (Test-Path -LiteralPath $target)) {
+        $body = $Lines -join "`r`n"
+        Invoke-Dry "Create default $FileName" { Set-Content -LiteralPath $target -Value $body -Encoding Ascii -NoNewline:$false }
+        Write-Ok "Created default $FileName"
+    } else {
+        Write-Skip "$FileName exists - left untouched"
+    }
+}
+
 # ---- Kill running game ----
 if ($Kill) {
     Write-Step 'Killing running game processes'
@@ -162,18 +188,9 @@ if ($NoBuild) {
     if ($DryRun) {
         Write-Host "   [DRY RUN] cmd /c `"$BuildBat`"" -ForegroundColor DarkGray
     } else {
-        Write-Host "   Running: cmd /c `"$BuildBat`"" -ForegroundColor Gray
-        $prev = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        Push-Location $ScriptDir
-        cmd /c "`"$BuildBat`"" 2>&1 | ForEach-Object { Write-Host "   $_" }
-        $rc = $LASTEXITCODE
-        Pop-Location
-        $ErrorActionPreference = $prev
-        if ($rc -ne 0) {
-            Write-Fail "Build failed (exit code $rc)"
-            exit 1
-        }
+        Invoke-BuildStep "cmd /c `"$BuildBat`"" $ScriptDir {
+            cmd /c "`"$BuildBat`""
+        } 'Build failed'
     }
     if (-not (Test-Path -LiteralPath $BuildOutput)) {
         Write-Fail "Build output not found after successful build: $BuildOutput"
@@ -181,6 +198,47 @@ if ($NoBuild) {
     }
     $sz = (Get-Item -LiteralPath $BuildOutput).Length
     Write-Ok "Built: $BuildOutput ($sz bytes)"
+}
+
+# ---- Stamp jig_host.exe with the game version ----
+$JigRc = Join-Path $ScriptDir 'build\jig_version.rc'
+try {
+    $gv = (Get-Item -LiteralPath $GameExe).VersionInfo
+    $vv = "$($gv.FileMajorPart),$($gv.FileMinorPart),$($gv.FileBuildPart),$($gv.FilePrivatePart)"
+    $vs = "$($gv.FileMajorPart), $($gv.FileMinorPart), $($gv.FileBuildPart), $($gv.FilePrivatePart)"
+    $tpl = Get-Content -LiteralPath (Join-Path $ScriptDir 'jig_version.rc') -Raw
+    $tpl = $tpl -replace 'FILEVERSION [\d,]+', "FILEVERSION $vv"
+    $tpl = $tpl -replace 'PRODUCTVERSION [\d,]+', "PRODUCTVERSION $vv"
+    $vd = "$($gv.FileMajorPart).$($gv.FileMinorPart).$($gv.FileBuildPart).$($gv.FilePrivatePart)"
+    $tpl = $tpl -replace '"1, 7, 104, 0"', "`"$vs`""
+    $tpl = $tpl -replace '"1\.7\.104\.0"', "`"$vd`""
+    Set-Content -LiteralPath $JigRc -Value $tpl -NoNewline -Encoding Ascii
+    Write-Ok "Stamped jig version: $vs"
+} catch {
+    Write-Skip "Could not stamp jig version ($_) - using fallback"
+}
+
+# ---- Build jig_host.exe (X-Ray live check) ----
+$JigBat = Join-Path $ScriptDir 'build_jig.bat'
+$JigOutput = Join-Path $ScriptDir 'build\jig_host.exe'
+if ($NoBuild) {
+    Write-Step 'Build jig_host.exe'
+    Write-Skip 'Skipped (-NoBuild)'
+} else {
+    Write-Step 'Building jig_host.exe'
+    if ($DryRun) {
+        Write-Host "   [DRY RUN] cmd /c `"$JigBat`"" -ForegroundColor DarkGray
+    } else {
+        Invoke-BuildStep "cmd /c `"$JigBat`"" $ScriptDir {
+            cmd /c "`"$JigBat`""
+        } 'Jig build failed'
+    }
+    if (Test-Path -LiteralPath $JigOutput) {
+        $sz = (Get-Item -LiteralPath $JigOutput).Length
+        Write-Ok "Built: $JigOutput ($sz bytes)"
+    } else {
+        Write-Fail "jig_host.exe not found after build"
+    }
 }
 
 # ---- Build CompaSSE.exe (PyInstaller) ----
@@ -197,18 +255,9 @@ if ($NoBuild) {
     if ($DryRun) {
         Write-Host "   [DRY RUN] python -m PyInstaller --noconfirm --clean --distpath dist $Spec" -ForegroundColor DarkGray
     } else {
-        Write-Host "   Running: python -m PyInstaller" -ForegroundColor Gray
-        $prev = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        Push-Location $ProjectRoot
-        python -m PyInstaller --noconfirm --clean --log-level WARN --distpath dist $Spec 2>&1 | ForEach-Object { Write-Host "   $_" }
-        $rc = $LASTEXITCODE
-        Pop-Location
-        $ErrorActionPreference = $prev
-        if ($rc -ne 0) {
-            Write-Fail "PyInstaller failed (exit code $rc)"
-            exit 1
-        }
+        Invoke-BuildStep "python -m PyInstaller" $ProjectRoot {
+            python -m PyInstaller --noconfirm --clean --log-level WARN --distpath dist $Spec
+        } 'PyInstaller failed'
     }
     if (Test-Path -LiteralPath $ExeOutput) {
         $sz = (Get-Item -LiteralPath $ExeOutput).Length
@@ -240,7 +289,6 @@ if (-not $DryRun) {
 # ---- Deploy CompaSSE.exe ----
 if (Test-Path -LiteralPath $ExeOutput) {
     Write-Step 'Deploying CompaSSE.exe'
-    $ExeTarget = Join-Path $PluginsDir '..\..\..\..\..\..'
     $ExeTarget = Join-Path $SkyrimDir 'CompaSSE.exe'
     Invoke-Dry "Copy -> CompaSSE.exe" {
         Copy-Item -LiteralPath $ExeOutput -Destination $ExeTarget -Force
@@ -253,26 +301,144 @@ if (Test-Path -LiteralPath $ExeOutput) {
     }
 }
 
+# ---- Remove stale jig_host.exe ----
+$JigTarget = Join-Path $SkyrimDir 'jig_host.exe'
+if (Test-Path -LiteralPath $JigTarget) {
+    Invoke-Dry "Remove stale jig_host.exe" {
+        Remove-Item -LiteralPath $JigTarget -Force
+    }
+    Write-Ok "Removed stale loose jig_host.exe"
+}
+
 # ---- Ensure CompaSSE subfolder exists ----
 if (-not (Test-Path -LiteralPath $CompaSSEDir)) {
     Invoke-Dry "Create CompaSSE subfolder" { New-Item -ItemType Directory -Path $CompaSSEDir -Force | Out-Null }
     Write-Ok "Created CompaSSE subfolder"
 }
 
-# ---- Default quarantine.ini (never overwrite user edits) ----
-$IniTarget = Join-Path $CompaSSEDir 'quarantine.ini'
-if (-not (Test-Path -LiteralPath $IniTarget)) {
-    $IniBody = @(
-        '; CompaSSE quarantine.ini - slot-0 IDs withheld from transcoded temps.'
-        '; One ID per line (decimal or 0x hex). Trailing text is ignored.'
-        "';', '#' and [sections] start comments/sections and are skipped."
-        '; Withheld BEFORE translations, so a future verified address still applies.'
-        ''
-    ) -join "`r`n"
-    Invoke-Dry "Create default quarantine.ini" { Set-Content -LiteralPath $IniTarget -Value $IniBody -Encoding Ascii -NoNewline:$false }
-    Write-Ok 'Created default quarantine.ini'
+# ---- Default !CompaSSE.ini (never overwrite user edits) ----
+Ensure-DefaultIni '!CompaSSE.ini' @(
+    '; CompaSSE shim config - consent list and legacy skip list.'
+    '; One entry per line. CompaSSE appends here on every fix.'
+    "';', '#' and unknown [sections] are skipped."
+    '; A missing file means legacy mode (serve all, like before).'
+    ''
+    '[touched]'
+    '; DLL basenames you allowed CompaSSE to fix. Undoing a fix removes its line.'
+    '; The shim only serves listed mods.'
+    ''
+    '[legacy_skip]'
+    '; Versionless mods the legacy loader must not run.'
+    '; name.dll [| year=YYYY] [| note]. A pinned year skips only that build.'
+    '; These load what SKSE itself refuses; a faulting one takes the game down.'
+    '; SkyrimUncapper.dll is pre-listed: 2017 binary, hardcoded 1.6.640 lookups,'
+    '; faults on 1.7.104. Delete its line after the mod author'
+    '; ships a fixed build (every skip is logged each launch, so a stale entry shows).'
+    ''
+    'SkyrimUncapper.dll'
+    ''
+)
+
+# ---- Migrate old touched.ini / legacy-skip.ini into !CompaSSE.ini ----
+# One-way move: entries fold into their section (deduped), then the old
+# file is renamed. The shim ignores old files once the unified one exists,
+# so leaving them would strand user edits where nobody reads them.
+function Merge-IniSection($Unified, $Section, $NewLines) {
+    $text = @(Get-Content -LiteralPath $Unified -ErrorAction SilentlyContinue)
+    $sectRe = "^\s*\[$Section\]\s*$"
+    $have = @{}
+    $inSect = $false
+    foreach ($ln in $text) {
+        $t = $ln.Trim()
+        if ($t -match '^\s*\[.*\]\s*$') { $inSect = ($t -match $sectRe); continue }
+        if ($inSect -and $t) { $have[$t.ToLowerInvariant()] = $true }
+    }
+    $add = @($NewLines | Where-Object { $_ -and -not $have.ContainsKey($_.Trim().ToLowerInvariant()) })
+    if (-not $add.Count) { return 0 }
+    $out = @()
+    $placed = $false
+    $inSect = $false
+    foreach ($ln in $text) {
+        $t = $ln.Trim()
+        if ($t -match '^\s*\[.*\]\s*$') {
+            if ($inSect) { $out += $add; $placed = $true }
+            $inSect = ($t -match $sectRe)
+        }
+        $out += $ln
+    }
+    if ($inSect -and -not $placed) { $out += $add; $placed = $true }
+    if (-not $placed) { if ($out.Count -and $out[-1].Trim()) { $out += '' }; $out += "[$Section]"; $out += $add }
+    Set-Content -LiteralPath $Unified -Value ($out -join "`r`n") -Encoding Ascii
+    return $add.Count
+}
+
+Invoke-Dry "Migrate old ini files" {
+    $Unified = Join-Path $CompaSSEDir '!CompaSSE.ini'
+    foreach ($pair in @(@{Old='touched.ini'; Sect='touched'}, @{Old='legacy-skip.ini'; Sect='legacy_skip'})) {
+        $oldPath = Join-Path $CompaSSEDir $pair.Old
+        if (-not (Test-Path -LiteralPath $oldPath)) { continue }
+        $entries = @(Get-Content -LiteralPath $oldPath -ErrorAction SilentlyContinue | ForEach-Object {
+            $t = $_.Trim()
+            if ($t -and -not ($t.StartsWith(';') -or $t.StartsWith('#') -or $t.StartsWith('[') -or $t.StartsWith("'") -or $t.StartsWith('"'))) { $_.TrimEnd() }
+        } | Where-Object { $_ })
+        if (-not (Test-Path -LiteralPath $Unified)) {
+            New-Item -ItemType File -Path $Unified -Force | Out-Null
+        }
+        $moved = Merge-IniSection $Unified $pair.Sect $entries
+        Rename-Item -LiteralPath $oldPath -NewName ($pair.Old + '.migrated') -Force
+        Write-Ok "$($pair.Old): moved $moved entr(ies) to !CompaSSE.ini [$($pair.Sect)]"
+    }
+}
+
+# ---- Seed [touched] from existing backups (one entry per fixed DLL) ----
+Invoke-Dry "Seed !CompaSSE.ini from backups" {
+    $Unified = Join-Path $CompaSSEDir '!CompaSSE.ini'
+    $BackupsDir = Join-Path $CompaSSEDir 'backups'
+    if (-not (Test-Path -LiteralPath $Unified)) {
+        New-Item -ItemType File -Path $Unified -Force | Out-Null
+    }
+    $known = @{}
+    $inTouched = $false
+    Get-Content -LiteralPath $Unified -ErrorAction SilentlyContinue | ForEach-Object {
+        $t = $_.Trim()
+        if ($t.StartsWith('[')) { $inTouched = ($t -match '^\s*\[touched\]\s*$'); return }
+        if ($inTouched -and $t -and -not ($t.StartsWith(';') -or $t.StartsWith('#'))) {
+            $tok = ($t -split '\s|\|')[0]
+            if ($tok) { $known[$tok.ToLowerInvariant()] = $true }
+        }
+    }
+    $add = @()
+    if (Test-Path -LiteralPath $BackupsDir) {
+        Get-ChildItem -LiteralPath $BackupsDir -Filter '*.bak' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $base = $_.Name
+            if ($base.ToLowerInvariant().EndsWith('.bak')) { $base = $base.Substring(0, $base.Length - 4) }
+            if ($base -and -not $known.ContainsKey($base.ToLowerInvariant()) `
+                    -and $base.ToLowerInvariant() -ne '!compasse.dll') {
+                $add += $base
+                $known[$base.ToLowerInvariant()] = $true
+            }
+        }
+    }
+    if ($add.Count) { [void](Merge-IniSection $Unified 'touched' $add) }
+    Write-Ok "!CompaSSE.ini: seeded $($add.Count) entr(ies) from backups"
+}
+
+# ---- Ship known-fix recipes (never overwrite user-added ones) ----
+$RecipeSrc = Join-Path $ProjectRoot 'recipes'
+$RecipeDir = Join-Path $CompaSSEDir 'recipes'
+if (Test-Path -LiteralPath $RecipeSrc) {
+    Invoke-Dry "Create recipes subfolder" { New-Item -ItemType Directory -Path $RecipeDir -Force | Out-Null }
+    $shipped = 0
+    Get-ChildItem -LiteralPath $RecipeSrc -Filter '*.json' -File | ForEach-Object {
+        $dest = Join-Path $RecipeDir $_.Name
+        if (-not (Test-Path -LiteralPath $dest)) {
+            Invoke-Dry "Copy recipe $($_.Name)" { Copy-Item -LiteralPath $_.FullName -Destination $dest -Force }
+            $shipped++
+        }
+    }
+    Write-Ok "Recipes: $shipped new, rest left untouched"
 } else {
-    Write-Skip 'quarantine.ini exists - left untouched'
+    Write-Skip 'No recipes folder in repo'
 }
 
 # ---- Build translation table ----
@@ -282,12 +448,18 @@ if (-not $NoTranslations) {
         Write-Skip "Game exe not found: $GameExe - skipping translation build"
     } else {
         if ($DryRun) {
-            Write-Host "   [DRY RUN] compasse.exe --build-translations" -ForegroundColor DarkGray
+            Write-Host "   [DRY RUN] build translation table" -ForegroundColor DarkGray
         } else {
             $pyArgs = @(
-                'compasse.py', '--build-translations',
-                '--game', $GameExe,
-                '--plugins-dir', $PluginsDir
+                '-c', ('import sys, core.translations as T, core.versions as V; ' +
+                       'from pathlib import Path; ' +
+                       'game, plug = sys.argv[1], Path(sys.argv[2]); ' +
+                       'print(''Game:'', game); print(''Plugins:'', plug); ' +
+                       'ver_count, total = T.build_translations(game, plug, ' +
+                       'game_version=V.runtime_version_from_exe(game)); ' +
+                       'print(''Done:'', ver_count, ''version(s),'', total, ''total entries.'')'),
+                $GameExe,
+                $PluginsDir
             )
             Write-Host "   Running: python $($pyArgs -join ' ')" -ForegroundColor Gray
             $prev = $ErrorActionPreference

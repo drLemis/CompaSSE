@@ -1,0 +1,91 @@
+{
+  "format": 1,
+  "variants": {
+    "5225e4e3b185e6fc57c8d31b0cedbe5a030a951d9a744d33071b64c45a38c208": {
+      "game": "1.7.104",
+      "label": "skee64 (SVAL): embedded_stale_semantic_addresses",
+      "items": [
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 587494,
+          "width": 4,
+          "old": 13863782,
+          "new": 15717814,
+          "insn_check": false,
+          "label": "Replace embedded old semantic RVA/reference with validated 1.7.104 semantic target."
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 587552,
+          "width": 4,
+          "old": 3919193,
+          "new": 3948057,
+          "insn_check": false,
+          "label": "Replace embedded old semantic RVA/reference with validated 1.7.104 semantic target."
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 586508,
+          "width": 4,
+          "old": 3918600,
+          "new": 3947464,
+          "insn_check": false,
+          "label": "Replace embedded old semantic RVA/reference with validated 1.7.104 semantic target."
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 586515,
+          "width": 4,
+          "old": 3918641,
+          "new": 3947505,
+          "insn_check": false,
+          "label": "Replace embedded old semantic RVA/reference with validated 1.7.104 semantic target."
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 586797,
+          "width": 4,
+          "old": 3918615,
+          "new": 3947479,
+          "insn_check": false,
+          "label": "Replace embedded old semantic RVA/reference with validated 1.7.104 semantic target."
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 586817,
+          "width": 4,
+          "old": 3918615,
+          "new": 3947479,
+          "insn_check": false,
+          "label": "Replace embedded old semantic RVA/reference with validated 1.7.104 semantic target."
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 586841,
+          "width": 4,
+          "old": 3918615,
+          "new": 3947479,
+          "insn_check": false,
+          "label": "Replace embedded old semantic RVA/reference with validated 1.7.104 semantic target."
+        }
+      ],
+      "notes": [
+        "Imported from SVAL pack file skee64-tested.json.",
+        "Five semantic mappings are represented by seven literal replacements.",
+        "The three 0x3BCB17 references must be updated together.",
+        "SVAL's mapping logs used neighboring Address Library anchors to generate candidates, then validated the destination semantics before accepting them."
+      ],
+      "provenance": {
+        "pack": "skee64-tested.json",
+        "target_runtime": "1.7.104.0"
+      }
+    }
+  }
+}

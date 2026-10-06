@@ -1,0 +1,3 @@
+# Runtime is stdlib + tkinter; capstone only enables Healer hook
+# scanning and every tab degrades gracefully without it.
+capstone>=5.0; extra == "disasm"

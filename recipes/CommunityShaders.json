@@ -1,0 +1,40 @@
+{
+  "format": 1,
+  "variants": {
+    "bdf655fb2cca157c3bd8de9306c9b70f25120ba1e2777f60843c6389bf2bb88f": {
+      "game": "1.7.104",
+      "label": "CommunityShaders (SVAL): runtime_specific_compiled_immediates_and_hook_semantics",
+      "items": [
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 5165676,
+          "width": null,
+          "old": 226,
+          "new": 307,
+          "insn_check": true,
+          "label": "replace_integer_immediate"
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 5313559,
+          "width": null,
+          "old": 2830,
+          "new": 2864,
+          "insn_check": true,
+          "label": "replace_integer_immediate"
+        }
+      ],
+      "notes": [
+        "Imported from SVAL pack file CommunityShaders-1.8.4.0_tested_build.json.",
+        "Do not substitute the rejected neighbor-projection target 0xD4B2E2; SVAL proved it landed mid-instruction.",
+        "The final output hash is from the v56 state containing both validated compiled-immediate corrections."
+      ],
+      "provenance": {
+        "pack": "CommunityShaders-1.8.4.0_tested_build.json",
+        "target_runtime": "1.7.104.0"
+      }
+    }
+  }
+}

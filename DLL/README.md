@@ -1,645 +1,136 @@
-# AddressLibrary Shim DLL - Technical Documentation
-
-A runtime shim that intercepts Skyrim SE address library reads and patches
-plugin version flags at load time, so plugins compiled for older game
-versions work on the current runtime. No disk patching of individual mods
-needed - everything happens in memory when SKSE loads each plugin.
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [How SKSE Loads Plugins](#how-skse-loads-plugins)
-3. [The Address Library Problem](#the-address-library-problem)
-4. [Architecture](#architecture)
-5. [Hook Chain (17 hooks)](#hook-chain-17-hooks)
-6. [Address Library Formats](#address-library-formats)
-7. [Format Detection (Decoder)](#format-detection-decoder)
-8. [Serve Logic](#serve-logic)
-9. [Translation](#translation)
-10. [GetProcAddress + LoadLibrary Hooks](#getprocaddress--loadlibrary-hooks)
-11. [Legacy Loader](#legacy-loader)
-12. [MessageBox Interception](#messagebox-interception)
-13. [Crash VEH](#crash-veh)
-14. [Deployment](#deployment)
-15. [Log File Reference](#log-file-reference)
-16. [Known Limitations](#known-limitations)
-
----
-
-## Overview
-
-When Skyrim SE updates, its address library changes. Plugins compiled for
-older runtimes either get rejected by SKSE (version check fails) or read the
-wrong offsets (address library mismatch). CompaSSE solves both problems:
-
-1. **CompaSSE.exe** patches the version flags on disk so SKSE accepts the
-   plugin (fixes "must be recompiled" errors)
-2. **This shim DLL** hooks file APIs at runtime to serve compatible address
-   library data so the plugin gets the right function offsets
-
-Both are needed: the patcher fixes what SKSE checks, the shim fixes what
-the mods read.
-
-## How SKSE Loads Plugins
-
-SKSE's plugin loader works in two passes:
-
-### Pass 1: Version check (via GetProcAddress)
-For each `.dll` in `Data/SKSE/Plugins/`, SKSE calls:
-```c
-GetProcAddress(hModule, "SKSEPlugin_Version");
-```
-This returns a pointer to a `SKSEPluginVersionData` struct exported by the
-plugin. SKSE checks two fields:
-- `versionIndependenceEx` (offset `+0x304`): must have bit `0x2` set
-  (`AddressLibraryV5`) for modern runtimes
-- `versionIndependence` (offset `+0x308`): must have bits `0x1 | 0x4` set
-  (`AddressLibrary | Structs`)
-
-If these flags are missing, SKSE shows "must be recompiled" and rejects the
-plugin.
-
-**Some plugins bypass GetProcAddress** - SKSE reads the version struct
-directly from the PE export table (e.g. dosemetha.dll). The shim's
-LoadLibrary hooks catch these by patching flags at module-load time.
-
-### Pass 2: Plugin initialization
-If the version check passes, SKSE calls the plugin's `SKSEPlugin_Load`
-export. The plugin initializes and typically opens the address library file
-(`versionlib-X-Y-Z-W.bin` or `version-X-Y-Z-W.bin`) to look up function
-offsets for the current runtime.
-
-### Where it breaks
-Old plugins may have:
-1. Missing version flags -> SKSE rejects them (our GetProcAddress + LoadLibrary
-   hooks fix this)
-2. Correct flags but wrong format reader -> they open the library file but
-   can't parse the format (our serve logic fixes this)
-3. Correct flags, correct format, but stale offsets -> they read the library
-   but get wrong addresses (our translation table fixes this)
-
-## The Address Library Problem
-
-Skyrim SE's Address Library has evolved through multiple binary formats:
-
-| Format | Name             | Structure                              | Used by                              |
-|--------|------------------|----------------------------------------|--------------------------------------|
-|   0    | Fixed entries    | 16-byte records (8-bit head + offset)  | Very old mods                        |
-|   1    | Delta-compressed | Header + compressed entries            | CommonLibSSE 1.5.x (SE mode)         |
-|   2    | Sorted pairs     | Header + sorted {id, offset} pairs     | CommonLibSSE 1.6.x / commonlibsse-ng |
-|   5    | Dense array      | 96-byte header + u32[offset_table[id]] | CommonLibSSE-ng (AE mode), IAL       |
-
-Each AddressLibrary version ships a `versionlib-X-Y-Z-W.bin` file
-(format 5, ~565K entries) and optionally a `version-X-Y-Z-W.bin` file
-(format 1, ~395K entries). The format 5 file is denser and faster to
-parse, but older plugins only understand format 1 or 2.
-
-## Architecture
-
-```
-+------------------------------------------------------------+
-|                    Skyrim SE Process                       |
-|                                                            |
-|  +----------+   +----------+   +----------+   +--------+   |
-|  | Plugin A |   | Plugin B |   | Plugin C |   |  SKSE  |   |
-|  | (V2 fmt) |   | (V1 fmt) |   | (V5 fmt) |   |        |   |
-|  +----+-----+   +----+-----+   +----+-----+   +---+----+   |
-|       |              |              |             |        |
-| ------+--------------+--------------+-------------+--------|
-|       |              |              |             |        |
-|  +----v--------------v--------------v-------------v-----+  |
-|  |           !CompaSSE.dll (17 hooks)                   |  |
-|  |                                                      |  |
-|  |  GetProcAddress hook                                 |  |
-|  |    Patches SKSEPlugin_Version flags so SKSE          |  |
-|  |    accepts old plugins; fabricates the struct        |  |
-|  |    for legacy plugins that lack it                   |  |
-|  |                                                      |  |
-|  |  LoadLibraryW/A/ExW + LdrLoadDll hooks               |  |
-|  |    Catch plugins SKSE inspects directly from         |  |
-|  |    the export table (bypassing GetProcAddress)       |  |
-|  |                                                      |  |
-|  |  CreateFileW / CreateFileA / CreateFile2             |  |
-|  |  CreateFileMappingW/A / OpenFileMappingW/A /         |  |
-|  |  MapViewOfFile / NtCreateFile / NtOpenFile           |  |
-|  |    Intercept address library file opens              |  |
-|  |    Determine caller's format capability              |  |
-|  |    Serve compatible temp file                        |  |
-|  |                                                      |  |
-|  |  MessageBoxW/A hooks                                 |  |
-|  |    Log all error dialogs for diagnosis               |  |
-|  |    Pass through unchanged (no suppression)           |  |
-|  |                                                      |  |
-|  |  Crash VEH                                           |  |
-|  |    Log access violations with module info +          |  |
-|  |    register dump                                     |  |
-|  +------------------------------------------------------+  |
-|                         |                                  |
-|  -----------------------+----------------------------------|
-|                         |                                  |
-|  +----------------------v-------------------------------+  |
-|  |              Temp files in %TEMP%                    |  |
-|  |  !CompaSSE_{pid}_fmt0.bin                            |  |
-|  |  !CompaSSE_{pid}_fmt1.bin                            |  |
-|  |  !CompaSSE_{pid}_fmt2.bin                            |  |
-|  |  !CompaSSE_{pid}_fmt5.bin                            |  |
-|  +------------------------------------------------------+  |
-+------------------------------------------------------------+
-```
-
-### File structure
-
-| File                 | Purpose                                                                             |
-|----------------------|-------------------------------------------------------------------------------------|
-| `main.cpp`           | DLL entry point, `SKSEPlugin_Version` export, `SKSEPlugin_Load`, crash VEH          |
-| `hooks.cpp`          | All 13 API hooks, serve logic, format selection, translation                      |
-| `hooks.h`            | Public interface: `install_hooks`, `uninstall_hooks`, `set_self`, `shim_log`        |
-| `decoder_detect.cpp` | PE import analysis to detect what address library format a plugin can parse         |
-| `decoder_detect.h`   | `DecoderType` enum, `detect_decoder`, `resolve_caller_module`, `decoder_for_module` |
-| `transcode.cpp`      | Format transcoding: parse/encode format 0, 1, 2, 5                                  |
-| `transcode.h`        | Transcoder API                                                                      |
-| `build_shim.bat`     | MSVC build script                                                                   |
-| `deploy.ps1`         | Build + deploy automation                                                           |
-
-## Hook Chain (17 hooks)
-
-The shim installs 17 hooks via [MinHook](https://github.com/TsudaKageyu/minhook):
-
-### File API hooks (7)
-
-| Hook                 | Target       | Purpose                                          |
-|----------------------|--------------|--------------------------------------------------|
-| `CreateFileW`        | kernel32.dll | Primary interception point for Win32 callers     |
-| `CreateFileA`        | kernel32.dll | ANSI fallback (rarely used by plugins)           |
-| `CreateFile2`        | kernel32.dll | WinRT/UWP path (defensive)                       |
-| `CreateFileMappingW` | kernel32.dll | Catches callers that map the real file handle    |
-| `OpenFileMappingW`   | kernel32.dll | Log-only: who opens the shared IDDB mapping      |
-| `NtCreateFile`       | ntdll.dll    | NT-level interception for mods that bypass Win32 |
-| `NtOpenFile`         | ntdll.dll    | NT-level interception (same as NtCreateFile)     |
-
-### Module-load hooks (4)
-
-| Hook             | Target       | Purpose                                              |
-|------------------|--------------|------------------------------------------------------|
-| `GetProcAddress` | kernel32.dll | Patches `SKSEPlugin_Version` flags at runtime        |
-| `LoadLibraryW`   | kernel32.dll | Patches flags on load (catches export-table readers) |
-| `LoadLibraryA`   | kernel32.dll | ANSI variant                                         |
-| `LoadLibraryExW` | kernel32.dll | Extended variant                                     |
-| `LdrLoadDll`     | ntdll.dll    | Catches ntdll-level loads (bypasses kernel32)        |
-
-### Diagnostic hooks (2)
-
-| Hook             | Target       | Purpose                                       |
-|------------------|--------------|-----------------------------------------------|
-| `MessageBoxW`    | user32.dll   | Logs all error dialogs for diagnosis          |
-| `MessageBoxA`    | user32.dll   | Logs all error dialogs (ANSI)                 |
-
-### Hook installation order
-
-All hooks are created during `DllMain(DLL_PROCESS_ATTACH)`, then enabled
-atomically via `MH_EnableHook(MH_ALL_HOOKS)`. The `SKSEPlugin_Load` export
-also calls `install_hooks` as a safety net (with a guard against double-init).
-
-### Reentrancy guards
-
-Three boolean guards prevent infinite recursion:
-- **`g_loading`**: Set while `ensure_buffers()` reads the real bin file.
-  Prevents `CreateFileW -> NtCreateFile -> CreateFileW` loops.
-- **`g_serving_alt`**: Set while `serve_versionlib` opens the alt path
-  (versionlib-*.bin when caller requested version-*.bin). Same purpose.
-- **`g_ntRedirecting`** (thread-local): Set during `NtCreateFile ->
-  CreateFileW` redirect. The NT call internally calls Win32, which would
-  re-enter our hook.
-
-## Address Library Formats
-
-### Format 0 - Fixed entries
-```
-Header: magic(4) + version(16) + name(N) + ptr_size(4)
-Entries: { id(8 bytes), offset(8 bytes) } repeated
-```
-Simple but large. Used by very old plugins before CommonLibSSE.
-
-### Format 1 - Delta-compressed
-```
-Header: magic(4) + version(16) + name(N) + ptr_size(4)
-Entries: type_byte + compressed delta-encoded {id, offset} pairs
-```
-The "legacy SE" format. Files named `version-X-Y-Z-W.bin`.
-Used by CommonLibSSE compiled without AE support.
-
-### Format 2 - Sorted pairs
-```
-Header: magic(4) + version(16) + name(N) + ptr_size(4)
-Entries: type_byte + compressed delta-encoded {id, offset} pairs
-```
-The "universal" format. Works with most CommonLibSSE versions.
-Intermediate format for transcoding - everything can read it.
-
-### Format 5 - Dense array
-```
-Header: 96 bytes (magic + version + name + ptr_size + count)
-Data: u32 offset_table[count]  (index = ID, value = offset)
-```
-The "modern" format. Files named `versionlib-X-Y-Z-W.bin`.
-Smallest file size (~2.2MB for 565K entries vs ~14MB for format 1/2).
-Only CommonLibSSE-ng with AE support can read this.
-
-### Format sizes for Skyrim SE 1.7.104
-
-| Format | File                     | Size             | Entry count |
-|--------|--------------------------|------------------|-------------|
-|   1    | version-1-7-104-0.bin    | 3,570,871 bytes  | 395,946     |
-|   2    | (transcoded from fmt5)   | ~9,200,000 bytes | ~435,000+   |
-|   5    | versionlib-1-7-104-0.bin | 2,263,132 bytes  | 565,759     |
-
-The format 1 file has fewer entries because it only includes IDs that have
-non-zero offsets in the current runtime. Format 5 includes ALL IDs (zeros
-for unmapped ones). Format 2 is transcoded from the non-zero fmt5 entries
-(~435K on 1.7.104) with translation-table remaps applied on top.
-
-## Format Detection (Decoder)
-
-The shim determines what format each plugin can parse by analyzing its PE
-import table. This happens in `decoder_detect.cpp`.
-
-### Import-based heuristic
-
-| Imports                                  | Detected as  | Format served  |
-|------------------------------------------|--------------|----------------|
-| `CreateFileMapping*` + `istream` symbols | `DECODER_V5` | Format 2 *     |
-| `CreateFileMapping*` only (no istream)   | `DECODER_V2` | Format 2       |
-| `istream` symbols only (no mmap)         | `DECODER_V1` | Format 1       |
-| Neither / caller unresolvable            | -            | Format 2 *     |
-
-\* `DECODER_V5` does not route to passthrough: the heuristic misfires on
-CommonLibSSE-NG <= 3.7 (cache-mmap false positives), so the whole
-ambiguous bucket gets the faithful fmt2 temp instead. There is no
-per-mod allowlist - filenames are not capabilities.
-
-### V5-native detection (string markers)
-
-Import tables cannot tell a 1.7-era dual V2/V5 reader (binary_io stream,
-no mmap, no std::istream) from an old fmt2-only module, so a second
-signal scans the caller's `.rdata`/`.data` for V5-only strings
-(`AddressLibraryV5`, `Address Library V5`,
-`not an Address Library V5 file`, the `AddressLibV2` fallback path).
-The hit is logged (`dualV5=1`) but never routes: dual readers get the
-same fmt2 temp as everyone else. Serving them fmt5 sized their shared
-mapping differently from pure-V2 holders of the same name, and the
-second one to load always died with "failed to create shared mapping"
-(observed live: healthy updated mods failing next to older ones).
-
-**Why this works:** CommonLibSSE's address library reader evolved alongside
-its I/O strategy:
-- Old CommonLibSSE (1.5.x): reads the bin via `std::ifstream` -> format 1
-- Mid CommonLibSSE (1.6.x): reads via `std::ifstream` -> format 2
-- New commonlibsse-ng: memory-maps the file -> format 5
-- po3_PapyrusExtender: memory-maps without istream -> format 2
-
-The import table captures this evolution because the I/O method is baked in
-at compile time. V1 readers check `format == 1` strictly, so they get
-format 1 temps - serving them format 2 would fail their version check.
-
-### Caller resolution
-
-`resolve_caller_module()` uses `RtlCaptureStackBackTrace` to walk the call
-stack from inside the hook, skipping the shim's own frames and system DLLs
-(ntdll, kernel32, msvcrt, etc.), to find the plugin module that triggered
-the hook.
-
-When the stack walk fails (returns null), the caller joins the ambiguous
-bucket and gets the faithful fmt2 temp - the format every pre-2026 reader
-parses. (An earlier revision passed unknown callers through; that stranded
-fmt2-only mods on the real fmt5 file. Conversely, an even earlier revision
-served fmt2 temps that dropped zero offsets, stranding a healthy mod on a
-missing ID. Both lessons are encoded in the serve logic.) The walk captures
-32 frames: CRT `ifstream` opens bury the plugin frame deep behind system
-DLLs and 8 frames routinely missed them.
-
-### Caching
-
-Decoder detection results are cached per-module in a static hash map with a
-critical section. The PE import analysis runs only once per plugin.
-
-## Serve Logic
-
-When a plugin opens an address library file, the serve chain works as follows:
-
-### 1. Path matching
-
-`is_versionlib_path()` checks if the filename matches:
-- `versionlib-X-Y-Z-W.bin` (any caller)
-- `version-X-Y-Z-W.bin` (any caller)
-
-Both patterns are intercepted.
-
-### 2. SKSE pass-through
-
-If the caller is identified as `skse64*.dll`, the real file is served
-unmodified. SKSE itself needs the actual address library.
-
-### 3. Format prefix routing
-
-**`versionlib-` prefix (most plugins):**
-- `DECODER_V1` -> pass-through (real file). These readers open a fmt5
-  file by name yet carry istream-only imports: they parse fmt5 natively
-  via ifstream (healthy 1.7.99+ mods), so any transcoded temp fails
-  their format check (observed live: EVLaS/NativeEditorIDFix
-  "incompatible during load" on fmt1 temps). Never serve fmt1 here.
-- Everyone else (`DECODER_V2`, `DECODER_V5`, `DECODER_NONE`) -> format 2
-  (transcoded temp file; the one shared mapping per game version stays
-  one size)
-
-**`version-` prefix (old SE plugins):**
-- ALWAYS fmt1 temp, regardless of decoder detection. Opening a file
-  named `version-` means the reader expects `format == 1` strictly -
-  decoder heuristics can misclassify such readers as V5 (observed live:
-  PayloadInterpreter "Unsupported address library format: 2" on a fmt2
-  temp). The sparse file is verified to be a strict subset of the dense
-  one (all 395,946 entries of `version-1-7-104-0.bin` present in
-  `versionlib-1-7-104-0.bin` with identical offsets), and
-  `ensure_buffers` additionally folds any sibling-only IDs into the
-  merge - so the temp answers every lookup the real file would. This
-  keeps one shared-mapping size per game version even when a plugin
-  reads `version-` but maps the common name (observed live:
-  PayloadInterpreter "Failed to find the id 523660" from a short
-  395,946-entry span over the shared board).
-- Previously passed through for the ActorLimitFix "Identifier not found,
-  41450" incident (a merged temp once dropped IDs the real file had).
-  That class is closed by the subset guarantee plus the sibling fold
-  above; the `kKeepIds` backstop stays regardless.
-
-The current runtime is detected by extracting the version string from the
-bin filename and storing it in `g_currentVersion`.
-
-### 4. Buffer building
-
-`ensure_buffers()` lazily reads the real bin file and builds in-memory
-buffers for all four formats:
-
-```
-Real .bin (fmt5) ---+--- g_fmt5 (raw copy)
-                    +--- g_fmt5_patched (translated offsets)
-                    +--- g_fmt2 (transcoded, translations applied)
-                    +--- g_fmt1 (transcoded from fmt2)
-                    +--- g_fmt0 (transcoded from fmt2)
-```
-
-When the source is format 1/2, the process is similar but starts from fmt2
-and transcodes up to fmt5.
-
-### 5. Temp file materialization
-
-`ensure_temp_file(format)` writes the in-memory buffer to a temp file:
-```
-%TEMP%\!CompaSSE_{pid}_fmt{0,1,2,5}.bin
-```
-
-Temp files are created once per process and reused for all callers that
-need the same format.
-
-### 6. Handle redirect
-
-The hook returns a handle to the temp file instead of the real file. The
-caller reads the temp file as if it were the real address library.
-
-### Format selection summary
-
-```
-Caller requests current-version versionlib-*.bin
-+- Caller is SKSE -> pass-through (real file)
-+- Caller is V1 (istream only) -> pass-through (real file: it parses
-   the on-disk fmt5 natively; a temp of any other format fails it)
-+- Anyone else (V2, dual V2/V5, unresolvable) -> faithful fmt2 temp
-   (non-zero IDs + translations for missing ones). Dual readers parse
-   it through their V2 branch, data-identical for present IDs.
-   Everyone maps the same byte count, so no shared-mapping clash.
-```
-
-Caller requests version-*.bin (current game version)
-+- ALWAYS fmt1 temp, regardless of decoder detection (a `version-`
-   opener expects `format == 1` strictly; see section 3 above).
-
-Caller requests version-*.bin (older game version)
-+- ALWAYS pass-through (real file is already fmt1, and the temp would
-   carry another version's data)
-
-Caller requests an old-version versionlib-*.bin
-+- ALWAYS pass-through (it is another mod's fallback chain; the shim's
-   buffers are built from the current bins, so serving them would
-   substitute wrong-version data)
-```
-
-## Translation
-
-No old-bin merging happens at serve time: legacy readers get the current
-runtime's data, transcoded, with translation-table remaps applied. Old
-game versions feed the system one step earlier - `CompaSSE.exe
---build-translations` mints the remap rows from old bins plus old-exe
-ground truth (see the main README).
-
-### Translation table
-
-`CompaSSE\translation_table.bin` is a binary file containing cross-version ID
-remappings. Located in `Data/SKSE/Plugins/CompaSSE/` subfolder.
-
-Format:
-```
-"TRTL" magic
-u32 format_version (1 = legacy, 3 = stamped)
-u32 build_len + char build[build_len] (padded, fmt 3 only, e.g. "1.7.104")
-u32 version_count
-For each version:
-  u32 version_string_len
-  char version_string[len] (padded to 4-byte alignment)
-  u32 entry_count
-  For each entry:
-    u64 old_id
-    u32 new_offset
-```
-
-Generated by `compasse.exe --build-translations`, stamped with the game
-version it was built for. A fmt-3 table from another game version is
-skipped outright (minted offsets don't transfer across games); legacy
-fmt-1 tables still apply. Rebuild after every game update.
-
-### Fill-absent-only application
-
-`apply_translations` never overwrites: the base map was just read from
-the current bins, so a present entry is definitionally correct for the
-running game, while a recorded offset can only be equal (no-op) or stale
-(a table built for a different game version than the one running would
-otherwise poison every mod's lookups, healthy ones included). Only IDs
-the current library lacks (minted from old-exe ground truth) are added.
-The quarantine list is applied before translations and the quarantined
-IDs are now named in the log, not just counted.
-
-### Format 5 patching
-
-For format 5 callers, the shim creates `g_fmt5_patched` - a copy of the
-raw format 5 file with translated offsets patched in-place.
-This is a surgical modification: only the u32 values at positions
-`96 + id * 4` are changed. The file structure, header, and entry count
-remain identical, so format 5 readers parse it without noticing the
-modification.
-
-## GetProcAddress + LoadLibrary Hooks
-
-### GetProcAddress hook
-
-The `Hook_GetProcAddress` function intercepts all `GetProcAddress` calls in
-the process. When it detects a lookup for `"SKSEPlugin_Version"`, it
-patches the returned struct's version flags:
+# !CompaSSE.dll
+
+If you updated Skyrim and half your load order died with `must be recompiled`, this is the part that brings it back.
+
+The DLL loads first because of the `!` in its name. It watches SKSE load your mods. When a mod asks for version info - it patches the answer in memory. When a mod opens the address library it hands over a copy that mod can actually read. Your mod files stay untouched. You will still find temp bins and a log where the shim works, but nothing in `Data` gets rewritten by this DLL.
+
+## How a mod loads, and where it dies
+
+SKSE walks `Data/SKSE/Plugins/` and does two passes per DLL.
+
+First it asks for `SKSEPlugin_Version` with `GetProcAddress`. It wants bit 0x2 at +0x304 and bits 0x1 and 0x4 at +0x308. No flags means rejection on the spot because DLL is not an SKSE-compatible mod. Some mods never go through `GetProcAddress` at all though - SKSE is able to read their export table direct. Such mods can be identified and worked with via `LoadLibrary` hook.
+
+Then SKSE calls `SKSEPlugin_Load` on each mod. The mod opens `versionlib-X-Y-Z-W.bin` or `version-X-Y-Z-W.bin` and starts resolving IDs - that is the point of second and third failure. An old reader chokes on a new bin format, or it parses fine and still gets wrong addresses because the game engine chunks moved.
+
+## Formats
+
+| Format | Who reads it | File looks like |
+|---|---|---|
+| 0 | Ancient stuff | Fixed 16-byte records |
+| 1 | CommonLibSSE 1.5.x | `version-*.bin` |
+| 2 | CommonLibSSE 1.6.x | Sorted pairs |
+| 5 | commonlibsse-ng | `versionlib-*.bin`, dense array |
+
+## The hooks
+
+MinHook does the work. Everything gets created in `DllMain`, `SKSEPlugin_Load` runs the install again in case something loaded early, with a guard so it never inits twice.
+
+| Hook | Where | Why it exists |
+|---|---|---|
+| `CreateFileW` | kernel32 | Most mods open the bin here |
+| `CreateFileA` | kernel32 | ANSI stragglers |
+| `CreateFile2` | kernel32 | WinRT path |
+| `CreateFileMappingW` / `A` | kernel32 | Mods that map instead of reading |
+| `OpenFileMappingW` / `A` | kernel32 | Mostly logging, tells you who mapped what |
+| `MapViewOfFile` | kernel32 | Catches the view itself |
+| `NtCreateFile` / `NtOpenFile` | ntdll | For mods that skip Win32 entirely |
+
+Module loads, 5 total. `GetProcAddress` patches flags on lookup. `LoadLibraryW`, `LoadLibraryA`, `LoadLibraryExW`, and `LdrLoadDll` patch flags when a module appears, whichever road it took in.
+
+Dialogs, 2 total. `MessageBoxW` and `MessageBoxA` just log. They never block the popup, so leave your hopes there. You will see caption plus 200 chars in the log and that is it.
+
+Reentry is the annoying part. Three guards handle it:
+* `g_loading` is set while we read the real bin ourselves;
+* `g_serving_alt` covers the case where we open the other prefix on your behalf;
+* `g_ntRedirecting` is thread-local for the Nt call that reenters Win32 underneath.
+
+## Figuring out what a mod can read
+
+Mapped file plus `istream` smells like V5. Mapped file alone smells like V2. Plain `istream` smells like V1. No info means we play safe with fmt2 and hope for the best.
+
+Imports lie on commonlibsse-ng 3.7 and older, cache code pulls in mapping calls it never uses for bins. So we also grep `.rdata` and `.data` for literal strings. V5 strings mean a dual reader that usually handles both, and it keeps the real file with `dualV5=1` in the log. No CommonLib strings at all means some custom minimal loader, (hello Display Tweaks and friends), and that keeps the real file too. Only a proven legacy reader gets the temp, CommonLib strings present and no V5 strings, logged as `leg=1`.
+
+Caller lookup is `RtlCaptureStackBackTrace` with 32 frames. We skip our own frames and the system DLLs and take whatever plugin frame is left. Misses fall back to fmt2. Every module gets scanned once and cached, so this cost happens one time per plugin.
+
+## What gets served
+
+We only look at filenames that start with `versionlib-` or `version-`. Anything else passes through untouched, and SKSE itself always gets the real file.
+
+For `versionlib-`, the common case:
+
+* V1-only reader, V5 strings found, or a versioned mod with no legacy strings gets the real file. These parse fmt5 themselves, and a temp would only break them.
+* Proven legacy reader or a versionless mod gets the fmt2 temp. No consent needed for this part: the transcoded bytes match the real file for present IDs, so it can only help or leave things as broken as without the shim. Unknown callers keep the real file, because a temp fails fmt5-only format checks. Consent still gates flag patches, translations, and legacy loading. Versionless mods only run through the legacy loader anyway, so they are old by definition.
+
+For `version-`, always the fmt1 temp.
+
+Old game versions pass through as well. Our buffers come from current bins, so serving them for an old request would hand out wrong-version data. Same for an old `versionlib-` that belongs to another mod's fallback chain.
+
+Buffers get built on demand in `ensure_buffers`. From fmt5 we keep a raw copy, a translated fmt5 copy, plus transcoded fmt2, fmt1, and fmt0. From fmt1 or fmt2 we start at fmt2 and go up from there. Temps land in `%TEMP%` as `!CompaSSE_{pid}_fmt{0,1,2,5}.bin`, one per format per game run. The hook swaps the handle and the mod never knows.
+
+## Translations
+
+`CompaSSE\translation_table.bin` is just ID remaps between game versions. Format 3 stamps the game it was built for, like `1.7.104`, and a table from the wrong game gets ignored. Old fmt1 tables still apply.
+
+The rule is fill gaps only. Whatever exists in the current bin wins, by definition it is right for the running game. The table only supplies IDs the current bin lacks. For fmt5 we patch a copy at `96 + id * 4` and leave header and count alone, so readers parse it normally.
+
+## Flag patch in plain code
+
+`Hook_GetProcAddress` sees `SKSEPlugin_Version` and sets bits on the returned struct:
 
 ```cpp
-// versionIndependenceEx at +0x304: set AddressLibraryV5 (0x2)
 *(uint32_t*)(raw + 0x304) |= 0x2;
-// versionIndependence at +0x308: set AddressLibrary | Structs (0x5)
 *(uint32_t*)(raw + 0x308) |= 0x5;
 ```
 
-This makes SKSE accept plugins that were compiled without the modern
-version flags, without modifying the DLL files on disk.
+LoadLibrary hooks do the same with `patch_skse_version_flags` for mods SKSE reads direct. Once per lookup or load, then out of the way.
 
-### LoadLibrary + LdrLoadDll hooks
+## Versionless mods
 
-Some plugins bypass GetProcAddress - SKSE reads the version struct directly
-from the PE export table (e.g. dosemetha.dll). The LoadLibrary hooks catch
-these by calling `patch_skse_version_flags()` on every newly loaded module.
+Some old mods export Query and Load but no version struct. SKSE skips them with `no version data` and no hook can catch that, the export simply is not there to intercept. So the shim loads them after SKSE posts its first message.
 
-The four hooks cover all DLL load paths:
-- `LoadLibraryW` / `LoadLibraryA` / `LoadLibraryExW` (kernel32.dll)
-- `LdrLoadDll` (ntdll.dll) - catches loads that bypass kernel32 entirely
+The worker looks at top-level DLLs only. It maps what SKSE left alone and drops versioned mods and helper libs right away. `CompaSSE/!CompaSSE.ini` under [legacy_skip] holds the ones you do not want auto-loaded. Each line is `name.dll`, with optional year and note. Pin a year and only that build skips, useful when a filename gets reused. You can tick this from the Therapist tab and it pins the year for you. Skips log every launch, so a stale line is easy to spot.
 
-**Performance:** All version-check hooks are lightweight - they only activate
-for `SKSEPlugin_Version` lookups (GetProcAddress) or once per module load
-(LoadLibrary/LdrLoadDll).
+Kept mods get Query then Load with the real SKSE interface, wrapped in SEH. A bad init logs and gets skipped instead of taking the game down. If SKSE grabs a module first through fabrication, the loader backs off. No double init.
 
-## Legacy Loader
+## Crash logging
 
-Plugins with `SKSEPlugin_Query`/`SKSEPlugin_Load` but no
-`SKSEPlugin_Version` export are skipped by SKSE outright (`no version
-data`, handle 0) - SKSE resolves the export itself, so no API hook can
-interpose. The shim loads them instead:
+The VEH logs access violations while mods start. You get module plus offset and registers RAX through R15. Init raises a lot of 0x4001 debug events as part of normal startup, those stay quiet or the game dies silently. Real faults log and pass on with `EXCEPTION_CONTINUE_SEARCH`. It will not save you, it just tells you who fell over.
 
-- On SKSE's first post-load message, a worker scans `Data/SKSE/Plugins/*.dll`
-  (top level only) and maps each file SKSE left unowned. In-memory exports
-  decide: version struct or consumed fabrication means SKSE owns it
-  (released again), missing Query/Load means support lib (released again).
-  No ini, no list. Most files are SKSE-owned and never mapped at all.
-- The worker calls Query then Load on the keepers with SKSE's own interface,
-  holding the reference SKSE never took.
-- Each call runs under SEH isolation: a faulting legacy init is logged
-  and skipped instead of taking down the game.
-- The GetProcAddress fabrication path covers the same modules if SKSE
-  ever probes them first; a consumed fabrication means SKSE owns the
-  module and the loader stands down (no double init).
+## Build, install, log
 
-## MessageBox Interception
-
-Both `MessageBoxW` and `MessageBoxA` are hooked to log all error dialogs.
-Every MessageBox call is written to the log with caption and first 200 chars
-of text, for post-mortem diagnosis.
-
-MessageBox calls are **not suppressed** - they pass through and display
-normally. The hook only adds logging.
-
-## Crash VEH
-
-A Vectored Exception Handler is installed during `SKSEPlugin_Load` to log
-access violations with diagnostic information:
-
-- Faulting module name and offset (resolved via `GetModuleHandleExW`)
-- Full register dump (RAX through R15)
-- Debug events (0x4001xxxx) are suppressed - the game raises these during
-  normal init and passing them through kills the process silently
-
-The VEH does **not** suppress real exceptions - it logs and re-throws via
-`EXCEPTION_CONTINUE_SEARCH`.
-
-## Deployment
-
-### Manual build
 ```cmd
 cd DLL
 cmd /c build_shim.bat
 ```
-Output: `DLL\build\!CompaSSE.dll`
 
-### Automated deploy
+You want `DLL\build\!CompaSSE.dll`. The `!` puts it first in load order, ahead of everything it needs to watch.
+
 ```powershell
-.\DLL\deploy.ps1                     # build + deploy
-.\DLL\deploy.ps1 -Kill -Launch       # kill + build + deploy + launch
-.\DLL\deploy.ps1 -NoBuild -Kill      # skip build, deploy last
-.\DLL\deploy.ps1 -DryRun             # preview only
+.\DLL\deploy.ps1
+.\DLL\deploy.ps1 -Kill -Launch
+.\DLL\deploy.ps1 -NoBuild -Kill
+.\DLL\deploy.ps1 -DryRun
 ```
 
-### DLL naming
+Log lives at `Data/SKSE/Plugins/!CompaSSE.log`. Time plus pid plus text per line. The lines you will actually grep:
 
-The shim must be deployed under the name `!CompaSSE.dll`
+| Line | What happened |
+|---|---|
+| `install_hooks: CreateFileW ok` | Hook is in |
+| `install_hooks: enable ok` | All hooks are on |
+| `GetProcAddress: patched SKSEPlugin_Version flags` | Flags fixed on lookup |
+| `loadtime LoadLibraryW: patched` | Flags fixed on load |
+| `serve VERSIONLIB -> format N` | Temp served, with entry counts |
+| `serve PATH -> pass-through for SKSE` | SKSE got the real thing |
+| `load_translations: loaded N remapped IDs` | Table is live |
+| `MessageBoxW intercepted` | A mod popped an error |
 
-ASCII sort: `'!'` (0x21) < `'A'` (0x41), so `!CompaSSE.dll`
-is loaded before any other properly named DLL.
+The serve line carries `decoder=`, `dualV5=`, and `leg=` for that caller. When a mod gets the wrong file, that one line usually tells you why.
 
-## Log File Reference
+## Where it still goes wrong
 
-The shim writes a log file at:
-```
-Data/SKSE/Plugins/!CompaSSE.log
-```
+Caller detection misses sometimes. Syscall stubs and heavy inlining hide the plugin frame and the walk comes back empty. Those callers get fmt2. Dual readers landing here still parse through their V2 side, identical for present IDs, off only for absent ones.
 
-### Log entry format
-```
-[YYYY-MM-DD HH:MM:SS.mmm] pid=PROCESS_ID message
-```
+The table only knows what someone taught it. Unknown IDs keep stale offsets after an update and there is no magic there.
 
-### Key log messages
-
-| Message | Meaning |
-|---------|---------|
-| `install_hooks: CreateFileW ok` | Hook installed successfully |
-| `install_hooks: enable ok` | All hooks enabled |
-| `GetProcAddress: patched SKSEPlugin_Version flags for module at ADDR` | Version flags patched |
-| `loadtime LoadLibraryW: patched SKSEPlugin_Version mod=...` | Flags patched at load time |
-| `serve VERSIONLIB -> format N (transcoded, ..., ids=X, mapbytes=Y) for MODULE` | Temp file served (ids = entries, mapbytes = shared-mapping bytes) |
-| `CreateFileMappingW NAME size=N -> ok/FAILED for MODULE` | Shared IDDB mapping created per game version |
-| `OpenFileMappingW NAME -> opened/missing for MODULE` | Shared IDDB mapping opened (missing = first creator) |
-| `serve PATH -> pass-through for SKSE (MODULE)` | SKSE gets the real file |
-| `load_translations: loaded N remapped IDs from N version tables` | Translation table loaded |
-| `MessageBoxW intercepted! caption=X text=Y` | Error dialog logged |
-
-## Known Limitations
-
-### Caller identification
-Some mods call address library APIs through syscall stubs or deeply inlined
-code, causing `resolve_caller_module()` to return null. Those callers join
-the ambiguous bucket (faithful fmt2 temp). Dual V2/V5 readers with a failed
-stack walk land here too: they still parse the fmt2 temp through their V2
-branch (data-identical for present IDs), diverging from the real file only
-for absent IDs. The serve log (`dualV5=`, `decoder=`) names the decision
-per caller, so a misroute is identifiable in one run.
-
-### V5-native detection
-Callers containing V5-only strings are logged (`dualV5=1`) but served the
-same fmt2 temp as everyone else: their V2 branch parses it fine, and a
-fmt5 temp would size their shared mapping differently from pure-V2
-holders of the same name. A pre-V5 binary cannot contain those strings
-(verified: the marker set is parity-tested in `test_detect.py` T20
-against the exact list in `decoder_detect.cpp`).
-
-### Translation table coverage
-The translation table covers known ID remappings between major game versions.
-IDs not in the table may have stale offsets after a game update.
-
-### Thread safety
-The serve logic uses an SRW lock (`g_lock`) to protect buffer building and
-temp file materialization. Format selection and handle creation happen
-outside the lock. This is safe for the single-threaded plugin loading
-phase but could race if plugins spawn threads that open the address library
-concurrently.
-
-### Temp files
-Temp files persist until process exit (cleaned up in `uninstall_hooks`).
-If the game crashes, orphaned temp files remain in `%TEMP%`. They are
-small (~2-14MB) and harmless.
+Buffer builds lock with an SRW lock and handle creation happens outside it. Plugin load is single threaded in practice so you will likely never hit this, but concurrent opens from mod threads can race.

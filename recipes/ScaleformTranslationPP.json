@@ -1,0 +1,31 @@
+{
+  "format": 1,
+  "variants": {
+    "324c6716c797ce4231d627441ebd9996e81eec0f67a500d69e0dfcbf75f2e899": {
+      "game": "1.7.104",
+      "label": "Fixable: outdated addresses",
+      "items": [
+        {
+          "kind": "hook",
+          "hook": {
+            "va": 86950,
+            "rel_id": 36547,
+            "offset": 3761,
+            "pattern": {
+              "0": 232,
+              "5": 72,
+              "6": 137,
+              "7": 5
+            },
+            "pattern_len": 8
+          },
+          "new": 3489,
+          "rel_id": 36547
+        },
+        {
+          "kind": "flags"
+        }
+      ]
+    }
+  }
+}

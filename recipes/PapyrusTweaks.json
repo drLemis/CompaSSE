@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "variants": {
+    "109ded0cb55b0139a1b883756c54d154da47600f4e9e11d7349bba5e8554c85a": {
+      "game": "1.7.104",
+      "label": "PapyrusTweaks (SVAL): compiled_variant_offset_semantic_suboffset",
+      "items": [
+        {
+          "kind": "bytes",
+          "loc_kind": "rva",
+          "loc": 29678,
+          "width": null,
+          "old": 1636,
+          "new": 1692,
+          "insn_check": true,
+          "label": "EnableLoadDocStrings AE VariantOffset"
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "rva",
+          "loc": 30009,
+          "width": null,
+          "old": 1636,
+          "new": 1692,
+          "insn_check": true,
+          "label": "EnableLoadDebugInformation AE VariantOffset"
+        }
+      ],
+      "notes": [
+        "Imported from SVAL pack file PapyrusTweaks-tested.json.",
+        "Address Library ID 53919 itself remains unchanged.",
+        "The old +0x664 location bisected an instruction on Skyrim 1.7.104; +0x69C was the validated CompiledScriptLoader call.",
+        "RVA locations are retained SVAL analysis results. The semantic correction and final output hash were independently retained in SVAL diagnostics."
+      ],
+      "provenance": {
+        "pack": "PapyrusTweaks-tested.json",
+        "target_runtime": "1.7.104.0"
+      }
+    }
+  }
+}

@@ -251,23 +251,6 @@ bool encode_format2(std::vector<uint8_t>& out,
     return true;
 }
 
-bool format5_to_format2(const uint8_t* fmt5, size_t size, std::vector<uint8_t>& out) {
-    std::vector<std::pair<uint64_t, uint64_t>> entries;
-    uint32_t version[4];
-    std::string name;
-    uint32_t ptr_size = 0;
-    if (!parse_format5(fmt5, size, entries, version, name, ptr_size)) return false;
-    return encode_format2(out, version, name, ptr_size, entries);
-}
-
-bool format5_to_format1(const uint8_t* fmt5, size_t size, std::vector<uint8_t>& out) {
-    std::vector<uint8_t> fmt2;
-    if (!format5_to_format2(fmt5, size, fmt2)) return false;
-    return format2_to_format1(fmt2.data(), fmt2.size(), out);
-}
-
-// Format 0: same header, but entries are fixed 16-byte {id:u64, offset:u64}.
-// No type byte, no variable-length encoding.
 bool encode_format0(std::vector<uint8_t>& out,
                            const uint32_t version[4], const std::string& name,
                            uint32_t ptr_size, const std::vector<std::pair<uint64_t, uint64_t>>& entries) {
@@ -293,13 +276,4 @@ bool encode_format0(std::vector<uint8_t>& out,
         put64(e.second);  // offset:u64
     }
     return true;
-}
-
-bool format5_to_format0(const uint8_t* fmt5, size_t size, std::vector<uint8_t>& out) {
-    std::vector<std::pair<uint64_t, uint64_t>> entries;
-    uint32_t version[4];
-    std::string name;
-    uint32_t ptr_size = 0;
-    if (!parse_format5(fmt5, size, entries, version, name, ptr_size)) return false;
-    return encode_format0(out, version, name, ptr_size, entries);
 }

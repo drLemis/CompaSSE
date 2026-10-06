@@ -1,0 +1,30 @@
+{
+  "format": 1,
+  "variants": {
+    "3726b337133a0f698c13c7213ec5547255cc8f9fe7cfebfa5025812dd5388d63": {
+      "game": "1.7.104",
+      "label": "DiagonalSprint (SVAL): runtime_family_classifier",
+      "items": [
+        {
+          "kind": "bytes",
+          "loc_kind": "file",
+          "loc": 143898,
+          "width": 1,
+          "old": 149,
+          "new": 146,
+          "insn_check": false,
+          "label": "SETNE -> SETB"
+        }
+      ],
+      "notes": [
+        "Imported from SVAL pack file DiagonalSprint-tested.json.",
+        "Exact-binary recipe. Do not apply to a different DLL hash.",
+        "This repairs the legacy runtime-family classifier, not an Address Library entry."
+      ],
+      "provenance": {
+        "pack": "DiagonalSprint-tested.json",
+        "target_runtime": "1.7.104.0"
+      }
+    }
+  }
+}

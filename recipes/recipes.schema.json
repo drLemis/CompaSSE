@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CompaSSE recipe file",
+  "description": "Known-fix recipes under recipes/, keyed by content hash.",
+  "type": "object",
+  "required": ["format", "variants"],
+  "properties": {
+    "format": {"type": "integer"},
+    "variants": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["game", "label", "items"],
+        "properties": {
+          "game": {"type": "string"},
+          "label": {"type": "string"},
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "loc", "old", "new"],
+              "properties": {
+                "kind": {"type": "string"},
+                "loc_kind": {"type": "string"},
+                "loc": {"type": "integer"},
+                "width": {"type": ["integer", "null"]},
+                "old": {"type": "integer"},
+                "new": {"type": "integer"},
+                "insn_check": {"type": "boolean"},
+                "label": {"type": "string"}
+              }
+            }
+          },
+          "notes": {"type": "array", "items": {"type": "string"}},
+          "provenance": {"type": "object"}
+        }
+      }
+    }
+  }
+}

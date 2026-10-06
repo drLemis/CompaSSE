@@ -4,7 +4,7 @@ a = Analysis(
     ['compasse_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('compasse.ico', '.')],
+    datas=[('compasse.ico', '.'), ('DLL/build/jig_host.exe', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

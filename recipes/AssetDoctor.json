@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "variants": {
+    "558c49f9be3ed9e9377d532a4470c726f8251f5a66e785904db1381990838726": {
+      "game": "1.7.104",
+      "label": "AssetDoctor (SVAL): commonlib_variant_family_selection",
+      "items": [
+        {
+          "kind": "bytes",
+          "loc_kind": "rva",
+          "loc": 160334,
+          "width": 1,
+          "old": 16,
+          "new": 24,
+          "insn_check": false,
+          "label": "VariantID/VariantOffset constructor source displacement: alias SE slot to AE argument"
+        },
+        {
+          "kind": "bytes",
+          "loc_kind": "rva",
+          "loc": 368323,
+          "width": 1,
+          "old": 16,
+          "new": 24,
+          "insn_check": false,
+          "label": "VariantID/VariantOffset constructor source displacement: alias SE slot to AE argument"
+        }
+      ],
+      "notes": [
+        "Imported from SVAL pack file AssetDoctor-2.0.0.json.",
+        "These are RVAs, not raw file offsets.",
+        "The shared constructor repair fixed multiple unrelated relocations; it should be preferred over per-relocation patches for this exact binary.",
+        "Validation case: SE ID 75595 +0x9 was semantically wrong on 1.7.104; AE ID 77226 +0x275 began the expected E8 rel32 call."
+      ],
+      "provenance": {
+        "pack": "AssetDoctor-2.0.0.json",
+        "target_runtime": "1.7.104.0"
+      }
+    }
+  }
+}

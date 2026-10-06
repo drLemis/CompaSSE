@@ -24,15 +24,6 @@ bool parse_format5(const uint8_t* data, size_t size,
                    std::vector<std::pair<uint64_t, uint64_t>>& entries,
                    uint32_t version[4], std::string& name, uint32_t& ptr_size);
 
-// Transcode format-5 bytes to a complete format-2 bin (delta-encoded entries).
-bool format5_to_format2(const uint8_t* fmt5, size_t size, std::vector<uint8_t>& out);
-
-// Transcode format-5 bytes to a complete format-1 bin (delta-encoded entries).
-bool format5_to_format1(const uint8_t* fmt5, size_t size, std::vector<uint8_t>& out);
-
-// Transcode format-5 bytes to a complete format-0 bin (fixed 16-byte entries).
-bool format5_to_format0(const uint8_t* fmt5, size_t size, std::vector<uint8_t>& out);
-
 // Encode entries into format-2 bin bytes. entries must be sorted by id.
 bool encode_format2(std::vector<uint8_t>& out,
                     const uint32_t version[4], const std::string& name,

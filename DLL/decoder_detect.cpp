@@ -4,10 +4,6 @@
 #include <cwchar>
 #include <unordered_map>
 
-namespace {
-
-// True if the module path belongs to the OS/CRT and should be skipped when
-// resolving the caller of a hooked API.
 bool is_system_module(const wchar_t* path) {
     wchar_t low[MAX_PATH];
     size_t len = wcslen(path);
@@ -22,8 +18,6 @@ bool is_system_module(const wchar_t* path) {
     if (wcsncmp(low, L"c:\\windows\\system32", 19) == 0) return true;
     return false;
 }
-
-} // namespace
 
 DecoderType detect_decoder(HMODULE mod) {
     if (!mod) return DECODER_NONE;
@@ -65,8 +59,6 @@ DecoderType detect_decoder(HMODULE mod) {
 }
 
 HMODULE resolve_caller_module(HMODULE self_module) {
-    // 32 frames: CRT ifstream opens bury the plugin frame deep behind
-    // system DLLs; 8 routinely missed it and misclassified healthy mods.
     void* frames[32] = {};
     USHORT n = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
     for (USHORT i = 0; i < n; ++i) {
@@ -108,8 +100,6 @@ DecoderType decoder_for_module(HMODULE mod, HMODULE self_module) {
     return t;
 }
 
-// V5-only strings. Pre-V5 binaries predate them; keep in sync with
-// compasse.py FMT5_MARKERS.
 static const char* const kFmt5Markers[] = {
     "AddressLibraryV5",
     "Address Library V5",
@@ -117,8 +107,17 @@ static const char* const kFmt5Markers[] = {
     "AddressLibV2",
 };
 
-static bool scan_markers(const uint8_t* base, size_t size) {
-    for (const char* m : kFmt5Markers) {
+static const char* const kFmt2OnlyMarkers[] = {
+    "CommonLibSSEOffsets",
+    "Unsupported address library format",
+    "within the address library",
+    "failed to create shared mapping",
+};
+
+static bool scan_markers(const uint8_t* base, size_t size,
+                         const char* const* marks, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const char* m = marks[i];
         size_t len = strlen(m);
         if (len == 0 || len > size)
             continue;
@@ -132,8 +131,8 @@ static bool scan_markers(const uint8_t* base, size_t size) {
     return false;
 }
 
-// POD-only locals: __try must not share scope with C++ objects (C2712).
-static bool scan_module_fmt5(HMODULE mod) {
+static bool scan_module_marks(HMODULE mod, const char* const* marks,
+                              size_t count) {
     const auto* dos = (const IMAGE_DOS_HEADER*)mod;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
         return false;
@@ -147,10 +146,10 @@ static bool scan_module_fmt5(HMODULE mod) {
         memcpy(name, sec->Name, 8);
         if (strcmp(name, ".rdata") != 0 && strcmp(name, ".data") != 0)
             continue;
-        // A fault here must never take down the game.
+        // A fault here must never take down the game
         __try {
             const uint8_t* base = (const uint8_t*)mod + sec->VirtualAddress;
-            if (scan_markers(base, sec->Misc.VirtualSize))
+            if (scan_markers(base, sec->Misc.VirtualSize, marks, count))
                 return true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -158,30 +157,93 @@ static bool scan_module_fmt5(HMODULE mod) {
     return false;
 }
 
-bool module_supports_fmt5(HMODULE mod) {
-    if (!mod)
-        return false;
+static bool scan_module_fmt5(HMODULE mod) {
+    return scan_module_marks(mod, kFmt5Markers,
+                             sizeof(kFmt5Markers) / sizeof(kFmt5Markers[0]));
+}
 
+static bool scan_module_legacy(HMODULE mod) {
+    return scan_module_marks(mod, kFmt2OnlyMarkers,
+                             sizeof(kFmt2OnlyMarkers) /
+                             sizeof(kFmt2OnlyMarkers[0]));
+}
+
+// One cache for every per-module boolean signal
+enum ScanKind { SCAN_FMT5, SCAN_LEGACY, SCAN_VERSION };
+
+static bool cached_scan(HMODULE mod, ScanKind kind, bool (*scan)(HMODULE)) {
     struct Cache {
-        std::unordered_map<HMODULE, bool> map;
+        std::unordered_map<uint64_t, bool> map;
         CRITICAL_SECTION cs;
         Cache() { InitializeCriticalSection(&cs); }
         ~Cache() { DeleteCriticalSection(&cs); }
     };
     static Cache cache; // same static-init pattern as the decoder cache
+    uint64_t key = ((uint64_t)mod << 2) | (uint64_t)kind;
     EnterCriticalSection(&cache.cs);
-    auto it = cache.map.find(mod);
+    auto it = cache.map.find(key);
     if (it != cache.map.end()) {
-        bool cached = it->second;
+        bool found = it->second;
         LeaveCriticalSection(&cache.cs);
-        return cached;
+        return found;
     }
     LeaveCriticalSection(&cache.cs);
 
-    bool found = scan_module_fmt5(mod);
+    bool found = scan(mod);
 
     EnterCriticalSection(&cache.cs);
-    cache.map[mod] = found;
+    cache.map[key] = found;
     LeaveCriticalSection(&cache.cs);
     return found;
+}
+
+bool module_supports_fmt5(HMODULE mod) {
+    if (!mod)
+        return false;
+    return cached_scan(mod, SCAN_FMT5, scan_module_fmt5);
+}
+
+bool module_is_legacy_reader(HMODULE mod) {
+    if (!mod)
+        return false;
+    return cached_scan(mod, SCAN_LEGACY, scan_module_legacy);
+}
+
+static bool scan_version_export(HMODULE mod) {
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const IMAGE_NT_HEADERS64* nt =
+        (const IMAGE_NT_HEADERS64*)((const uint8_t*)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return false;
+    const IMAGE_DATA_DIRECTORY& dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (dir.VirtualAddress == 0 || dir.Size == 0)
+        return false;
+    bool found = false;
+    __try {
+        const IMAGE_EXPORT_DIRECTORY* exp =
+            (const IMAGE_EXPORT_DIRECTORY*)((const uint8_t*)mod +
+                                            dir.VirtualAddress);
+        const DWORD* names = (const DWORD*)((const uint8_t*)mod +
+                                            exp->AddressOfNames);
+        for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+            const char* n =
+                (const char*)((const uint8_t*)mod + names[i]);
+            if (n[0] == 'S' && strcmp(n, "SKSEPlugin_Version") == 0) {
+                found = true;
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return found;
+}
+
+bool module_has_version_export(HMODULE mod) {
+    if (!mod)
+        return false;
+    return cached_scan(mod, SCAN_VERSION, scan_version_export);
 }

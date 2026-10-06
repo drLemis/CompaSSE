@@ -24,6 +24,13 @@ $DataDir = Join-Path $BundleDir 'Data\SKSE\Plugins'
 $CompaSSEDir = Join-Path $DataDir 'CompaSSE'
 New-Item -ItemType Directory -Path $CompaSSEDir -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root 'DLL\build\!CompaSSE.dll') -Destination $DataDir
+$RecipesSrc = Join-Path $Root 'recipes'
+if (Test-Path -LiteralPath $RecipesSrc) {
+    $RecipesDir = Join-Path $CompaSSEDir 'recipes'
+    New-Item -ItemType Directory -Path $RecipesDir -Force | Out-Null
+    Copy-Item -Path (Join-Path $RecipesSrc '*.json') -Destination $RecipesDir -Force
+    Write-Host '   Copied recipes to bundle'
+}
 
 # Build translation table against installed game's old bins (best effort, skipped without a game)
 $DefaultPluginsDir = $env:COMPASSE_PLUGINS_DIR
@@ -59,7 +66,7 @@ if ($DefaultPluginsDir) {
 }
 if ($GameExe -and (Test-Path -LiteralPath $GameExe)) {
     Write-Host '== Building translation table =='
-    python compasse.py --build-translations --game $GameExe --plugins-dir $DefaultPluginsDir
+    python -c "import sys, core.translations as T, core.versions as V; from pathlib import Path; game, plug = sys.argv[1], Path(sys.argv[2]); T.build_translations(game, plug, game_version=V.runtime_version_from_exe(game))" $GameExe $DefaultPluginsDir
     if ($LASTEXITCODE -ne 0) { Write-Warning "Translation build failed (exit code $LASTEXITCODE)" }
     # Copy result to bundle
     $srcBin = Join-Path $DefaultPluginsDir 'CompaSSE\translation_table.bin'
@@ -69,10 +76,10 @@ if ($GameExe -and (Test-Path -LiteralPath $GameExe)) {
     }
 } else {
     Write-Warning "Game exe not found - skipping translation table build"
-    Write-Warning "Users must run: compasse.exe --build-translations"
+    Write-Warning "Rebuild helper data from the Therapist tab instead"
 }
 
-$Ver = & python -c "import compasse; print(compasse.VERSION)"
+$Ver = & python -c "import core; print(core.VERSION)"
 $Zip = Join-Path $BundleDir "CompaSSE-$Ver.zip"
 Compress-Archive -Path (Join-Path $BundleDir '*') -DestinationPath $Zip -Force
 

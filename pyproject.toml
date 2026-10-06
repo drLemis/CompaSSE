@@ -1,0 +1,12 @@
+[project]
+name = "compasse"
+version = "2.0.0"
+description = "CompaSSE: SKSE plugin compatibility scanner and fixer"
+requires-python = ">=3.9"
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "BLE001", "PLC0414"]
+
+[tool.black]
+line-length = 100
