@@ -1,9 +1,9 @@
 """Track which DLLs the user allowed CompaSSE to fix."""
 from pathlib import Path
 
-from core.config import (TOUCHED_SECTION, TOUCHED_LEGACY, _shim_dir,
-                         config_path, prelude_lines, read_section,
-                         write_section)
+from core.config import (FIXED_SECTION, TOUCHED_LEGACY,
+                          _shim_dir, config_path, prelude_lines,
+                          read_section, write_section)
 
 TOUCHED_NAME = TOUCHED_LEGACY
 _SHIM_DIR = "CompaSSE"
@@ -28,8 +28,7 @@ def _token(line):
 def read_touched(plugins_dir):
     """Names in the ledger. Empty if missing."""
     out = set()
-    for line in read_section(plugins_dir, TOUCHED_SECTION,
-                             include_prelude=True):
+    for line in read_section(plugins_dir, FIXED_SECTION):
         tok = _token(line)
         if tok:
             out.add(tok)
@@ -46,10 +45,10 @@ def add_touched(shim_plugins_dir, dll_path):
     key = name.lower()
     if key in read_touched(shim_plugins_dir):
         return True
-    lines = [ln for ln in read_section(shim_plugins_dir, TOUCHED_SECTION)
+    lines = [ln for ln in read_section(shim_plugins_dir, FIXED_SECTION)
              if _token(ln) != key]
     lines.append(name)
-    return write_section(shim_plugins_dir, TOUCHED_SECTION, lines)
+    return write_section(shim_plugins_dir, FIXED_SECTION, lines)
 
 def remove_touched(shim_plugins_dir, dll_path):
     """Remove one DLL from the ledger. True if removed."""
@@ -59,13 +58,13 @@ def remove_touched(shim_plugins_dir, dll_path):
         return False
     if not key:
         return False
-    lines = read_section(shim_plugins_dir, TOUCHED_SECTION)
+    lines = read_section(shim_plugins_dir, FIXED_SECTION)
     kept = [ln for ln in lines if _token(ln) != key]
     pre = [ln for ln in prelude_lines(shim_plugins_dir)
            if _token(ln) != key]
     if len(kept) == len(lines) and pre == prelude_lines(shim_plugins_dir):
         return False
-    return write_section(shim_plugins_dir, TOUCHED_SECTION, kept,
+    return write_section(shim_plugins_dir, FIXED_SECTION, kept,
                           prelude=pre)
 
 def seed_from_backups(shim_plugins_dir):
@@ -103,7 +102,7 @@ def prune_missing(shim_plugins_dir):
                    if q.is_file()}
     except OSError:
         return 0
-    lines = read_section(shim_plugins_dir, TOUCHED_SECTION)
+    lines = read_section(shim_plugins_dir, FIXED_SECTION)
     kept, dropped = [], 0
     for line in lines:
         tok = _token(line)
@@ -116,7 +115,7 @@ def prune_missing(shim_plugins_dir):
     dropped += sum(1 for _ in prelude_lines(shim_plugins_dir)) - len(pre)
     if not dropped:
         return 0
-    if not write_section(shim_plugins_dir, TOUCHED_SECTION, kept,
+    if not write_section(shim_plugins_dir, FIXED_SECTION, kept,
                           prelude=pre):
         return 0
     return dropped

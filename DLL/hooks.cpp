@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#define COMPASSE_SHIM_VERSION "2.0.1"
+#define COMPASSE_SHIM_VERSION "2.0.2"
 
 // ---- GetProcAddress interception (SKSE version bypass) ----
 typedef FARPROC (WINAPI* pfnGetProcAddress)(HMODULE, LPCSTR);
@@ -431,7 +431,7 @@ static FARPROC WINAPI fabricate_version_struct(HMODULE mod) {
     return (FARPROC)b;
 }
 
-// Skip-list for the legacy loader (CompaSSE\!CompaSSE.ini [legacy_skip],
+// Skip-list for the legacy loader (CompaSSE\!CompaSSE.ini [skip],
 // one entry per line: "name.dll [| year=YYYY] [| note]". ';' '#' and other
 // are ignored, matching is case-insensitive). A pinned year skips only
 // that build (same DLL filename, different mod); without one every build
@@ -483,7 +483,8 @@ static bool config_path(wchar_t* out) {
     return true;
 }
 
-// Section header value: "legacy_skip" from "[legacy_skip]".
+// Section header matcher: true with match set when the line opens
+// the wanted section (case-insensitive, surrounding spaces allowed).
 // Returns true and sets match when the line opens the wanted section.
 static bool section_select(const char* line, const char* want, bool& inSection) {
     const char* p = line;
@@ -505,15 +506,8 @@ static void load_legacy_skip() {
     g_legacySkipLoaded = true;
     if (!g_self) return;
     wchar_t path[MAX_PATH];
-    bool unified = config_path(path) &&
-        GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-    if (!unified) {
-        if (!GetModuleFileNameW(g_self, path, MAX_PATH)) return;
-        wchar_t* bs = wcsrchr(path, L'\\');
-        if (!bs) return;
-        *bs = 0;
-        wcscat_s(path, L"\\CompaSSE\\legacy-skip.ini");
-    }
+    if (!config_path(path) ||
+        GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -532,10 +526,15 @@ static void load_legacy_skip() {
     char* ctx = nullptr;
     for (char* line = strtok_s(text, "\r\n", &ctx); line;
          line = strtok_s(nullptr, "\r\n", &ctx)) {
-        if (unified) {
-            bool wasSection = section_select(line, "legacy_skip", inSection);
-            if (wasSection || !inSection) continue;
+        // Only [skip] is read; old section names are ignored.
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '[') {
+            bool tmp = false;
+            inSection = section_select(line, "skip", tmp) && tmp;
+            continue;
         }
+        if (!inSection) continue;
         while (*line == ' ' || *line == '\t') ++line;
         if (!*line || *line == ';' || *line == '#' || *line == '[' ||
             *line == '\'' || *line == '"')
@@ -593,11 +592,19 @@ static bool is_legacy_skipped(const wchar_t* base) {
 }
 
 static std::vector<std::wstring> g_touched;
+static std::vector<std::wstring> g_serveRaw;
+static std::vector<std::wstring> g_serveFmt1;
 static bool g_touchedLoaded = false;
 static bool g_touchedMissing = false;
+static bool g_legacyWarned = false;
 static std::map<HMODULE, bool> g_touchedCache; // guarded by g_lock
 static std::map<std::wstring, bool> g_touchedSkipLogged; // skip line once per basename per boot
 static bool g_translationsAllowed = true; // per-serve touched decision; a miss makes apply_translations add 0
+
+static bool in_list_ci(const std::vector<std::wstring>& list, const wchar_t* w) {
+    for (auto& e : list) if (_wcsicmp(e.c_str(), w) == 0) return true;
+    return false;
+}
 
 static void load_touched() {
     // Call with g_lock held exclusively.
@@ -605,14 +612,11 @@ static void load_touched() {
     g_touchedLoaded = true;
     if (!g_self) { g_touchedMissing = true; return; }
     wchar_t path[MAX_PATH];
-    bool unified = config_path(path) &&
-        GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-    if (!unified) {
-        if (!GetModuleFileNameW(g_self, path, MAX_PATH)) { g_touchedMissing = true; return; }
-        wchar_t* bs = wcsrchr(path, L'\\');
-        if (!bs) { g_touchedMissing = true; return; }
-        *bs = 0;
-        wcscat_s(path, L"\\CompaSSE\\touched.ini");
+    if (!config_path(path) ||
+        GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        g_touchedMissing = true;
+        shim_log("touched: no config - legacy mode, serving all plugins");
+        return;
     }
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -639,29 +643,61 @@ static void load_touched() {
         }
         text += 3;
     }
-    bool inSection = false;
+    bool inFixed = false;
     bool seenSection = false;
     char* ctx = nullptr;
     for (char* line = strtok_s(text, "\r\n", &ctx); line;
          line = strtok_s(nullptr, "\r\n", &ctx)) {
-        if (unified) {
-            // Pre-section lines count as [touched], so old touched.ini
-            // content pastes in cleanly. Other sections are skipped.
+        {
             const char* p = line;
             while (*p == ' ' || *p == '\t') ++p;
             if (*p == '[') {
                 seenSection = true;
-                if (!section_select(line, "touched", inSection) || !inSection)
-                    continue;
-                else
-                    continue;
+                bool tmp = false;
+                inFixed = section_select(line, "fixed", tmp) && tmp;
+                if (!inFixed && !g_legacyWarned) {
+                    // Tripwire: dead headers are ignored, loudly, once.
+                    // Rewrite the ini via the current CompaSSE.exe.
+                    const char* dead[] = { "touched", "serve_raw", "serve_fmt1", "legacy_skip" };
+                    for (int i = 0; i < 4; ++i) {
+                        bool d = false;
+                        if (section_select(line, dead[i], d) && d) {
+                            g_legacyWarned = true;
+                            shim_log("LEGACY SECTIONS IGNORED - rewrite via current CompaSSE.exe");
+                            break;
+                        }
+                    }
+                }
+                continue;
             }
-            if (seenSection && !inSection) continue;
+            if (!seenSection || !inFixed) continue;
         }
         while (*line == ' ' || *line == '\t') ++line;
         if (!*line || *line == ';' || *line == '#' || *line == '[') continue;
+        int serveMode = 0; // 0 auto, 1 raw, 2 fmt1
         char* bar = strchr(line, '|');
-        if (bar) *bar = 0;
+        if (bar) {
+            *bar = 0;
+            for (char* seg = bar + 1; seg; ) {
+                char* next = strchr(seg, '|');
+                if (next) *next++ = 0;
+                while (*seg == ' ' || *seg == '\t') ++seg;
+                if (_strnicmp(seg, "serve=", 6) == 0) {
+                    const char* v = seg + 6;
+                    while (*v == ' ' || *v == '\t') ++v;
+                    if (_strnicmp(v, "raw", 3) == 0
+                        && (v[3] == 0 || v[3] == ' ' || v[3] == '\t'))
+                        serveMode = 1;
+                    else if (_strnicmp(v, "fmt1", 4) == 0
+                        && (v[4] == 0 || v[4] == ' ' || v[4] == '\t'))
+                        serveMode = 2;
+                    else if (_strnicmp(v, "auto", 4) == 0
+                        && (v[4] == 0 || v[4] == ' ' || v[4] == '\t'))
+                        serveMode = 0;
+                }
+                seg = next;
+            }
+        }
         size_t n = strlen(line);
         while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t')) line[--n] = 0;
         char* sp = strchr(line, ' ');
@@ -672,10 +708,15 @@ static void load_touched() {
         wchar_t w[MAX_PATH] = {};
         for (size_t i = 0; line[i]; ++i) w[i] = (wchar_t)(unsigned char)line[i];
         if (g_touched.size() >= 512) break;
-        g_touched.push_back(w);
+        if (!in_list_ci(g_touched, w)) g_touched.push_back(w);
+        if (serveMode == 1) {
+            if (!in_list_ci(g_serveRaw, w) && g_serveRaw.size() < 512) g_serveRaw.push_back(w);
+        } else if (serveMode == 2) {
+            if (!in_list_ci(g_serveFmt1, w) && g_serveFmt1.size() < 512) g_serveFmt1.push_back(w);
+        }
     }
-    shim_log("touched: %zu consented plugin(s) from %ls", g_touched.size(),
-             unified ? L"!CompaSSE.ini" : L"touched.ini");
+    shim_log("touched: %zu consented plugin(s) (+%zu raw, +%zu fmt1) from !CompaSSE.ini",
+             g_touched.size(), g_serveRaw.size(), g_serveFmt1.size());
 }
 
 static bool is_touched_name(const wchar_t* base) {
@@ -729,6 +770,31 @@ static bool is_touched_module(HMODULE mod) {
     return hit;
 }
 
+static bool is_serve_listed(const wchar_t* base, const std::vector<std::wstring>& list) {
+    if (!base || !base[0]) return false;
+    AcquireSRWLockShared(&g_lock);
+    if (!g_touchedLoaded) {
+        ReleaseSRWLockShared(&g_lock);
+        AcquireSRWLockExclusive(&g_lock);
+        if (!g_touchedLoaded) load_touched();
+        ReleaseSRWLockExclusive(&g_lock);
+        AcquireSRWLockShared(&g_lock);
+    }
+    bool missing = g_touchedMissing;
+    bool hit = false;
+    if (!missing) hit = in_list_ci(list, base);
+    ReleaseSRWLockShared(&g_lock);
+    return missing ? false : hit;
+}
+
+static bool is_serve_raw_name(const wchar_t* base) {
+    return is_serve_listed(base, g_serveRaw);
+}
+
+static bool is_serve_fmt1_name(const wchar_t* base) {
+    return is_serve_listed(base, g_serveFmt1);
+}
+
 static void touched_skip_log_once(const wchar_t* base, const char* what) {
     std::wstring key(base ? base : L"?");
     for (auto& c : key) c = (wchar_t)towlower(c);
@@ -768,7 +834,7 @@ static void touched_set_allowed_for_caller(HMODULE caller) {
 // skipped by SKSE outright (it never maps them - no load event to
 // catch), so at activation we scan Data/SKSE/Plugins/*.dll and map
 // what SKSE left unowned ourselves, then invoke Query/Load with
-// SKSE's own interface. A skip-list (CompaSSE\!CompaSSE.ini [legacy_skip])
+// SKSE's own interface. A skip-list (CompaSSE\!CompaSSE.ini [skip])
 // excludes known faulters. Best effort: Query may
 // decline, Load may fail, init may fault (SEH-isolated per plugin
 // below).
@@ -1547,10 +1613,46 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     }
 
-    // Old fmt2-only callers share one mapping per game version: they all
-    // get the same fmt1/2 bytes (counts unified to the dense count, so
-    // the shared board stays one size). Fmt5-native readers bypass this
-    // entirely below with the real file; their board is their own.
+    if (caller && is_touched_module(caller)) {
+        const wchar_t* modBase = wcsrchr(modName, L'\\');
+        modBase = modBase ? modBase + 1 : modName;
+        if (is_serve_raw_name(modBase)) {
+            shim_log("serve %ls -> fixed:raw for %ls", path,
+                     modName[0] ? modName : L"(unknown)");
+            return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
+        }
+        if (is_serve_fmt1_name(modBase)) {
+            touched_set_allowed_for_caller(caller);
+            AcquireSRWLockExclusive(&g_lock);
+            ensure_buffers(path);
+            if (g_loadFailed) {
+                ReleaseSRWLockExclusive(&g_lock);
+                shim_log("serve: load failed, serving real file");
+                return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
+            }
+            if (!ensure_temp_file(1)) {
+                ReleaseSRWLockExclusive(&g_lock);
+                shim_log("serve: temp file failed, serving real file");
+                return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
+            }
+            ReleaseSRWLockExclusive(&g_lock);
+            shim_log("serve %ls -> fixed:fmt1 for %ls", path,
+                     modName[0] ? modName : L"(unknown)");
+            return fpCreateFileW(g_tempPath1, access, share, sa, disp, flags, tmpl);
+        }
+    }
+
+    if (caller && !is_touched_module(caller)) {
+        wchar_t callerPath[MAX_PATH] = {};
+        const wchar_t* callerBase = L"(unknown)";
+        if (GetModuleFileNameW(caller, callerPath, MAX_PATH))
+            callerBase = module_basename(callerPath);
+        touched_skip_log_once(callerBase, "serve");
+        shim_log("serve %ls -> untouched=raw for %ls", path,
+                 modName[0] ? modName : L"(unknown)");
+        return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
+    }
+
     CallerCaps caps = caller_caps(caller);
     touched_set_allowed_for_caller(caller);
     int format;
@@ -1561,11 +1663,7 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
                  modName[0] ? modName : L"(unknown)");
         return fpCreateFileW(path, access, share, sa, disp, flags, tmpl);
     }
-    // No consent check here on purpose: transcoded bytes for present IDs
-    // are identical to the real file, so the temp can only help a legacy
-    // reader or leave it as broken as without the shim. Consent still
-    // gates flag patches, translations, and legacy loading. Only proven
-    // legacy shapes take the temp; everything else keeps the real file.
+    
     if (!isVersionFile && caller && keep_real_bytes(caps)) {
         shim_log("serve %ls -> pass-through fmt5-native reader (decoder=%d dualV5=%d leg=%d ver=%d) for %ls", path,
                  (int)caps.type, caps.dualV5 ? 1 : 0, caps.legacy ? 1 : 0, caps.hasVer ? 1 : 0,
@@ -1591,7 +1689,7 @@ static HANDLE serve_versionlib(const wchar_t* path, DWORD access, DWORD share,
     uint32_t ids = temp_entry_count(tempFmt);
     ReleaseSRWLockExclusive(&g_lock);
 
-    shim_log("serve %ls -> format %d (transcoded, decoder=%d, dualV5=%d, leg=%d, ver=%d, ids=%u, mapbytes=%llu) for %ls", path, tempFmt,
+    shim_log("serve %ls -> fixed:auto:fmt%d (decoder=%d, dualV5=%d, leg=%d, ver=%d, ids=%u, mapbytes=%llu) for %ls", path, tempFmt,
              (int)caps.type, caps.dualV5 ? 1 : 0, caps.legacy ? 1 : 0, caps.hasVer ? 1 : 0,
              ids, (unsigned long long)ids * 16,
              modName[0] ? modName : L"(unknown)");
@@ -1662,30 +1760,39 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
         if (is_old_version_path(fpath))
             return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
         wcscpy_s(binPath, fpath);
-        // File-backed readers of a version- file expect fmt1 bytes,
-        // same as stream readers (see serve_versionlib).
         const wchar_t* base = path_basename(fpath);
         bool versionDash = (_wcsnicmp(base, L"version-", 8) == 0 &&
             _wcsnicmp(base, L"versionlib-", 11) != 0);
-        // Same rule as serve_versionlib (see keep_real_bytes).
-        // Unknown callers keep the real file: a temp fails fmt5-only
-        // format checks, while the real file is no-shim behavior. No
-        // consent check: transcoded bytes match the real file for
-        // present IDs, so only proven legacy shapes take the temp.
+        wchar_t callerPath[MAX_PATH] = {};
+        const wchar_t* callerBase = L"(unknown)";
+        if (caller && GetModuleFileNameW(caller, callerPath, MAX_PATH))
+            callerBase = path_basename(callerPath);
+        bool fixedCaller = caller && is_touched_module(caller);
+        bool forceRaw = fixedCaller && is_serve_raw_name(callerBase);
+        bool forceFmt1 = !forceRaw && fixedCaller && is_serve_fmt1_name(callerBase);
+        if (forceRaw) {
+            shim_log("serve mapping -> fixed:raw for %ls", callerBase);
+            return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+        }
+        if (forceFmt1) {
+            shim_log("serve mapping -> fixed:fmt1 for %ls", callerBase);
+        } else if (caller && !is_touched_module(caller)) {
+            // Untouched keeps the real mapping (no-shim).
+            touched_skip_log_once(callerBase, "serve mapping");
+            shim_log("serve mapping -> untouched=raw for %ls", callerBase);
+            return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
+        }
         if (!versionDash && !caller)
             return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
-        if (!versionDash && caller && keep_real_bytes(caps))
+        if (!versionDash && caller && !forceFmt1 && keep_real_bytes(caps))
             return fpCreateFileMappingW(hFile, sa, protect, sizeHigh, sizeLow, name);
-        format = versionDash ? 1 : 2;
+        format = (versionDash || forceFmt1) ? 1 : 2;
     }
 
         wchar_t modName[MAX_PATH] = L"(unknown)";
         if (caller) GetModuleFileNameW(caller, modName, MAX_PATH);
 
         AcquireSRWLockExclusive(&g_lock);
-        // A mapper can arrive before any stream opener: build the buffers
-        // now instead of silently passing the real file (wrong bytes for
-        // a legacy reader look exactly like no shim at all).
         if (!g_loaded && !g_loadFailed)
             ensure_buffers(binPath);
         bool ok = g_loaded && ensure_temp_file(format);
@@ -1699,7 +1806,7 @@ static HANDLE WINAPI Hook_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES
                 HANDLE mapping = fpCreateFileMappingW(temp, sa, protect, sizeHigh, sizeLow, name);
                 CloseHandle(temp);
                 const wchar_t* base = wcsrchr(modName, L'\\');
-                shim_log("CreateFileMappingW: redirecting versionlib handle to temp fmt%d (dualV5=%d leg=%d ver=%d) for %ls",
+                shim_log("CreateFileMappingW: redirecting versionlib handle to temp fixed:auto:fmt%d (dualV5=%d leg=%d ver=%d) for %ls",
                          format, caps.dualV5 ? 1 : 0, caps.legacy ? 1 : 0, caps.hasVer ? 1 : 0,
                          base ? base + 1 : modName);
                 return mapping;
@@ -1763,14 +1870,33 @@ static HANDLE WINAPI Hook_CreateFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES
         const wchar_t* base = path_basename(fpath);
         bool versionDash = (_wcsnicmp(base, L"version-", 8) == 0 &&
             _wcsnicmp(base, L"versionlib-", 11) != 0);
+        wchar_t callerPath[MAX_PATH] = {};
+        const wchar_t* callerBase = L"(unknown)";
+        if (caller && GetModuleFileNameW(caller, callerPath, MAX_PATH))
+            callerBase = path_basename(callerPath);
+        bool fixedCaller = caller && is_touched_module(caller);
+        bool forceRaw = fixedCaller && is_serve_raw_name(callerBase);
+        bool forceFmt1 = !forceRaw && fixedCaller && is_serve_fmt1_name(callerBase);
+        if (forceRaw) {
+            shim_log("serve mapping -> fixed:raw for %ls", callerBase);
+            return fpCreateFileMappingA(hFile, sa, protect, sizeHigh, sizeLow, name);
+        }
+        if (forceFmt1) {
+            shim_log("serve mapping -> fixed:fmt1 for %ls", callerBase);
+        } else if (caller && !is_touched_module(caller)) {
+            // Untouched keeps the real mapping (no-shim).
+            touched_skip_log_once(callerBase, "serve mapping");
+            shim_log("serve mapping -> untouched=raw for %ls", callerBase);
+            return fpCreateFileMappingA(hFile, sa, protect, sizeHigh, sizeLow, name);
+        }
     // Same shape as the W twin (see serve_versionlib for the rule).
     // Unknown callers keep the real file; no consent check: only
     // proven legacy shapes take the temp.
     if (!versionDash && !caller)
         return fpCreateFileMappingA(hFile, sa, protect, sizeHigh, sizeLow, name);
-    if (!versionDash && caller && keep_real_bytes(caps))
+    if (!versionDash && caller && !forceFmt1 && keep_real_bytes(caps))
         return fpCreateFileMappingA(hFile, sa, protect, sizeHigh, sizeLow, name);
-    format = versionDash ? 1 : 2;
+    format = (versionDash || forceFmt1) ? 1 : 2;
     }
 
         wchar_t modName[MAX_PATH] = L"(unknown)";
@@ -1791,7 +1917,7 @@ static HANDLE WINAPI Hook_CreateFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES
                 DWORD err = mapping ? 0 : GetLastError();
                 CloseHandle(temp);
                 const wchar_t* base = wcsrchr(modName, L'\\');
-                shim_log("CreateFileMappingA: redirecting versionlib handle to temp fmt%d (dualV5=%d leg=%d ver=%d) -> %s (err=%lu) for %ls",
+                shim_log("CreateFileMappingA: redirecting versionlib handle to temp fixed:auto:fmt%d (dualV5=%d leg=%d ver=%d) -> %s (err=%lu) for %ls",
                          format, caps.dualV5 ? 1 : 0, caps.legacy ? 1 : 0, caps.hasVer ? 1 : 0,
                          mapping ? "ok" : "FAILED", err, base ? base + 1 : modName);
                 return mapping;

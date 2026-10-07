@@ -316,29 +316,6 @@ if (-not (Test-Path -LiteralPath $CompaSSEDir)) {
     Write-Ok "Created CompaSSE subfolder"
 }
 
-# ---- Default !CompaSSE.ini (never overwrite user edits) ----
-Ensure-DefaultIni '!CompaSSE.ini' @(
-    '; CompaSSE shim config - consent list and legacy skip list.'
-    '; One entry per line. CompaSSE appends here on every fix.'
-    "';', '#' and unknown [sections] are skipped."
-    '; A missing file means legacy mode (serve all, like before).'
-    ''
-    '[touched]'
-    '; DLL basenames you allowed CompaSSE to fix. Undoing a fix removes its line.'
-    '; The shim only serves listed mods.'
-    ''
-    '[legacy_skip]'
-    '; Versionless mods the legacy loader must not run.'
-    '; name.dll [| year=YYYY] [| note]. A pinned year skips only that build.'
-    '; These load what SKSE itself refuses; a faulting one takes the game down.'
-    '; SkyrimUncapper.dll is pre-listed: 2017 binary, hardcoded 1.6.640 lookups,'
-    '; faults on 1.7.104. Delete its line after the mod author'
-    '; ships a fixed build (every skip is logged each launch, so a stale entry shows).'
-    ''
-    'SkyrimUncapper.dll'
-    ''
-)
-
 # ---- Migrate old touched.ini / legacy-skip.ini into !CompaSSE.ini ----
 # One-way move: entries fold into their section (deduped), then the old
 # file is renamed. The shim ignores old files once the unified one exists,
@@ -374,7 +351,7 @@ function Merge-IniSection($Unified, $Section, $NewLines) {
 
 Invoke-Dry "Migrate old ini files" {
     $Unified = Join-Path $CompaSSEDir '!CompaSSE.ini'
-    foreach ($pair in @(@{Old='touched.ini'; Sect='touched'}, @{Old='legacy-skip.ini'; Sect='legacy_skip'})) {
+    foreach ($pair in @(@{Old='touched.ini'; Sect='fixed'}, @{Old='legacy-skip.ini'; Sect='skip'})) {
         $oldPath = Join-Path $CompaSSEDir $pair.Old
         if (-not (Test-Path -LiteralPath $oldPath)) { continue }
         $entries = @(Get-Content -LiteralPath $oldPath -ErrorAction SilentlyContinue | ForEach-Object {
@@ -390,7 +367,7 @@ Invoke-Dry "Migrate old ini files" {
     }
 }
 
-# ---- Seed [touched] from existing backups (one entry per fixed DLL) ----
+# ---- Seed [fixed] from existing backups (one entry per fixed DLL) ----
 Invoke-Dry "Seed !CompaSSE.ini from backups" {
     $Unified = Join-Path $CompaSSEDir '!CompaSSE.ini'
     $BackupsDir = Join-Path $CompaSSEDir 'backups'
@@ -398,11 +375,11 @@ Invoke-Dry "Seed !CompaSSE.ini from backups" {
         New-Item -ItemType File -Path $Unified -Force | Out-Null
     }
     $known = @{}
-    $inTouched = $false
+    $inFixed = $false
     Get-Content -LiteralPath $Unified -ErrorAction SilentlyContinue | ForEach-Object {
         $t = $_.Trim()
-        if ($t.StartsWith('[')) { $inTouched = ($t -match '^\s*\[touched\]\s*$'); return }
-        if ($inTouched -and $t -and -not ($t.StartsWith(';') -or $t.StartsWith('#'))) {
+        if ($t.StartsWith('[')) { $inFixed = ($t -match '^\s*\[fixed\]\s*$'); return }
+        if ($inFixed -and $t -and -not ($t.StartsWith(';') -or $t.StartsWith('#'))) {
             $tok = ($t -split '\s|\|')[0]
             if ($tok) { $known[$tok.ToLowerInvariant()] = $true }
         }
@@ -419,7 +396,7 @@ Invoke-Dry "Seed !CompaSSE.ini from backups" {
             }
         }
     }
-    if ($add.Count) { [void](Merge-IniSection $Unified 'touched' $add) }
+    if ($add.Count) { [void](Merge-IniSection $Unified 'fixed' $add) }
     Write-Ok "!CompaSSE.ini: seeded $($add.Count) entr(ies) from backups"
 }
 

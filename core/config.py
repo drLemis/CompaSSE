@@ -1,9 +1,10 @@
 """One shim config file for the CompaSSE folder.
 
 !CompaSSE.ini holds the two plain lists the shim reads at game start:
-[touched] for consented DLL basenames, [legacy_skip] for versionless
-mods the legacy loader must not run. Lines outside a known section
-count as [touched], so old touched.ini content pastes in cleanly.
+[fixed] for fixed DLL basenames with an optional serve mode, [skip] for
+versionless mods the legacy loader must not run.
+
+One [fixed] line: Name.dll [| serve=auto|raw|fmt1] [| note]. Default auto.
 
 Old separate files still work when !CompaSSE.ini is missing. When it
 exists, it wins and they are ignored. First write migrates them in
@@ -12,8 +13,8 @@ and removes them, so edits never land in a file nobody reads.
 from pathlib import Path
 
 CONFIG_NAME = "!CompaSSE.ini"
-TOUCHED_SECTION = "touched"
-SKIP_SECTION = "legacy_skip"
+FIXED_SECTION = "fixed"
+SKIP_SECTION = "skip"
 
 TOUCHED_LEGACY = "touched.ini"
 SKIP_LEGACY = "legacy-skip.ini"
@@ -21,15 +22,16 @@ SKIP_LEGACY = "legacy-skip.ini"
 _SHIM_DIR = "CompaSSE"
 
 DEFAULT_TEXT = """\
-; CompaSSE shim config - consent list and legacy skip list.
+; CompaSSE shim config: [fixed], [skip].
 ; One entry per line. ';', '#' and unknown [sections] are skipped.
 ; The exe appends here on every fix; the shim reads it at game start.
 ; A missing file means legacy mode (serve all).
-
-[touched]
-; DLL basenames you allowed CompaSSE to fix.
-
-[legacy_skip]
+;
+[fixed]
+; Fixed DLL basenames. Name.dll [| serve=auto|raw|fmt1] [| note].
+; Default serve is auto. Undoing a fix removes its line.
+;
+[skip]
 ; Versionless mods the legacy loader must not run.
 ; name.dll [| year=YYYY] [| note]. A pinned year skips only that build.
 """
@@ -61,9 +63,9 @@ def _read_lines(path):
 def read_section(plugins_dir, section, include_prelude=False):
     """Raw lines of one section. Falls back to the legacy file.
 
-    With include_prelude, pre-section lines count as touched too, so
-    old touched.ini content pastes in cleanly. Writers always use
-    strict section lines; the prelude passes through untouched.
+    With include_prelude, pre-section lines count as fixed too, so
+    old pasted content keeps working. Writers always use
+    strict section lines; the prelude passes through as-is.
     """
     shim = _shim_dir(plugins_dir)
     unified = shim / CONFIG_NAME
@@ -79,13 +81,13 @@ def read_section(plugins_dir, section, include_prelude=False):
                 cur = sect
                 continue
             if cur is None:
-                if include_prelude and section == TOUCHED_SECTION:
+                if include_prelude and section == FIXED_SECTION:
                     out.append(line)
                 continue
             if cur == section:
                 out.append(line)
         return out
-    legacy = shim / (TOUCHED_LEGACY if section == TOUCHED_SECTION
+    legacy = shim / (TOUCHED_LEGACY if section == FIXED_SECTION
                       else SKIP_LEGACY)
     lines = _read_lines(legacy)
     return lines if lines is not None else []
@@ -94,9 +96,19 @@ def _is_entry(line):
     s = line.strip()
     return bool(s) and s[0] not in ";#['\""
 
+
+def fixed_serve_mode(line):
+    """'raw'/'fmt1' from a [fixed] serve= suffix, else 'auto'."""
+    for seg in str(line or "").split("|")[1:]:
+        kv = seg.split("=", 1)
+        if len(kv) == 2 and kv[0].strip().lower() == "serve" \
+                and kv[1].strip().lower() in ("auto", "raw", "fmt1"):
+            return kv[1].strip().lower()
+    return "auto"
+
 def _migrate_lines(shim, section):
     """Entry lines from the legacy file, for folding into unified."""
-    legacy = shim / (TOUCHED_LEGACY if section == TOUCHED_SECTION
+    legacy = shim / (TOUCHED_LEGACY if section == FIXED_SECTION
                       else SKIP_LEGACY)
     lines = _read_lines(legacy)
     if not lines:
@@ -123,7 +135,7 @@ def write_section(plugins_dir, section, entry_lines, prelude=None):
     to drop stale pasted entries). Otherwise the prelude passes
     through untouched.
     """
-    other = SKIP_SECTION if section == TOUCHED_SECTION else TOUCHED_SECTION
+    other = SKIP_SECTION if section == FIXED_SECTION else FIXED_SECTION
     shim = _shim_dir(plugins_dir)
     try:
         shim.mkdir(parents=True, exist_ok=True)
