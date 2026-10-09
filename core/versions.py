@@ -25,7 +25,7 @@ __all__ = [
     "compat_match",
 ]
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
 # versionIndependence flags (from SKSE64 PluginManager.cpp)
 KVI_ADDR_LIB_POST_AE = 1 << 0

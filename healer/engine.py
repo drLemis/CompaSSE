@@ -1212,9 +1212,19 @@ def checkup_plugin(dll_path, exe_path, plugins_dir, old_exe_path=None,
             and (year or 0) < 2025:
         verdict, title, action = ("BROKEN", "Needs the mod author",
                                   "turn_off")
-    elif needs_patch or health["stale"]:
+    elif health["stale"]:
         verdict, title, action = ("FIXABLE", "Fixable: outdated addresses",
                                   "fix")
+    elif needs_patch and (healer_fixes or health.get("fixed")
+                          or amputate
+                          or (old_ctx is not None and uncovered)):
+        verdict, title, action = ("FIXABLE", "Fixable: outdated addresses",
+                                  "fix")
+    elif needs_patch:
+        lines.append("Version flags are outdated - press Fix in the "
+                     "Therapist tab. This tab cannot patch flags.")
+        verdict, title, action = ("RISKY", "Fix the flags in Therapist",
+                                  "to_therapist")
     elif health["ambiguous"] or gates or crossed or uncovered:
         verdict, title, action = ("RISKY", "Might work, test in game",
                                   "try_first")

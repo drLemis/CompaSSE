@@ -45,6 +45,7 @@ HINT = {
     "fix": "Press Fix below.",
     "try_first": "Try it in the game first.",
     "turn_off": "Turn it off to play, then ask the author for an update.",
+    "to_therapist": "Fix the version flags in the Therapist tab.",
 }
 
 class _NoWork:
@@ -681,11 +682,15 @@ class HealerTab:
                 item["selected"] = card.selection()
             items.append(item)
         if not items:
-            messagebox.showinfo("Fix", "Nothing fixable - pick a candidate "
-                                "first." if any(
-                                    i.get("kind") == "hook-pick"
-                                    for i in self._plan)
-                                else "Nothing to fix.")
+            if any(i.get("kind") == "hook-pick" for i in self._plan):
+                messagebox.showinfo("Fix", "Nothing fixable - pick a "
+                                    "candidate first.")
+            elif any(i.get("kind") == "flags" for i in self._plan):
+                messagebox.showinfo(
+                    "Fix", "Nothing to fix here - version flags are "
+                    "fixed in the Therapist tab.")
+            else:
+                messagebox.showinfo("Fix", "Nothing to fix.")
             return
         if self.work is not None and not self.work.acquire("Fixing..."):
             messagebox.showinfo("Please wait", "Another task is running.")

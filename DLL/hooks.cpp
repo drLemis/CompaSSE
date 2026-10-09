@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#define COMPASSE_SHIM_VERSION "2.0.2"
+#define COMPASSE_SHIM_VERSION "2.0.3"
 
 // ---- GetProcAddress interception (SKSE version bypass) ----
 typedef FARPROC (WINAPI* pfnGetProcAddress)(HMODULE, LPCSTR);
@@ -1250,7 +1250,6 @@ static HANDLE create_iddb_mapping(LPSECURITY_ATTRIBUTES sa, DWORD protect,
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
     }
-    SetLastError(ERROR_ALREADY_EXISTS);
     shim_log("CreateFileMappingW %ls stale (smaller than %llu) -> shadow %ls size=%llu",
              name, reqSize, shadow, reqSize);
     return hs;

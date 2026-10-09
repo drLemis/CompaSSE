@@ -621,6 +621,7 @@ class PluginCard(tk.Frame):
                          anchor="w", justify="left").pack(fill="x", pady=(0, 2))
 
         # -- Controls (only when the plugin needs fixing, or forced in pro mode) --
+        fix_items = []
         if verdict["needs_fix"] or force_fix:
             fix_items = verdict.get("fix_items", [])
 
@@ -655,10 +656,24 @@ class PluginCard(tk.Frame):
             if fix_items:
                 fw = tk.Frame(body, bg=CARD_BG)
                 fw.pack(fill="x", pady=(6, 4))
-                for it in fix_items:
+                if len(fix_items) == 1 \
+                        and fix_items[0].get("kind") != "all":
+                    it = fix_items[0]
+                    tk.Label(fw, text=it["label"],
+                             font=(FONT_FAMILY, 9),
+                             fg=TEXT_SECONDARY, bg=CARD_BG,
+                             anchor="w", wraplength=380).pack(
+                                 fill="x", pady=(0, 2))
+                    if it.get("description"):
+                        tk.Label(fw, text=it["description"],
+                                 font=(FONT_FAMILY, 9),
+                                 fg=TEXT_SECONDARY, bg=CARD_BG,
+                                 anchor="w", justify="left",
+                                 wraplength=380).pack(
+                                     fill="x", pady=(0, 4))
                     b = tk.Button(
                         fw,
-                        text=it['label'],
+                        text="Fix",
                         font=(FONT_FAMILY, 9, "bold"),
                         relief="raised", bd=1,
                         padx=12, pady=4,
@@ -672,24 +687,43 @@ class PluginCard(tk.Frame):
                     b.pack(fill="x", pady=2)
                     self.fix_buttons.append(b)
                     self.kind_buttons[it["kind"]] = b
-
-                if len(fix_items) > 1:
-                    fab = tk.Button(
-                        fw,
-                        text="Fix all",
-                        font=(FONT_FAMILY, 9, "bold"),
-                        relief="raised", bd=1,
-                        padx=12, pady=4,
-                        bg="#fde047", fg="#422006",
-                        activebackground="#facc15", activeforeground="#1a2e05",
-                        cursor="hand2",
-                        command=self._on_fix_click,
-                    )
-                    fab.pack(fill="x", pady=2)
-                    self.fix_btn = fab
-                    self.fix_buttons.append(fab)
+                    self.fix_btn = b
                 else:
-                    self.fix_btn = None
+                    for it in fix_items:
+                        b = tk.Button(
+                            fw,
+                            text=it['label'],
+                            font=(FONT_FAMILY, 9, "bold"),
+                            relief="raised", bd=1,
+                            padx=12, pady=4,
+                            bg="#fef08a", fg="#713f12",
+                            activebackground="#fde047", activeforeground="#422006",
+                            cursor="hand2",
+                            command=lambda: None,
+                        )
+                        b.config(command=lambda k=it["kind"], btn=b:
+                                 self._on_fix_kind(k, btn))
+                        b.pack(fill="x", pady=2)
+                        self.fix_buttons.append(b)
+                        self.kind_buttons[it["kind"]] = b
+
+                    if len(fix_items) > 1:
+                        fab = tk.Button(
+                            fw,
+                            text="Fix all",
+                            font=(FONT_FAMILY, 9, "bold"),
+                            relief="raised", bd=1,
+                            padx=12, pady=4,
+                            bg="#fde047", fg="#422006",
+                            activebackground="#facc15", activeforeground="#1a2e05",
+                            cursor="hand2",
+                            command=self._on_fix_click,
+                        )
+                        fab.pack(fill="x", pady=2)
+                        self.fix_btn = fab
+                        self.fix_buttons.append(fab)
+                    else:
+                        self.fix_btn = None
 
             # Status row
             ctrls = tk.Frame(body, bg=CARD_BG)
@@ -726,7 +760,10 @@ class PluginCard(tk.Frame):
             self.fix_buttons.append(self.recipe_btn)
 
         # -- Deep check (sends the mod to the Healer tab) --
-        if self.on_healer is not None:
+        flag_only = bool(fix_items) and all(
+            it.get("kind") in ("flag", "addrlib") for it in fix_items)
+        if self.on_healer is not None and (
+                not flag_only or verdict.get("hook_note")):
             self.healer_btn = tk.Button(
                 body, text="Check in Healer",
                 font=(FONT_FAMILY, 9),
@@ -737,6 +774,14 @@ class PluginCard(tk.Frame):
             self.healer_btn.pack(fill="x", pady=(4, 0))
         else:
             self.healer_btn = None
+            if self.on_healer is not None and flag_only:
+                tk.Label(body,
+                         text="Healer fixes hook offsets - "
+                              "the flags above are fixed with Fix.",
+                         font=(FONT_FAMILY, 9),
+                         fg=TEXT_SECONDARY, bg=CARD_BG,
+                         anchor="w", wraplength=380).pack(
+                             fill="x", pady=(4, 0))
 
         # -- Undo fix (only when a stored original exists) --
         if self.on_restore_one is not None \
